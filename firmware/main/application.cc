@@ -15,6 +15,11 @@
 #include <esp_sntp.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <atomic>
+#include <cstring>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include "common/server_pairing.h"
 
 #include <ctime>
 
@@ -105,6 +110,36 @@ void StartSntpClockSyncOnce() {
 
 bool IsLocalHttpServiceRunning(const ui::RawDrawUiManager* manager) {
     return manager != nullptr && manager->IsHttpServerRunning();
+}
+
+std::atomic<bool> s_pairing_started{false};
+
+void ServerPairingTaskTrampoline(void*) {
+    ServerPairStatus st = server_pairing_init();
+    if (st == SERVER_PAIR_NEEDS_PROVISION) {
+        ESP_LOGW(kTag, "ServerPairing: no base_url — 请重新配网");
+        vTaskDelete(nullptr);
+        return;
+    }
+    if (st == SERVER_PAIR_NEEDS_PAIRING) {
+        char dev_id[32] = {0};
+        server_pairing_get_device_id(dev_id, sizeof(dev_id));
+        server_pairing_set_display_cb([](const char* code, int expires_in) {
+            ESP_LOGI(kTag, "ServerPairing: 配对码 %s (有效 %d 秒)", code, expires_in);
+        });
+        ESP_LOGI(kTag, "ServerPairing: device=%s 开始配对流程", dev_id);
+        if (!server_pairing_run()) {
+            ESP_LOGE(kTag, "ServerPairing: 配对失败（超时/网络不可达）");
+            vTaskDelete(nullptr);
+            return;
+        }
+        ESP_LOGI(kTag, "ServerPairing: 配对成功，token 已写入 NVS");
+    }
+    char tok[65] = {0};
+    if (server_pairing_get_token(tok, sizeof(tok))) {
+        ESP_LOGI(kTag, "ServerPairing: token ready (%d chars)", (int)strlen(tok));
+    }
+    vTaskDelete(nullptr);
 }
 
 }  // namespace
@@ -290,6 +325,7 @@ void Application::Initialize() {
                 ESP_LOGI(kTag, "WiFi connected: %s", data.c_str());
                 wifi_connected_.store(true, std::memory_order_release);
                 StartSntpClockSyncOnce();
+                StartServerPairingOnce();
                 if (rawdraw_ui_manager_ && !rawdraw_ui_manager_->IsLanHttpServerRunning()) {
                     const std::string ip = data.empty() ? WifiManager::GetInstance().GetIpAddress() : data;
                     if (!ip.empty()) {
@@ -489,6 +525,24 @@ void Application::ArmSyncSleepTimer() {
     ESP_LOGI(kTag, "Sync sleep interval: %d minutes", interval_minutes);
     ESP_LOGI(kTag, "Scheduling sleep after sync interval: %d minutes", interval_minutes);
     ESP_ERROR_CHECK(esp_timer_start_once(sleep_timer_, delay_us));
+}
+
+void Application::StartServerPairingOnce() {
+    if (s_pairing_started.exchange(true)) {
+        return;
+    }
+    if (xTaskCreatePinnedToCore(
+            &Application::ServerPairingTaskEntry, "srv_pair", 8192,
+            this, 3, nullptr, 1) != pdPASS) {
+        ESP_LOGE(kTag, "ServerPairing: failed to create task");
+        s_pairing_started.store(false);
+        return;
+    }
+    ESP_LOGI(kTag, "ServerPairing: task started");
+}
+
+void Application::ServerPairingTaskEntry(void* arg) {
+    ServerPairingTaskTrampoline(arg);
 }
 
 void Application::EnterScheduledSleep() {

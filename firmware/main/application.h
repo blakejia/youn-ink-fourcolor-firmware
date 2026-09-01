@@ -62,6 +62,8 @@ private:
     void EnterManualSleep();
     void NoteButtonActivity();
     void EnterWifiConfigMode();
+    void StartServerPairingOnce();
+    static void ServerPairingTaskEntry(void* arg);
 };
 
 #endif  // _APPLICATION_H_
