@@ -181,9 +181,22 @@ static void show_page(int index) {
         return;
     }
     auto* lcd = static_cast<CustomLcdDisplay*>(s_display);
-    bool ok = lcd->DisplayRaw4ColorImage(s_pages[index].bitmap, PAGE_BITMAP_SIZE, 400, 300);
-    ESP_LOGI(kTag, "show page %d/%d md5=%.8s shown=%d", index + 1, s_page_count,
-             s_pages[index].md5, ok ? 1 : 0);
+    // 安全路径：不直接调 DisplayRaw4ColorImage（它阻塞写屏会与后台
+    // refresh_task 并发抢 EPD，导致 busy 卡死——见 kEnableDirectRawPhotoRefresh 注释）。
+    // 改为把 2bpp 位图 blit 进共享 framebuffer，再走 EpdRefreshScheduler 统一刷新。
+    uint8_t* fb = lcd->GetFramebuffer();
+    int fb_len = lcd->GetFBWidth() * lcd->GetFBHeight() * 2 / 8;
+    if (!fb || fb_len != PAGE_BITMAP_SIZE) {
+        ESP_LOGE(kTag, "framebuffer size mismatch: fb_len=%d want=%d", fb_len, PAGE_BITMAP_SIZE);
+        return;
+    }
+    // 2bpp 像素序一致（rawdraw set_pixel 与 server pack_2bpp 均 MSB-first），直接拷贝。
+    xSemaphoreTake(lcd->GetMutex(), portMAX_DELAY);
+    memcpy(fb, s_pages[index].bitmap, PAGE_BITMAP_SIZE);
+    xSemaphoreGive(lcd->GetMutex());
+    lcd->RequestUrgentFullRefresh();
+    ESP_LOGI(kTag, "show page %d/%d md5=%.8s via framebuffer", index + 1, s_page_count,
+             s_pages[index].md5);
 }
 
 static void page_sync_task(void* arg) {

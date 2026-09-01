@@ -71,11 +71,22 @@ _DEFAULT_FONT_CANDIDATES = (
 )
 
 
+def _style_px(v) -> Optional[int]:
+    """Parse '240px' / 240 -> int; None otherwise."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    s = str(v).strip()
+    m = re.search(r"(-?\d+)", s)
+    return int(m.group(1)) if m else None
+
+
 class RenderError(Exception):
     """Raised when an element/property is unsupported or malformed.
 
-    `path` is a dotted JSON-pointer so the client can localize the failure
-    (e.g. "windowData.default[0].props.children[2].type").
+    path is a dotted JSON-pointer so the client can localize the failure
+    (e.g. windowData.default[0].props.children[2].type).
     """
 
     def __init__(self, path: str, message: str) -> None:
@@ -407,10 +418,18 @@ class _CanvasRenderer:
         return out
 
     def _measure_node(self, node, tw, path):
-        w = _size_from_tw(tw, "w")
-        h = _size_from_tw(tw, "h")
+        # Size sources in priority order: node's own tw, node's style, parent tw.
+        props = node.get("props") or {}
+        node_tw = str(props.get("tw", ""))
+        style = props.get("style") or {}
+        w = _size_from_tw(node_tw, "w") or _style_px(style.get("width")) or _size_from_tw(tw, "w")
+        h = _size_from_tw(node_tw, "h") or _style_px(style.get("height")) or _size_from_tw(tw, "h")
         if w and h:
             return w, h
+        # For img: default to the full parent box instead of a tiny 100x24 sliver.
+        ntype = node.get("type")
+        if ntype == "img":
+            return (w or 0, h or 0)  # 0 → caller clamps to container
         return (w or 100, h or 24)
 
     def _fill_box(self, box: _Box, color) -> None:
