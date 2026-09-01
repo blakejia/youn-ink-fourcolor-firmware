@@ -61,6 +61,8 @@ set(SOURCES
     "common/ble_gatt_service.cc"
     "common/ble_image_receiver.cc"
     "common/holiday_fetcher.cc"
+    "common/server_pairing.cc"
+    "common/http_client_wrapper.cc"
     "ui/widgets/status_bar.cc"
     "ui/renderers/rawdraw/ebook_renderer.cc"
     "ui/renderers/rawdraw/chat_renderer.cc"

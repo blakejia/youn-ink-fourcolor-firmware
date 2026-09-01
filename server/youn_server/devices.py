@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE TABLE IF NOT EXISTS device_secrets (
     device_id TEXT PRIMARY KEY,
     secret    TEXT NOT NULL,
-    created   INTEGER NOT NULL
+    created   INTEGER NOT NULL,
+    token     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_devices_trust ON devices(trust);
 """
@@ -85,6 +86,15 @@ class DeviceRegistry:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        # Migrate existing device_secrets: add token column if missing.
+        try:
+            self._conn.execute("ALTER TABLE device_secrets ADD COLUMN token TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Ensure unique index on token (idempotent).
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_device_secrets_token ON device_secrets(token)"
+        )
 
     # ── write ──
     def upsert(
@@ -172,6 +182,38 @@ class DeviceRegistry:
                 "SELECT secret FROM device_secrets WHERE device_id = ?", (device_id,)
             ).fetchone()
         return None if row is None else row["secret"]
+
+    def get_device_by_token(self, token: str) -> Optional[Device]:
+        """Look up a device by its auth token. Returns None if not found."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT d.* FROM devices d JOIN device_secrets ds ON d.device_id = ds.device_id WHERE ds.token = ?",
+                (token,),
+            ).fetchone()
+        if row is None:
+            return None
+        return Device(
+            device_id=row["device_id"],
+            board_type=row["board_type"],
+            first_seen=row["first_seen"],
+            last_seen=row["last_seen"],
+            ws_session_id=row["ws_session_id"],
+            ip_address=row["ip_address"],
+            trust=bool(row["trust"]),
+        )
+
+    def set_token(self, device_id: str, token: str) -> None:
+        """Store auth token for a device."""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO device_secrets(device_id, secret, created, token)
+                VALUES (?, '', ?, ?)
+                ON CONFLICT(device_id) DO UPDATE SET token = excluded.token
+                """,
+                (device_id, int(time.time()), token),
+            )
+
 
     def list_all(self, only_trusted: bool = False) -> list[Device]:
         with self._lock:

@@ -8,6 +8,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <nvs.h>
 #include <cstddef>
 
 
@@ -202,6 +203,20 @@ bool WebSocket::Connect(const char* uri) {
     }
     std::string base64_key = base64_encode(reinterpret_cast<const unsigned char*>(key), 16);
     SetHeader("Sec-WebSocket-Key", base64_key.c_str());
+    // 从 NVS 读取设备 token 并注入鉴权头（配对鉴权）
+    {
+        nvs_handle_t nvs;
+        if (nvs_open("server", NVS_READONLY, &nvs) == ESP_OK) {
+            char token[80] = {0};
+            size_t len = sizeof(token);
+            if (nvs_get_str(nvs, "token", token, &len) == ESP_OK && token[0] != '\0') {
+                char bearer[96];
+                snprintf(bearer, sizeof(bearer), "Bearer %s", token);
+                SetHeader("Authorization", bearer);
+            }
+            nvs_close(nvs);
+        }
+    }
 
     if (protocol == "wss" || protocol == "https") {
         tcp_ = network_->CreateSsl(connect_id_);

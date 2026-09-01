@@ -198,13 +198,6 @@ void WifiConfigurationAp::StartAccessPoint()
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("wifi", NVS_READONLY, &nvs);
     if (err == ESP_OK) {
-        // 读取OTA URL
-        char ota_url[256] = {0};
-        size_t ota_url_size = sizeof(ota_url);
-        err = nvs_get_str(nvs, "ota_url", ota_url, &ota_url_size);
-        if (err == ESP_OK) {
-            ota_url_ = ota_url;
-        }
 
         // 读取WiFi功率
         err = nvs_get_i8(nvs, "max_tx_power", &max_tx_power_);
@@ -422,6 +415,34 @@ void WifiConfigurationAp::StartWebServer()
                 password_str = password_item->valuestring;
             }
 
+            // 解析 server_url（必填，校验 http/https scheme，剥尾部斜杠）
+            cJSON *server_url_item = cJSON_GetObjectItemCaseSensitive(json, "server_url");
+            if (!cJSON_IsString(server_url_item) || server_url_item->valuestring == NULL) {
+                cJSON_Delete(json);
+                httpd_resp_send(req, "{\"success\":false,\"error\":\"Server URL is required\"}", HTTPD_RESP_USE_STRLEN);
+                return ESP_OK;
+            }
+            std::string server_url_str = server_url_item->valuestring;
+            // 校验 http/https scheme
+            if (server_url_str.find("http://") != 0 && server_url_str.find("https://") != 0) {
+                cJSON_Delete(json);
+                httpd_resp_send(req, "{\"success\":false,\"error\":\"Server URL must start with http:// or https://\"}", HTTPD_RESP_USE_STRLEN);
+                return ESP_OK;
+            }
+            // 剥尾部斜杠
+            while (!server_url_str.empty() && server_url_str.back() == '/') {
+                server_url_str.pop_back();
+            }
+            // 写入 NVS namespace "server" key "base_url"
+            {
+                nvs_handle_t nvs;
+                if (nvs_open("server", NVS_READWRITE, &nvs) == ESP_OK) {
+                    nvs_set_str(nvs, "base_url", server_url_str.c_str());
+                    nvs_commit(nvs);
+                    nvs_close(nvs);
+                }
+            }
+
             // 获取当前对象
             auto *this_ = static_cast<WifiConfigurationAp *>(req->user_ctx);
             if (!this_->ConnectToWifi(ssid_str, password_str)) {
@@ -541,9 +562,6 @@ void WifiConfigurationAp::StartWebServer()
             }
 
             // 添加配置项到JSON
-            if (!this_->ota_url_.empty()) {
-                cJSON_AddStringToObject(json, "ota_url", this_->ota_url_.c_str());
-            }
             cJSON_AddNumberToObject(json, "max_tx_power", this_->max_tx_power_);
             cJSON_AddBoolToObject(json, "remember_bssid", this_->remember_bssid_);
             cJSON_AddBoolToObject(json, "sleep_mode", this_->sleep_mode_);
@@ -616,15 +634,6 @@ void WifiConfigurationAp::StartWebServer()
                 return ESP_FAIL;
             }
 
-            // 保存OTA URL
-            cJSON *ota_url = cJSON_GetObjectItem(json, "ota_url");
-            if (cJSON_IsString(ota_url) && ota_url->valuestring) {
-                this_->ota_url_ = ota_url->valuestring;
-                err = nvs_set_str(nvs, "ota_url", this_->ota_url_.c_str());
-                if (err != ESP_OK) {
-                    ESP_LOGE(TAG, "Failed to save OTA URL: %d", err);
-                }
-            }
 
             // 保存WiFi功率
             cJSON *max_tx_power = cJSON_GetObjectItem(json, "max_tx_power");
@@ -677,8 +686,8 @@ void WifiConfigurationAp::StartWebServer()
             httpd_resp_set_hdr(req, "Connection", "close");
             httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
 
-            ESP_LOGI(TAG, "Saved settings: ota_url=%s, max_tx_power=%d, remember_bssid=%d, sleep_mode=%d",
-                this_->ota_url_.c_str(), this_->max_tx_power_, this_->remember_bssid_, this_->sleep_mode_);
+            ESP_LOGI(TAG, "Saved settings: max_tx_power=%d, remember_bssid=%d, sleep_mode=%d",
+                this_->max_tx_power_, this_->remember_bssid_, this_->sleep_mode_);
             return ESP_OK;
         },
         .user_ctx = this

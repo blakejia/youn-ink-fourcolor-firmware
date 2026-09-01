@@ -46,10 +46,13 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from pydantic import BaseModel
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.responses import Response
 
 from .canvas_render import RenderError, render_canvas_to_bitmap
+from . import pairing as pairing_mod
+
 from . import pages as pages_mod
 
 from . import image_conv
@@ -80,6 +83,36 @@ def _require_operator(request: Request) -> None:
     provided = request.headers.get("X-Operator-Token", "")
     if not secrets.compare_digest(provided.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="bad operator token")
+
+# ── pairing (device auth) ───────────────────────────────────────────
+_pairing_store = pairing_mod.PairingStore(settings.devices_db)
+
+
+class _PairStartBody(BaseModel):
+    device_id: str
+    board_type: str = "unknown"
+
+
+class _PairConfirmBody(BaseModel):
+    device_id: str
+    code: str
+
+
+class _PairClaimBody(BaseModel):
+    device_id: str
+    code: str
+
+
+def _require_device_token(request: Request) -> None:
+    """Validate Authorization: Bearer <token> against device_secrets + trust."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    token = auth[7:]
+    dev = registry.get_device_by_token(token)
+    if dev is None or not dev.trusted:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
 
 
 # ── image storage helpers ─────────────────────────────────────────────
@@ -208,6 +241,38 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "unknown device")
         return {"device_id": device_id, "trust": False}
 
+    # ── device pairing ──
+    @app.post("/api/devices/pair-start")
+    async def pair_start(body: _PairStartBody, request: Request) -> dict:
+        ip = request.client.host if request.client else "unknown"
+        if not _pairing_store.check_rate_limit(ip):
+            raise HTTPException(429, detail="rate limited, try again later")
+        # Upsert device if new
+        registry.upsert(body.device_id, body.board_type)
+        code, expires_in = _pairing_store.create_session(body.device_id)
+        return {"code": code, "expires_in": expires_in}
+
+    @app.post("/api/devices/pair-confirm")
+    async def pair_confirm(body: _PairConfirmBody, request: Request) -> dict:
+        _require_operator(request)
+        if not _pairing_store.confirm_session(body.device_id, body.code):
+            raise HTTPException(401, detail="invalid or expired code")
+        return {"status": "ready"}
+
+    @app.post("/api/devices/pair-claim")
+    async def pair_claim(body: _PairClaimBody, request: Request) -> dict:
+        if _pairing_store.is_claim_locked(body.device_id):
+            raise HTTPException(429, detail="too many failed attempts, try again later")
+        token = _pairing_store.claim_session(body.device_id, body.code)
+        if token is None:
+            _pairing_store.record_claim_failure(body.device_id)
+            raise HTTPException(401, detail="invalid or expired code")
+        # Write token and mark device trusted
+        registry.set_token(body.device_id, token)
+        registry.approve(body.device_id)
+        return {"token": token}
+
+
     # ── image upload + push ──
     @app.post("/api/images")
     async def upload_image(
@@ -300,7 +365,8 @@ def create_app() -> FastAPI:
         return meta.to_json()
 
     @app.get("/api/ota/check")
-    async def ota_check(channel: str = Query("stable")) -> dict:
+    async def ota_check(request: Request, channel: str = Query("stable")) -> dict:
+        _require_device_token(request)
         meta = ota_mod.latest(channel)
         if meta is None:
             return {"available": False}
@@ -314,7 +380,8 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/ota/download/{filename}")
-    async def ota_download(filename: str) -> FileResponse:
+    async def ota_download(filename: str, request: Request) -> FileResponse:
+        _require_device_token(request)
         p = ota_mod.get_file_path(filename)
         if p is None:
             raise HTTPException(404, "unknown firmware")
@@ -441,20 +508,21 @@ def create_app() -> FastAPI:
             ip_address=websocket.client.host if websocket.client else None,
         )
 
-        # 2) Pairing gate: trusted OR a one-time ?secret= match.
-        qs = websocket.query_params
-        presented_secret = qs.get("secret", "")
-        expected_secret = registry.get_secret(device_id)
+        # 2) Auth via Bearer token in WebSocket handshake headers.
+        auth_header = websocket.headers.get("authorization", "")
+        token = ""
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+        dev_by_token = registry.get_device_by_token(token) if token else None
         authorized = dev.trusted or (
-            expected_secret and presented_secret and
-            secrets.compare_digest(presented_secret.encode(), expected_secret.encode())
+            dev_by_token is not None and dev_by_token.trusted
         )
         if not authorized:
             await websocket.send_text(json.dumps(P.ok(
                 P.OutMsg.ERROR, message="device not trusted; pair via operator API",
             )))
             await websocket.close()
-            log.warning("ws refused device=%s (not trusted, no secret)", device_id)
+            log.warning("ws refused device=%s (not trusted, no valid token)", device_id)
             return
 
         # 3) Hand off to session manager.
