@@ -20,6 +20,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "common/server_pairing.h"
+#include "common/page_sync.h"
 
 #include <ctime>
 
@@ -139,6 +140,11 @@ void ServerPairingTaskTrampoline(void*) {
     if (server_pairing_get_token(tok, sizeof(tok))) {
         ESP_LOGI(kTag, "ServerPairing: token ready (%d chars)", (int)strlen(tok));
     }
+    // Canvas Loop: page_sync 需要显示实例（spec 2026-09-01 §3）
+    auto& board = Board::GetInstance();
+    page_sync_set_display(board.GetDisplay());
+    page_sync_start();
+    ESP_LOGI(kTag, "PageSync: started");
     vTaskDelete(nullptr);
 }
 
