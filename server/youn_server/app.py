@@ -22,6 +22,7 @@ registry, or a one-time pairing secret via `?secret=<hex>` query parameter.
 from __future__ import annotations
 
 import asyncio
+import os
 import io
 import json
 import logging
@@ -50,7 +51,7 @@ from pydantic import BaseModel
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.responses import Response
 
-from .canvas_render import RenderError, render_canvas_to_bitmap
+from .canvas_render import RenderError, render_canvas_to_bitmap, render_canvas_to_png
 from . import pairing as pairing_mod
 
 from . import pages as pages_mod
@@ -71,9 +72,8 @@ _OPERATOR_TOKEN = secrets.compare_digest  # type: ignore[attr-defined]
 
 
 def _operator_token() -> Optional[str]:
-    """Read operator token from env at request time (no caching)."""
-    import os
-    return os.environ.get("OPERATOR_TOKEN") or None
+    """Read operator token: environment first (test override), then .env settings."""
+    return os.environ.get("OPERATOR_TOKEN") or settings.operator_token or None
 
 
 def _require_operator(request: Request) -> None:
@@ -364,6 +364,15 @@ def create_app() -> FastAPI:
         meta = ota_mod.save_firmware(data, version=version, channel=channel, notes=notes)
         return meta.to_json()
 
+    @app.get("/api/ota")
+    async def ota_meta(request: Request) -> dict:
+        """Operator view: current firmware metadata."""
+        _require_operator(request)
+        meta = ota_mod.latest("stable")
+        if meta is None:
+            return {"available": False}
+        return {"available": True, **meta.to_json()}
+
     @app.get("/api/ota/check")
     async def ota_check(request: Request, channel: str = Query("stable")) -> dict:
         _require_device_token(request)
@@ -393,6 +402,21 @@ def create_app() -> FastAPI:
         if not ota_mod.verify_signature(p):
             raise HTTPException(500, "firmware signature mismatch")
         return FileResponse(p, filename=filename, media_type="application/octet-stream")
+
+    @app.post("/api/pages/preview")
+    async def preview_page(request: Request, body: dict = Body(...)) -> Response:
+        """Render canvas_json to a PNG preview (used by the web admin UI)."""
+        _require_operator(request)
+        canvas_json = body.get("canvas_json")
+        if not isinstance(canvas_json, dict):
+            raise HTTPException(400, "canvas_json must be an object")
+        try:
+            png = render_canvas_to_png(canvas_json)
+        except RenderError as e:
+            raise HTTPException(400, f"render failed: {e.path}: {e.message}") from e
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"render failed: {e}") from e
+        return Response(content=png, media_type="image/png")
 
     # ── Canvas Loop ──
 
@@ -560,6 +584,15 @@ def create_app() -> FastAPI:
         finally:
             session.closed = True
             await app.state.sessions.unregister(session.session_id)
+    # ── Web admin UI (Vite build output) ──
+    dist_dir = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    if dist_dir.exists() and (dist_dir / "index.html").exists():
+        from fastapi.staticfiles import StaticFiles
+
+        app.mount("/", StaticFiles(directory=str(dist_dir), html=True), name="spa")
+        log.info("web admin UI mounted from %s", dist_dir)
+    else:
+        log.warning("frontend/dist not found (%s); web admin UI disabled", dist_dir)
 
     return app
 

@@ -13,6 +13,8 @@ import pytest
 
 from youn_server.config import settings
 
+# Tests run without operator token (auth logic is exercised in test_pairing separately)
+settings.operator_token = ""
 
 @pytest.fixture(autouse=True)
 def isolate_pages_dir():

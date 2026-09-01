@@ -566,3 +566,25 @@ def render_canvas_to_bitmap(canvas_json: dict) -> bytes:
         return r.render(canvas_json)
     finally:
         r.close()
+
+
+def render_canvas_to_png(canvas_json: dict) -> bytes:
+    """Render canvas_json to a 400x300 PNG preview (for the web admin UI).
+
+    Returns PNG bytes; raises RenderError on unsupported element/property.
+    """
+    import io
+
+    bitmap = render_canvas_to_bitmap(canvas_json)
+    img = Image.new("RGB", (SCREEN_W, SCREEN_H))
+    px = img.load()
+    for y in range(SCREEN_H):
+        for xb in range(SCREEN_W // 4):
+            byte = bitmap[y * (SCREEN_W // 4) + xb]
+            for xi in range(4):
+                x = xb * 4 + xi
+                idx = (byte >> ((3 - xi) * 2)) & 0x3
+                px[x, y] = _PILLOW_BG[idx]
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
