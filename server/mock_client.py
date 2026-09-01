@@ -93,7 +93,7 @@ async def run_full_test(server_url: str):
     results = {
         "hello_ack": False,
         "server_ready": False,
-        "asr_result": None,
+        "asrresult": None,
         "llm_chunks": 0,
         "llm_full_text": "",
         "tts_audio_received": False,
