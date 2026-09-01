@@ -24,7 +24,9 @@ static int s_page_count = 0;
 static char s_schedule_md5[33] = {0};
 static int s_current_index = 0;
 static uint64_t s_current_page_started_us = 0;
-static CustomLcdDisplay* s_lcd = nullptr;
+static bool s_manual_hold = false;   // 手动翻页后暂停自动轮换 30s
+static uint64_t s_manual_hold_until_us = 0;
+static bool s_displaying = false;    // 画板当前全屏显示中
 static bool s_running = false;
 
 extern Display* create_board_display_placeholder();  // not used; resolved via board
@@ -195,10 +197,32 @@ static void show_page(int index) {
     memcpy(fb, s_pages[index].bitmap, PAGE_BITMAP_SIZE);
     xSemaphoreGive(lcd->GetMutex());
     lcd->RequestUrgentFullRefresh();
+    s_displaying = true;
     ESP_LOGI(kTag, "show page %d/%d md5=%.8s via framebuffer", index + 1, s_page_count,
              s_pages[index].md5);
 }
 
+void page_sync_next(void) {
+    if (s_page_count <= 0) return;
+    s_current_index = (s_current_index + 1) % s_page_count;
+    s_current_page_started_us = now_us();
+    s_manual_hold = true;
+    s_manual_hold_until_us = now_us() + 30ULL * 1000000ULL;
+    show_page(s_current_index);
+}
+
+void page_sync_prev(void) {
+    if (s_page_count <= 0) return;
+    s_current_index = (s_current_index - 1 + s_page_count) % s_page_count;
+    s_current_page_started_us = now_us();
+    s_manual_hold = true;
+    s_manual_hold_until_us = now_us() + 30ULL * 1000000ULL;
+    show_page(s_current_index);
+}
+
+bool page_sync_is_displaying(void) { return s_displaying; }
+void page_sync_stop_display(void) { s_displaying = false; }
+void page_sync_resume_display(void) { s_displaying = true; }
 static void page_sync_task(void* arg) {
     ESP_LOGI(kTag, "page_sync task started");
     int tick = 0;

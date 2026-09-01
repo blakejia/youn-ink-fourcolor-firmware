@@ -8,6 +8,7 @@
 #include "boards/zectrix-s3-epaper-4.2/custom_lcd_display.h"
 #include "rawdraw/style.h"
 #include "rawdraw/rawdraw.h"
+#include "common/page_sync.h"
 #include "rawdraw/theme.h"
 #include "rawdraw/clock.h"
 #include "rawdraw/layout_utils.h"
@@ -860,6 +861,11 @@ bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
 void RawDrawUiManager::RenderAll(uint8_t* fb, int width, int height) {
     if (!fb) {
         ESP_LOGW(kTag, "RenderAll called with null framebuffer");
+        return;
+    }
+    // 画板全屏显示时，UI 不绘制任何东西（状态栏/页面内容都不画），避免覆盖 canvas 内容。
+    if (page_sync_is_displaying()) {
+        ESP_LOGD(kTag, "RenderAll skipped: canvas loop is displaying");
         return;
     }
     std::lock_guard<std::mutex> lock(ui_state_mutex_);

@@ -408,6 +408,11 @@ void Application::Initialize() {
 void Application::OnUpClick() {
     ESP_LOGI(kTag, "UP click");
     Board::GetInstance().FlashActivityLed();
+    // 画板显示时上键翻页
+    if (page_sync_is_displaying()) {
+        page_sync_prev();
+        return;
+    }
     if (rawdraw_ui_manager_) {
         rawdraw_ui_manager_->HandleInput(rawdraw::ButtonEvent{rawdraw::ButtonEvent::kUpClick});
     }
@@ -416,11 +421,15 @@ void Application::OnUpClick() {
 void Application::OnDownClick() {
     ESP_LOGI(kTag, "DOWN click");
     Board::GetInstance().FlashActivityLed();
+    // 画板显示时下键翻页
+    if (page_sync_is_displaying()) {
+        page_sync_next();
+        return;
+    }
     if (rawdraw_ui_manager_) {
         rawdraw_ui_manager_->HandleInput(rawdraw::ButtonEvent{rawdraw::ButtonEvent::kDownClick});
     }
 }
-
 void Application::OnUpLongPress() {
     ESP_LOGI(kTag, "UP long press");
     NoteButtonActivity();
