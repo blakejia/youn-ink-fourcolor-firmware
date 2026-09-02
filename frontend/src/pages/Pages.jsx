@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api.js';
-
+import CanvasEditor from '../CanvasEditor.jsx';
 const EMPTY_CANVAS = JSON.stringify(
   { default: [{ type: 'div', props: { tw: 'flex flex-col p-[12px] gap-[8px] bg-white', style: { color: '#000000' }, children: '新页面' } }] },
   null, 2
@@ -109,19 +109,20 @@ export default function Pages() {
             <label>时长(min) <input type="number" value={duration} onChange={(e) => setDuration(e.target.value)} style={{ width: 70 }} /></label>
             <label>顺序 <input type="number" value={order} onChange={(e) => setOrder(e.target.value)} style={{ width: 60 }} /></label>
           </div>
-          <textarea className="code" value={json} onChange={(e) => setJson(e.target.value)} />
+          <CanvasEditor canvasJson={json} onChange={(parsed) => setJson(JSON.stringify(parsed, null, 2))} />
           {previewErr && <div className="err">{previewErr}</div>}
           <div className="row" style={{ marginTop: 10 }}>
-            <button className="btn secondary" onClick={doPreview}>预览</button>
+            <button className="btn secondary" onClick={doPreview}>预览位图</button>
             <button className="btn" onClick={save}>保存</button>
             <button className="btn secondary" onClick={() => setEditing(null)}>取消</button>
           </div>
           {preview && (
             <div style={{ marginTop: 12 }}>
-              <p className="muted">渲染预览（400×300）：</p>
+              <p className="muted">服务端渲染预览（400×300 2bpp）：</p>
               <img className="preview" src={preview} width="400" height="300" alt="canvas preview" />
             </div>
           )}
+
         </div>
       )}
     </div>
