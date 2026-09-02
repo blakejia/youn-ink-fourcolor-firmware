@@ -201,7 +201,7 @@ const char* RawDrawUiManager::GetPageTitle(RawDrawPageId page) {
         case RawDrawPageId::Ebook:    return "电子书";
         case RawDrawPageId::Wifi:     return "WiFi状态";
         case RawDrawPageId::Settings: return "设置";
-        case RawDrawPageId::Gallery:  return "相册";
+
         case RawDrawPageId::Weather:  return "天气";
         case RawDrawPageId::News:     return "热点";
         case RawDrawPageId::WeatherDetail: return "天气详情";
@@ -213,7 +213,6 @@ const char* RawDrawUiManager::GetPageTitle(RawDrawPageId page) {
         case RawDrawPageId::Calendar:   return "日历";
         case RawDrawPageId::FontDebug:  return "对齐测试";
         case RawDrawPageId::FontMetrics: return "字体指标";
-        case RawDrawPageId::APTransfer: return "传图模式";
         default:               return "未知";
     }
 }
@@ -226,8 +225,7 @@ RawDrawUiManager::RawDrawUiManager()
     : lcd_(nullptr)
     , width_(Style::kScreenWidth)
     , height_(Style::kScreenHeight)
-    , current_page_(RawDrawPageId::Gallery)
-    , refresh_cb_(nullptr)
+    , current_page_(RawDrawPageId::Chat)
     , full_refresh_pending_(false)
     , clock_(rawdraw::kClockX, rawdraw::kClockY, &font_zectrix_16_1)
     , voice_wakeup_state_() {
@@ -249,79 +247,11 @@ RawDrawUiManager::RawDrawUiManager()
     calendar_renderer_ = std::make_unique<rawdraw::CalendarRenderer>();
     font_debug_renderer_ = std::make_unique<rawdraw::FontDebugRenderer>();
     font_metrics_renderer_ = std::make_unique<rawdraw::FontMetricsRenderer>();
-    ap_transfer_renderer_ = std::make_unique<rawdraw::ApTransferRenderer>();
-    ap_transfer_server_ = std::make_unique<rawdraw::ApTransferServer>();
-    ap_transfer_server_->SetStateCallback(
-        [this](rawdraw::ApTransferServer::ServerState state, const std::string& message) {
-            if (!ap_transfer_renderer_) return;
-            bool should_refresh = false;
-            switch (state) {
-                case rawdraw::ApTransferServer::kApStarted:
-                    ap_transfer_renderer_->SetState(rawdraw::ApTransferRenderer::kWaitingForConnection, message);
-                    should_refresh = true;
-                    break;
-                case rawdraw::ApTransferServer::kClientConnected:
-                    ap_transfer_renderer_->SetState(rawdraw::ApTransferRenderer::kClientConnected, message);
-                    break;
-                case rawdraw::ApTransferServer::kReceivingImage:
-                    // Uploads from the phone finish much faster than a
-                    // four-color EPD refresh. Keep the existing screen until
-                    // the final saved/error state so transient upload text
-                    // cannot become stale on glass.
-                    break;
-                case rawdraw::ApTransferServer::kProcessingImage:
-                    // Same as Receiving: this state is useful for logs, but
-                    // not worth a slow panel refresh.
-                    break;
-                case rawdraw::ApTransferServer::kImageSaved:
-                    ap_transfer_renderer_->SetState(rawdraw::ApTransferRenderer::kComplete, message);
-                    should_refresh = true;
-                    break;
-                case rawdraw::ApTransferServer::kError:
-                    ap_transfer_renderer_->SetState(rawdraw::ApTransferRenderer::kError, message);
-                    should_refresh = true;
-                    break;
-                case rawdraw::ApTransferServer::kStopped:
-                default:
-                    ap_transfer_renderer_->SetState(rawdraw::ApTransferRenderer::kWaitingForConnection, message);
-                    should_refresh = true;
-                    break;
-            }
-            if (should_refresh && current_page_ == RawDrawPageId::APTransfer) {
-                // AP/HTTP handlers run on their own task. Queue the actual EPD
-                // render for the main loop, and skip transient Receiving /
-                // Processing states so a fast upload does not leave the panel
-                // stuck showing an obsolete slow-refresh status.
-                RequestActivePageRefresh();
-            }
-        });
-    ap_transfer_server_->SetImageReceivedCallback([this](const char*) {
-        if (photo_gallery_renderer_) {
-            photo_gallery_renderer_->RefreshPhotoList();
-            const int count = photo_gallery_renderer_->GetPhotoCount();
-            if (count > 0) {
-                photo_gallery_renderer_->SetSelectedIndex(count - 1);
-            }
-        }
-    });
-    ap_transfer_server_->SetSettingsChangedCallback([this](int slideshow_interval_minutes) {
-        SetGallerySlideshowIntervalMinutes(slideshow_interval_minutes);
-        UpdateSettingsItem(3, slideshow_interval_minutes <= 0
-            ? std::string("关闭")
-            : std::to_string(slideshow_interval_minutes) + "min");
-        RequestActivePageRefresh();
-    });
-    ap_transfer_server_->SetPhotosChangedCallback([this]() {
-        if (photo_gallery_renderer_) {
-            photo_gallery_renderer_->RefreshPhotoList();
-        }
-    });
-    ap_transfer_server_->SetShowPhotoCallback([this](const std::string& photo_id) {
-        return ShowPhotoById(photo_id);
-    });
-
     // Initialize status bar defaults
-    status_bar_data_.page_title = GetPageTitle(RawDrawPageId::Gallery);
+    status_bar_data_.page_title = GetPageTitle(RawDrawPageId::Chat);
+
+
+
     status_bar_data_.wifi_connected = false;
     status_bar_data_.server_connected = false;
     status_bar_data_.battery_level = -1;
@@ -342,11 +272,7 @@ RawDrawUiManager::~RawDrawUiManager() {
         esp_timer_delete(transient_refresh_timer_);
         transient_refresh_timer_ = nullptr;
     }
-    if (gallery_slideshow_timer_ != nullptr) {
-        esp_timer_stop(gallery_slideshow_timer_);
-        esp_timer_delete(gallery_slideshow_timer_);
-        gallery_slideshow_timer_ = nullptr;
-    }
+
     ESP_LOGI(kTag, "RawDraw UI Manager destroyed");
 }
 
@@ -408,18 +334,7 @@ void RawDrawUiManager::Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb) {
         }
     }
 
-    if (gallery_slideshow_timer_ == nullptr) {
-        esp_timer_create_args_t timer_args = {};
-        timer_args.callback = &RawDrawUiManager::OnGallerySlideshowTimer;
-        timer_args.arg = this;
-        timer_args.dispatch_method = ESP_TIMER_TASK;
-        timer_args.name = "gallery_slideshow";
-        esp_err_t ret = esp_timer_create(&timer_args, &gallery_slideshow_timer_);
-        if (ret != ESP_OK) {
-            ESP_LOGW(kTag, "Failed to create slideshow timer: %s", esp_err_to_name(ret));
-        }
-    }
-    ArmGallerySlideshowTimer();
+    // Gallery slideshow timer removed (Gallery page removed)
 
     // Clear and render initial frame
     auto* fb = lcd_->GetFramebuffer();
@@ -542,7 +457,7 @@ rawdraw::PageRenderer* RawDrawUiManager::GetRendererForPage(RawDrawPageId page) 
         case RawDrawPageId::Ebook:    return ebook_renderer_.get();
         case RawDrawPageId::Wifi:     return wifi_renderer_.get();
         case RawDrawPageId::Settings: return settings_renderer_.get();
-        case RawDrawPageId::Gallery:  return photo_gallery_renderer_.get();
+
         case RawDrawPageId::Weather:  return weather_renderer_.get();
         case RawDrawPageId::News:     return news_renderer_.get();
         case RawDrawPageId::WeatherDetail: return weather_detail_renderer_.get();
@@ -554,7 +469,7 @@ rawdraw::PageRenderer* RawDrawUiManager::GetRendererForPage(RawDrawPageId page) 
         case RawDrawPageId::Calendar:   return calendar_renderer_.get();
         case RawDrawPageId::FontDebug:  return font_debug_renderer_.get();
         case RawDrawPageId::FontMetrics: return font_metrics_renderer_.get();
-        case RawDrawPageId::APTransfer: return ap_transfer_renderer_.get();
+
         default:               return nullptr;
     }
 }
@@ -614,15 +529,7 @@ bool RawDrawUiManager::TryDisplayCurrentPhotoRaw4Color() {
     int photo_width = 0;
     int photo_height = 0;
 
-    if (current_page_ == RawDrawPageId::Gallery && photo_gallery_renderer_ &&
-        photo_gallery_renderer_->IsFullscreenMode() &&
-        !photo_gallery_renderer_->IsDeleteDialogOpen() &&
-        photo_gallery_renderer_->IsCurrentPhotoBwry2bpp()) {
-        data = photo_gallery_renderer_->GetCurrentPhotoData();
-        size = photo_gallery_renderer_->GetCurrentPhotoSize();
-        photo_width = photo_gallery_renderer_->GetCurrentPhotoWidth();
-        photo_height = photo_gallery_renderer_->GetCurrentPhotoHeight();
-    } else if (current_page_ == RawDrawPageId::PhotoDetail && photo_detail_renderer_ &&
+    if (current_page_ == RawDrawPageId::PhotoDetail && photo_detail_renderer_ &&
                !photo_detail_renderer_->IsMetadataOpen() &&
                photo_detail_renderer_->IsCurrentPhotoBwry2bpp()) {
         data = photo_detail_renderer_->GetCurrentPhotoData();
@@ -645,63 +552,31 @@ bool RawDrawUiManager::TryDisplayCurrentPhotoRaw4Color() {
     return shown;
 }
 
-const std::array<RawDrawUiManager::QuickSwitchItem, 2>& RawDrawUiManager::GetQuickSwitchItems() {
-    static const std::array<QuickSwitchItem, 2> kItems = {{
-        {RawDrawPageId::Gallery, "相册", FA_SETTINGS_IMAGE},
+const std::array<RawDrawUiManager::QuickSwitchItem, 1>& RawDrawUiManager::GetQuickSwitchItems() {
+    static const std::array<QuickSwitchItem, 1> kItems = {{
         {RawDrawPageId::Settings, "设置", FA_SETTINGS_GEAR},
-#if 0
-        // Hardware-only alignment pages are intentionally hidden from the
-        // user-facing quick switch. Keep the renderer code for calibration,
-        // but do not expose them in normal navigation.
-        {RawDrawPageId::FontDebug, "对齐测试", nullptr},
-        {RawDrawPageId::FontMetrics, "字体指标", nullptr},
-#endif
     }};
     return kItems;
-}
-
-void RawDrawUiManager::StartApTransferMode() {
-    if (ap_transfer_renderer_) {
-        ap_transfer_renderer_->UseDefaultTransferInstructions();
-    }
-    if (ap_transfer_server_) {
-        ap_transfer_server_->Start();
-    }
-    SwitchPage(RawDrawPageId::APTransfer);
-}
-
-void RawDrawUiManager::StopApTransferMode() {
-    if (ap_transfer_server_) {
-        ap_transfer_server_->Stop();
-    }
-    SwitchPage(RawDrawPageId::Gallery);
 }
 
 void RawDrawUiManager::ShowWifiConfigPage(const std::string& ssid,
                                           const std::string& password,
                                           const std::string& url) {
-    if (ap_transfer_renderer_) {
-        ap_transfer_renderer_->SetInstructionContent("WiFi 配网",
-                                                     ssid.empty() ? "ZecTrix" : ssid,
-                                                     password,
-                                                     url.empty() ? "http://192.168.4.1" : url,
-                                                     "连接热点后打开页面配置 WiFi",
-                                                     "长按 BOOT 退出");
-        ap_transfer_renderer_->SetState(rawdraw::ApTransferRenderer::kWaitingForConnection,
-                                        "192.168.4.1");
-    }
-    SwitchPage(RawDrawPageId::APTransfer);
+    // AP Transfer renderer removed — show the WiFi status page instead.
+    (void)ssid;
+    (void)password;
+    (void)url;
+    SwitchPage(RawDrawPageId::Wifi);
 }
 
 bool RawDrawUiManager::StartLanHttpServer(const std::string& ip_address) {
-    if (!ap_transfer_server_) return false;
-    return ap_transfer_server_->StartLan(ip_address);
+    // LAN HTTP server is now handled by the server-side pairing flow
+    // (no local HTTP server needed for AP transfer).
+    return false;
 }
 
 void RawDrawUiManager::StopLanHttpServer() {
-    if (ap_transfer_server_ && ap_transfer_server_->IsLanMode()) {
-        ap_transfer_server_->Stop();
-    }
+    // No-op: LAN HTTP server removed
 }
 
 // ============================================================
@@ -716,50 +591,12 @@ bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
     }
 
     if (event.type == rawdraw::ButtonEvent::kBootLongPress) {
-        // AP transfer owns BOOT-long globally while the server is running, even
-        // if a background display update temporarily moved the visible page.
-        if ((ap_transfer_server_ && ap_transfer_server_->IsRunning() && ap_transfer_server_->IsApMode()) ||
-            current_page_ == RawDrawPageId::APTransfer) {
-            ESP_LOGI(kTag, "BOOT long press - exiting AP transfer mode");
-            StopApTransferMode();
-            return true;
-        }
-
-        if (current_page_ == RawDrawPageId::Gallery) {
-            ESP_LOGI(kTag, "Gallery long press BOOT - entering AP transfer mode");
-            StartApTransferMode();
-            return true;
-        }
+        // Gallery/AP transfer removed; BOOT long press is now a no-op here.
+        // The application layer handles it (page_sync exit → Settings).
     }
     
     if (event.type == rawdraw::ButtonEvent::kBootDoubleClick) {
-#if 0
-        // Disabled during hardware screenshot verification. BOOT double-click
-        // is globally reserved for debug screenshot capture.
-        if (current_page_ == RawDrawPageId::Weather) {
-            SwitchPage(RawDrawPageId::WeatherDetail);
-            return true;
-        }
-        if (current_page_ == RawDrawPageId::WeatherDetail) {
-            SwitchPage(RawDrawPageId::Weather);
-            return true;
-        }
-#endif
-#if 0
-        // Disabled for now: BOOT double-click must remain global screenshot on
-        // gallery so real hardware captures can report the memory-card layout.
-        if (current_page_ == RawDrawPageId::Gallery) {
-            if (photo_detail_renderer_ && photo_gallery_renderer_) {
-                photo_detail_renderer_->SetSelection(photo_gallery_renderer_->GetSelectedIndex());
-            }
-            SwitchPage(RawDrawPageId::PhotoDetail);
-            return true;
-        }
-        if (current_page_ == RawDrawPageId::PhotoDetail) {
-            SwitchPage(RawDrawPageId::Gallery);
-            return true;
-        }
-#endif
+        // Gallery/PhotoDetail removed; BOOT double-click is a no-op here.
     }
 
     if (event.type == rawdraw::ButtonEvent::kUpDoubleClick) {
@@ -869,10 +706,7 @@ void RawDrawUiManager::RenderAll(uint8_t* fb, int width, int height) {
         return;
     }
     std::lock_guard<std::mutex> lock(ui_state_mutex_);
-    const bool gallery_fullscreen =
-        current_page_ == RawDrawPageId::Gallery &&
-        photo_gallery_renderer_ &&
-        photo_gallery_renderer_->IsFullscreenMode();
+    const bool gallery_fullscreen = false;
     const bool ebook_portrait_reader =
         current_page_ == RawDrawPageId::Ebook &&
         ebook_renderer_ &&
@@ -1322,65 +1156,14 @@ void RawDrawUiManager::RequestActivePageRefresh() {
 }
 
 bool RawDrawUiManager::ShowPhotoById(const std::string& photo_id) {
-    if (!photo_gallery_renderer_ || photo_id.empty()) {
-        return false;
-    }
-    photo_gallery_renderer_->RefreshPhotoList();
-    if (!photo_gallery_renderer_->SetSelectedById(photo_id.c_str())) {
-        ESP_LOGW(kTag, "ShowPhotoById failed: id=%s not found", photo_id.c_str());
-        return false;
-    }
-    photo_gallery_renderer_->EnterFullscreenMode();
-    SwitchPage(RawDrawPageId::Gallery);
-    ESP_LOGI(kTag, "Show photo fullscreen from HTTP: id=%s", photo_id.c_str());
-    return true;
+    // Gallery removed; this function is now a no-op.
+    ESP_LOGW(kTag, "ShowPhotoById: Gallery removed, cannot show photo id=%s", photo_id.c_str());
+    return false;
 }
 
 void RawDrawUiManager::SetGallerySlideshowIntervalMinutes(int minutes) {
-    gallery_slideshow_interval_minutes_ = std::max(0, minutes);
-    gallery_slideshow_pending_.store(false, std::memory_order_release);
-    ArmGallerySlideshowTimer();
-    if (gallery_slideshow_interval_minutes_ <= 0) {
-        ESP_LOGI(kTag, "Gallery slideshow disabled");
-    } else {
-        ESP_LOGI(kTag, "Gallery slideshow interval=%d minutes", gallery_slideshow_interval_minutes_);
-    }
-}
-
-void RawDrawUiManager::ArmGallerySlideshowTimer() {
-    if (gallery_slideshow_timer_ == nullptr) return;
-    esp_timer_stop(gallery_slideshow_timer_);
-    if (gallery_slideshow_interval_minutes_ <= 0) return;
-
-    const int64_t delay_us = static_cast<int64_t>(gallery_slideshow_interval_minutes_) * 60 * 1000 * 1000;
-    esp_err_t ret = esp_timer_start_once(gallery_slideshow_timer_, delay_us);
-    if (ret != ESP_OK) {
-        ESP_LOGW(kTag, "Failed to arm slideshow timer: %s", esp_err_to_name(ret));
-    }
-}
-
-void RawDrawUiManager::OnGallerySlideshowTimer(void* arg) {
-    auto* self = static_cast<RawDrawUiManager*>(arg);
-    if (self != nullptr) {
-        self->gallery_slideshow_pending_.store(true, std::memory_order_release);
-    }
-}
-
-bool RawDrawUiManager::AdvanceGallerySlideshow() {
-    ArmGallerySlideshowTimer();
-    if (current_page_ != RawDrawPageId::Gallery || !photo_gallery_renderer_) {
-        return false;
-    }
-    if (!photo_gallery_renderer_->IsFullscreenMode() ||
-        photo_gallery_renderer_->IsDeleteDialogOpen()) {
-        return false;
-    }
-    if (!photo_gallery_renderer_->SelectNext(true)) {
-        return false;
-    }
-    ESP_LOGI(kTag, "Gallery fullscreen slideshow advanced");
-    RefreshActivePage(false);
-    return true;
+    // Gallery removed; slideshow is a no-op
+    (void)minutes;
 }
 
 // ============================================================
@@ -1466,18 +1249,14 @@ void RawDrawUiManager::OnTransientRefreshTimer(void* arg) {
 void RawDrawUiManager::PumpClockRefresh() {
     const bool page_pending = active_page_refresh_pending_.exchange(false, std::memory_order_acq_rel);
     const bool transient_pending = transient_refresh_pending_.exchange(false, std::memory_order_acq_rel);
-    const bool slideshow_pending = gallery_slideshow_pending_.exchange(false, std::memory_order_acq_rel);
-    if (slideshow_pending) {
-        AdvanceGallerySlideshow();
-    }
     if (page_pending || transient_pending) {
         RefreshActivePage(false);
     }
-
     if (!kEnableMinuteClockRefresh) {
         clock_refresh_pending_.store(false, std::memory_order_release);
         return;
     }
+
 
     if (!clock_refresh_pending_.exchange(false, std::memory_order_acq_rel)) {
         return;

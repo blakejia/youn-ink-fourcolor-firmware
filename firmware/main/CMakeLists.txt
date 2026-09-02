@@ -82,8 +82,7 @@ set(SOURCES
     "ui/renderers/rawdraw/news_renderer.cc"
     "ui/renderers/rawdraw/font_debug_renderer.cc"
     "ui/renderers/rawdraw/font_metrics_renderer.cc"
-    "ui/renderers/rawdraw/ap_transfer_renderer.cc"
-    "ui/renderers/rawdraw/ap_transfer_server.cc"
+
     "ui/rawdraw_ui_manager.cc"
     "ui/epd_refresh.cc"
     "streaming/text_chunker.cc"

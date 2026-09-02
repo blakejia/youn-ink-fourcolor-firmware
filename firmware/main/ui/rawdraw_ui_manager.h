@@ -29,8 +29,6 @@
 #include "ui/renderers/rawdraw/font_debug_renderer.h"
 #include "ui/renderers/rawdraw/font_metrics_renderer.h"
 #include "ui/renderers/rawdraw/calendar_renderer.h"
-#include "ui/renderers/rawdraw/ap_transfer_renderer.h"
-#include "ui/renderers/rawdraw/ap_transfer_server.h"
 #include "rawdraw/rawdraw.h"
 #include "rawdraw/theme.h"
 #include "rawdraw/style.h"
@@ -63,7 +61,6 @@ enum class RawDrawPageId {
     Ebook = 2,
     Wifi = 3,
     Settings = 4,
-    Gallery = 5,
     Weather = 6,
     News = 7,
     WeatherDetail = 8,
@@ -75,7 +72,6 @@ enum class RawDrawPageId {
     Calendar = 14,
     FontDebug = 15,
     FontMetrics = 16,
-    APTransfer = 17,
     Count,
 };
 
@@ -180,28 +176,18 @@ public:
      * @brief Whether the global UP-double quick switch modal is open.
      *
      * LanMicApp checks this before page-local input handling so UP/DN/BOOT
-     * are consumed by the modal and do not leak into Todo/Gallery/etc.
+     * are consumed by the modal and do not leak into Todo/Settings/etc.
      */
     bool IsQuickSwitchOpen() const { return quick_switch_open_; }
-    bool IsApTransferRunning() const {
-        return ap_transfer_server_ && ap_transfer_server_->IsRunning();
-    }
-    bool IsApTransferModeRunning() const {
-        return ap_transfer_server_ && ap_transfer_server_->IsRunning() && ap_transfer_server_->IsApMode();
-    }
-    bool IsLanHttpServerRunning() const {
-        return ap_transfer_server_ && ap_transfer_server_->IsRunning() && ap_transfer_server_->IsLanMode();
-    }
-    bool IsHttpServerRunning() const {
-        return ap_transfer_server_ && ap_transfer_server_->IsRunning();
-    }
-    void StartApTransferMode();
-    void StopApTransferMode();
-    void ShowWifiConfigPage(const std::string& ssid,
-                            const std::string& password,
-                            const std::string& url);
+
+    /**
+     * @brief LAN HTTP server (removed — Gallery/AP Transfer gone).
+     * These are no-ops returning false.
+     */
     bool StartLanHttpServer(const std::string& ip_address);
     void StopLanHttpServer();
+    bool IsLanHttpServerRunning() const { return false; }
+    bool IsHttpServerRunning() const { return false; }
 
     /**
      * @brief Render everything to the framebuffer
@@ -235,86 +221,23 @@ public:
     // Page data update methods
     // ============================================================
 
-    /**
-     * @brief Add a chat message to the chat page
-     */
     void AddChatMessage(const std::string& text, rawdraw::ChatRole role);
-
-    /**
-     * @brief Clear all chat messages
-     */
     void ClearChat();
-
-    /**
-     * @brief Begin streaming text to chat page
-     */
     void BeginChatStream();
-
-    /**
-     * @brief Append streaming text chunk to chat page
-     */
     bool AppendChatText(const char* chunk);
-
-    /**
-     * @brief End streaming text on chat page
-     */
     void EndChatStream();
-
-    /**
-     * @brief Show/hide status bubble on chat page
-     */
     void ShowChatStatus(const std::string& status, rawdraw::ChatRole role);
     void HideChatStatus();
-
-    /**
-     * @brief Set listening state on chat page
-     */
     void SetChatListening(bool listening);
-
-    /**
-     * @brief Set bottom status text on chat page
-     */
     void SetChatBottomStatus(const std::string& status);
-
-    /**
-     * @brief Set settings page items
-     */
     void SetSettingsItems(const std::vector<rawdraw::SettingsItemDef>& items);
-
-    /**
-     * @brief Update a settings item value
-     */
     void UpdateSettingsItem(int index, const std::string& value);
-
-    /**
-     * @brief Update a settings item checkbox state
-     */
     void UpdateSettingsChecked(int index, bool checked);
-
-    /**
-     * @brief Switch and persist the global RawDraw theme.
-     */
     void SetRawDrawTheme(rawdraw::ThemeId theme_id);
     rawdraw::ThemeId GetRawDrawTheme() const;
-
-    /**
-     * @brief Update WiFi status page data
-     */
     void UpdateWifiStatus(const rawdraw::WifiStatus& status);
-
-    /**
-     * @brief Get WiFi status
-     */
     rawdraw::WifiStatus GetWifiStatus() const;
-
-    /**
-     * @brief Set WiFi blinking animation state
-     */
     void SetWifiBlinking(bool blinking);
-
-    /**
-     * @brief Toggle lifebar page visibility (controlled via settings)
-     */
     void SetLifeBarVisible(bool visible);
     bool IsLifeBarVisible() const;
 
@@ -338,11 +261,6 @@ public:
     rawdraw::CalendarRenderer* GetCalendarRenderer() { return calendar_renderer_.get(); }
     rawdraw::FontDebugRenderer* GetFontDebugRenderer() { return font_debug_renderer_.get(); }
     rawdraw::FontMetricsRenderer* GetFontMetricsRenderer() { return font_metrics_renderer_.get(); }
-    rawdraw::ApTransferRenderer* GetApTransferRenderer() { return ap_transfer_renderer_.get(); }
-
-    // ============================================================
-    // Display dimensions
-    // ============================================================
 
     int GetWidth() const { return width_; }
     int GetHeight() const { return height_; }
@@ -360,14 +278,20 @@ public:
      * Use this from callbacks that may run outside LanMicApp::Run().
      */
     void RequestActivePageRefresh();
+
+    // Gallery removed — these are no-ops.
     void SetGallerySlideshowIntervalMinutes(int minutes);
-    int GetGallerySlideshowIntervalMinutes() const { return gallery_slideshow_interval_minutes_; }
     bool ShowPhotoById(const std::string& photo_id);
 
     /**
-     * @brief Trigger EPD refresh immediately
-     *
-     * Marks entire framebuffer dirty and calls refresh_cb_ to push
+     * @brief Show WiFi config page
+     */
+    void ShowWifiConfigPage(const std::string& ssid,
+                            const std::string& password,
+                            const std::string& url);
+
+    /**
+     * @brief Marks entire framebuffer dirty and calls refresh_cb_ to push
      * fb content to the EPD. This is the method that actually makes
      * pixels appear on the screen.
      *
@@ -385,32 +309,10 @@ public:
     // Clock and voice wakeup integration
     // ============================================================
 
-    /**
-     * @brief Tick voice wakeup state machine (call from main loop)
-     */
     void VoiceWakeupTick();
-
-    /**
-     * @brief Trigger voice recording (called on BOOT long-press)
-     */
     void VoiceWakeupTrigger(bool network_available);
-
-    /**
-     * @brief Signal voice recording completed
-     */
     void VoiceWakeupDone();
-
-    /**
-     * @brief Check if voice wakeup overlay is currently active
-     */
     bool VoiceWakeupIsActive() const;
-
-    /**
-     * @brief Process pending minute-clock refresh requests from esp_timer
-     *
-     * The esp_timer callback only marks a pending flag. Actual framebuffer
-     * rendering and EPD refresh happen here on the main/UI loop thread.
-     */
     void PumpClockRefresh();
 
 private:
@@ -426,10 +328,12 @@ private:
     int height_ = 300;
 
     // Current page
-    RawDrawPageId current_page_ = RawDrawPageId::Gallery;
+    RawDrawPageId current_page_ = RawDrawPageId::Chat;
 
     // Status bar
     RawDrawStatusBarData status_bar_data_;
+
+    // UI state mutex (protects status_bar_data_ + shared state)
     mutable std::mutex ui_state_mutex_;
 
     // Page renderers (owned)
@@ -449,28 +353,25 @@ private:
     std::unique_ptr<rawdraw::CalendarRenderer> calendar_renderer_;
     std::unique_ptr<rawdraw::FontDebugRenderer> font_debug_renderer_;
     std::unique_ptr<rawdraw::FontMetricsRenderer> font_metrics_renderer_;
-    std::unique_ptr<rawdraw::ApTransferRenderer> ap_transfer_renderer_;
-    std::unique_ptr<rawdraw::ApTransferServer> ap_transfer_server_;
-
-    // Refresh callback (provided by CustomLcdDisplay)
-    RefreshCallback refresh_cb_;
-    PageSwitchCallback page_switch_cb_;
 
     // Full refresh flag
     bool full_refresh_pending_ = false;
+
+    PageSwitchCallback page_switch_cb_;
+
+    // Refresh callback
+    RefreshCallback refresh_cb_;
 
     // Clock component (persistent, drawn on every RenderAll)
     rawdraw::Clock clock_;
     esp_timer_handle_t clock_refresh_timer_ = nullptr;
     esp_timer_handle_t transient_refresh_timer_ = nullptr;
-    esp_timer_handle_t gallery_slideshow_timer_ = nullptr;
-    std::atomic<bool> clock_refresh_pending_{false};
-    std::atomic<bool> transient_refresh_pending_{false};
-    std::atomic<bool> active_page_refresh_pending_{false};
-    std::atomic<bool> gallery_slideshow_pending_{false};
+
     std::atomic<bool> input_refresh_locked_{false};
     int last_clock_minute_key_ = -1;
-    int gallery_slideshow_interval_minutes_ = 0;
+    std::atomic<bool> active_page_refresh_pending_{false};
+    std::atomic<bool> transient_refresh_pending_{false};
+    std::atomic<bool> clock_refresh_pending_{false};
 
     // Voice wakeup overlay state
     rawdraw::VoiceWakeupState voice_wakeup_state_;
@@ -491,18 +392,15 @@ private:
     void ArmTransientRefreshTimer(int delay_ms = 2000);
     static void OnClockRefreshTimer(void* arg);
     static void OnTransientRefreshTimer(void* arg);
-    static void OnGallerySlideshowTimer(void* arg);
-    void ArmGallerySlideshowTimer();
-    bool AdvanceGallerySlideshow();
     void DrawGlobalPageFrame(uint8_t* fb, int width, int height);
-    void DrawQuickSwitchOverlay(uint8_t* fb, int width, int height);
-    bool HandleQuickSwitchInput(const rawdraw::ButtonEvent& event);
-    rawdraw::Rect GetQuickSwitchBounds() const;
     void SnapshotQuickSwitchBacking(uint8_t* fb);
     void RestoreQuickSwitchBacking(uint8_t* fb);
     void RedrawQuickSwitchOnly(uint8_t* fb);
     void RefreshRect(const rawdraw::Rect& rect, bool urgent = false);
-    static const std::array<QuickSwitchItem, 2>& GetQuickSwitchItems();
+    bool HandleQuickSwitchInput(const rawdraw::ButtonEvent& event);
+    void DrawQuickSwitchOverlay(uint8_t* fb, int width, int height);
+    rawdraw::Rect GetQuickSwitchBounds() const;
+    static const std::array<QuickSwitchItem, 1>& GetQuickSwitchItems();
     void MarkAllRenderersFullRefresh();
 };
 

@@ -15,6 +15,7 @@
 #include "server_pairing.h"
 #include "http_client_wrapper.h"
 #include "boards/zectrix-s3-epaper-4.2/custom_lcd_display.h"
+#include "display.h"
 #include "wifi_manager.h"
 
 static const char* kTag = "PageSync";
@@ -201,6 +202,42 @@ static void show_page(int index) {
     ESP_LOGI(kTag, "show page %d/%d md5=%.8s via framebuffer", index + 1, s_page_count,
              s_pages[index].md5);
 }
+// ── 空页提示 ────────────────────────────────────────────────
+static bool s_empty_hint_shown = false;
+
+static void show_empty_hint(void) {
+    if (!s_display) {
+        ESP_LOGW(kTag, "no display wired for empty hint");
+        return;
+    }
+    auto* lcd = static_cast<CustomLcdDisplay*>(s_display);
+    xSemaphoreTake(lcd->GetMutex(), portMAX_DELAY);
+    lcd->EPD_Clear();
+    std::vector<Display::TextItem> texts;
+    Display::TextItem title;
+    title.content = "未配置画板页";
+    title.x = 20;
+    title.y = 100;
+    title.size = 24;
+    Display::TextItem sub1;
+    sub1.content = "请在服务端添加页面";
+    sub1.x = 20;
+    sub1.y = 140;
+    sub1.size = 16;
+    Display::TextItem sub2;
+    sub2.content = "http://10.0.0.90:9002";
+    sub2.x = 20;
+    sub2.y = 170;
+    sub2.size = 16;
+    texts.push_back(title);
+    texts.push_back(sub1);
+    texts.push_back(sub2);
+    lcd->DrawTexts(texts, true);
+    xSemaphoreGive(lcd->GetMutex());
+    lcd->RequestUrgentFullRefresh();
+    s_displaying = true;
+    ESP_LOGI(kTag, "show empty page hint (no pages configured)");
+}
 
 void page_sync_next(void) {
     if (s_page_count <= 0) return;
@@ -228,8 +265,15 @@ static void page_sync_task(void* arg) {
     int tick = 0;
     while (s_running) {
         sync_once();
-        // Page rotation check: run every loop (10s)
-        if (s_page_count > 0) {
+        // 无页时显示空页提示（不空白）
+        if (s_page_count == 0) {
+            if (!s_empty_hint_shown) {
+                show_empty_hint();
+                s_empty_hint_shown = true;
+            }
+        } else {
+            s_empty_hint_shown = false;
+            // Page rotation check: run every loop (10s)
             uint64_t elapsed = now_us() - s_current_page_started_us;
             uint32_t dur = s_pages[s_current_index].duration_seconds;
             if (dur > 0 && elapsed >= (uint64_t)dur * 1000000ULL) {
@@ -240,16 +284,17 @@ static void page_sync_task(void* arg) {
                 // first display
                 show_page(s_current_index);
             }
-        }
-        // Show current page immediately after first sync
-        if (tick == 0 && s_page_count > 0) {
-            show_page(s_current_index);
+            // Show current page immediately after first sync
+            if (tick == 0 && s_page_count > 0) {
+                show_page(s_current_index);
+            }
         }
         tick++;
         vTaskDelay(pdMS_TO_TICKS(10000));  // 10s loop
     }
     vTaskDelete(nullptr);
 }
+
 
 void page_sync_start(void) {
     if (s_running) return;

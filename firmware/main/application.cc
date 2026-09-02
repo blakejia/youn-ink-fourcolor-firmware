@@ -3,7 +3,7 @@
 #include "boards/zectrix-s3-epaper-4.2/custom_lcd_display.h"
 #include "boards/zectrix-s3-epaper-4.2/config.h"
 #include "board.h"
-#include "common/photo_storage.h"
+
 #include "display.h"
 #include "settings.h"
 #include "ui/rawdraw_ui_manager.h"
@@ -20,6 +20,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "common/server_pairing.h"
+#include "ssid_manager.h"
 #include "common/page_sync.h"
 #include "common/notify.h"
 
@@ -30,33 +31,13 @@ namespace {
 constexpr char kTag[] = "Application";
 constexpr char kSyncNamespace[] = "sync";
 constexpr char kSyncIntervalKey[] = "sync_interval";
-constexpr char kGalleryNamespace[] = "gallery";
-constexpr char kSlideshowIntervalKey[] = "slide_min";
-constexpr int kSettingsSlideshowIndex = 3;
+
+
 constexpr int kSettingsWifiIndex = 5;
 constexpr int kSettingsHttpServerIndex = 6;
 constexpr int kSettingsLanIpIndex = 7;
 
-std::string FormatMinutesLabel(int minutes) {
-    if (minutes <= 0) return "关闭";
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%dmin", minutes);
-    return buf;
-}
 
-const char* FormatMinutesLogLabel(int minutes) {
-    return minutes <= 0 ? "关闭" : "开启";
-}
-
-int NextSlideshowInterval(int current) {
-    static constexpr int kOptions[] = {0, 5, 10, 30};
-    for (size_t i = 0; i < sizeof(kOptions) / sizeof(kOptions[0]); ++i) {
-        if (kOptions[i] == current) {
-            return kOptions[(i + 1) % (sizeof(kOptions) / sizeof(kOptions[0]))];
-        }
-    }
-    return 5;
-}
 
 void UpdateWifiSettingsItem(rawdraw::SettingsRenderer* renderer, bool connected,
                             const char* value = nullptr) {
@@ -182,11 +163,7 @@ void Application::Initialize() {
         SetDeviceState(kDeviceStateFatalError);
         return;
     }
-    if (photo_storage_init() == 0) {
-        ESP_LOGI(kTag, "Photo storage ready (%d photos)", photo_get_count());
-    } else {
-        ESP_LOGW(kTag, "Photo storage init failed");
-    }
+
 
     auto* lcd = static_cast<CustomLcdDisplay*>(display);
     rawdraw_ui_manager_ = std::make_unique<ui::RawDrawUiManager>();
@@ -197,43 +174,17 @@ void Application::Initialize() {
             lcd->RequestUrgentRefresh();
         }
     });
-
     if (auto* sr = rawdraw_ui_manager_->GetSettingsRenderer()) {
-        Settings gallery_nvs(kGalleryNamespace, false);
-        int slideshow_interval = gallery_nvs.GetInt(kSlideshowIntervalKey, 5);
-        if (slideshow_interval != 0 && slideshow_interval != 5 &&
-            slideshow_interval != 10 && slideshow_interval != 30) {
-            slideshow_interval = 5;
-        }
-        ESP_LOGI(kTag, "Startup gallery fullscreen slideshow: %s, interval=%s",
-                 FormatMinutesLogLabel(slideshow_interval),
-                 FormatMinutesLabel(slideshow_interval).c_str());
-        rawdraw_ui_manager_->SetGallerySlideshowIntervalMinutes(slideshow_interval);
-
         std::vector<rawdraw::SettingsItemDef> items;
         items.push_back({"系统", "", nullptr, rawdraw::SettingsItemType::Section, false});
         items.push_back({"重启", "执行", nullptr, rawdraw::SettingsItemType::Action, false,
                          []() { esp_restart(); }});
-        items.push_back({"相册", "", nullptr, rawdraw::SettingsItemType::Section, false});
-        items.push_back({"轮播间隔", FormatMinutesLabel(slideshow_interval), nullptr,
-                         rawdraw::SettingsItemType::Action, false,
-                         [this, sr]() {
-                             Settings nvs(kGalleryNamespace, true);
-                             const int current = nvs.GetInt(kSlideshowIntervalKey, 5);
-                             const int next = NextSlideshowInterval(current);
-                             nvs.SetInt(kSlideshowIntervalKey, next);
-                             if (rawdraw_ui_manager_) {
-                                 rawdraw_ui_manager_->SetGallerySlideshowIntervalMinutes(next);
-                             }
-                             if (next > 0 && sleep_timer_ != nullptr) {
-                                 esp_timer_stop(sleep_timer_);
-                                 ESP_LOGI(kTag, "Sync sleep timer paused while gallery slideshow is enabled");
-                             } else if (next <= 0 &&
-                                        (wifi_connected_.load(std::memory_order_acquire) ||
-                                         WifiManager::GetInstance().IsConnected())) {
-                                 ArmSyncSleepTimer();
-                             }
-                             sr->UpdateItem(kSettingsSlideshowIndex, FormatMinutesLabel(next));
+        items.push_back({"重置网络", "清凭据重启", nullptr, rawdraw::SettingsItemType::Action, false,
+                         []() {
+                             ESP_LOGW(kTag, "Reset network: clearing WiFi credentials and pairing token");
+                             SsidManager::GetInstance().Clear();
+                             server_pairing_clear();
+                             esp_restart();
                          }});
         items.push_back({"网络", "", nullptr, rawdraw::SettingsItemType::Section, false});
         items.push_back({"Wi-Fi", "未连接", nullptr, rawdraw::SettingsItemType::Checkbox, false,
@@ -346,12 +297,7 @@ void Application::Initialize() {
                         }
                     }
                 }
-                if (rawdraw_ui_manager_ &&
-                    rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::APTransfer &&
-                    !rawdraw_ui_manager_->IsApTransferModeRunning()) {
-                    ESP_LOGI(kTag, "WiFi connected while config page is visible, returning to gallery");
-                    rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Gallery);
-                }
+
                 UpdateStatusBarForUi();
                 ArmSyncSleepTimer();
                 break;
@@ -380,12 +326,6 @@ void Application::Initialize() {
                 UpdateStatusBarForUi();
                 break;
             case NetworkEvent::WifiConfigModeExit:
-                if (rawdraw_ui_manager_ &&
-                    rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::APTransfer &&
-                    !rawdraw_ui_manager_->IsApTransferModeRunning()) {
-                    ESP_LOGI(kTag, "WiFi config AP exited, returning to gallery");
-                    rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Gallery);
-                }
                 wifi_connected_.store(WifiManager::GetInstance().IsConnected(),
                                       std::memory_order_release);
                 UpdateStatusBarForUi();
@@ -448,7 +388,7 @@ void Application::OnUpLongPress() {
     if (rawdraw_ui_manager_ &&
         rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::Settings) {
         ESP_LOGI(kTag, "UP long press - leaving settings");
-        rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Gallery);
+        rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Settings);
     }
 }
 
@@ -491,16 +431,16 @@ void Application::OnBootLongPress() {
     if (WifiManager::GetInstance().IsConfigMode()) {
         ESP_LOGI(kTag, "BOOT long press - exiting WiFi config AP");
         if (rawdraw_ui_manager_) {
-            rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Gallery);
+            rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Settings);
         }
         WifiManager::GetInstance().StartStation();
         return;
     }
-    // 画板显示时 BOOT 长按退出画板，回到 Gallery（短按已改为拉取通知）
+    // 画板显示时 BOOT 长按退出画板，回到 Settings（短按已改为拉取通知）
     if (page_sync_is_displaying()) {
         page_sync_stop_display();
         if (rawdraw_ui_manager_) {
-            rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Gallery);
+            rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Settings);
         }
         return;
     }
@@ -540,14 +480,7 @@ void Application::ArmSyncSleepTimer() {
         ESP_LOGI(kTag, "Sync sleep timer skipped while local HTTP transfer service is running");
         return;
     }
-    if (rawdraw_ui_manager_ &&
-        rawdraw_ui_manager_->GetGallerySlideshowIntervalMinutes() > 0) {
-        if (sleep_timer_ != nullptr) {
-            esp_timer_stop(sleep_timer_);
-        }
-        ESP_LOGI(kTag, "Sync sleep timer skipped while gallery slideshow is enabled");
-        return;
-    }
+
 
     Settings nvs(kSyncNamespace, false);
     const int interval_minutes = nvs.GetInt(kSyncIntervalKey, 30);
@@ -596,12 +529,7 @@ void Application::EnterScheduledSleep() {
         ArmSyncSleepTimer();
         return;
     }
-    if (rawdraw_ui_manager_ &&
-        rawdraw_ui_manager_->GetGallerySlideshowIntervalMinutes() > 0) {
-        ESP_LOGI(kTag, "Scheduled sleep skipped: gallery slideshow is enabled");
-        ArmSyncSleepTimer();
-        return;
-    }
+
 
     ESP_LOGI(kTag, "Entering deep sleep after sync interval; BOOT wakes device");
     wifi_connected_.store(false, std::memory_order_release);
@@ -617,7 +545,7 @@ void Application::EnterManualSleep() {
         esp_timer_stop(sleep_timer_);
     }
     if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsHttpServerRunning()) {
-        rawdraw_ui_manager_->StopApTransferMode();
+        rawdraw_ui_manager_->StopLanHttpServer();
     }
     wifi_connected_.store(false, std::memory_order_release);
     esp_wifi_disconnect();
