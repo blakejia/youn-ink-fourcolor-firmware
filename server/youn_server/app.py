@@ -671,7 +671,18 @@ def create_app() -> FastAPI:
         # sub-app routes are already at /mcp; mount at root to avoid double-mount
         mcp_subapp = mcp_server.http_app(transport="streamable-http")
         app.mount("/", mcp_subapp)
-        app.router.lifespan_context = mcp_subapp.lifespan
+        # Compose lifespans so we don't clobber any existing lifespan
+        # (or legacy on_event handlers) that may be added later.
+        from contextlib import asynccontextmanager
+        _original_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def _composed_lifespan(app):
+            async with _original_lifespan(app):
+                async with mcp_subapp.lifespan(app):
+                    yield
+
+        app.router.lifespan_context = _composed_lifespan
     except ImportError:
         log.warning("fastmcp not installed; /mcp endpoint disabled")
 
