@@ -21,6 +21,7 @@
 #include <freertos/task.h>
 #include "common/server_pairing.h"
 #include "common/page_sync.h"
+#include "common/notify.h"
 
 #include <ctime>
 
@@ -145,6 +146,7 @@ void ServerPairingTaskTrampoline(void*) {
     page_sync_set_display(board.GetDisplay());
     page_sync_start();
     ESP_LOGI(kTag, "PageSync: started");
+    notify_init();
     vTaskDelete(nullptr);
 }
 
@@ -407,6 +409,11 @@ void Application::Initialize() {
 
 void Application::OnUpClick() {
     ESP_LOGI(kTag, "UP click");
+    // 通知展示时上键确认（agree）
+    if (notify_is_active()) {
+        notify_post_ack("agree");
+        return;
+    }
     Board::GetInstance().FlashActivityLed();
     // 画板显示时上键翻页
     if (page_sync_is_displaying()) {
@@ -420,6 +427,11 @@ void Application::OnUpClick() {
 
 void Application::OnDownClick() {
     ESP_LOGI(kTag, "DOWN click");
+    // 通知展示时下键拒绝（reject）
+    if (notify_is_active()) {
+        notify_post_ack("reject");
+        return;
+    }
     Board::GetInstance().FlashActivityLed();
     // 画板显示时下键翻页
     if (page_sync_is_displaying()) {
@@ -458,6 +470,16 @@ void Application::OnWifiConfigComboLongPress() {
 void Application::OnBootClick() {
     ESP_LOGI(kTag, "BOOT click");
     Board::GetInstance().FlashActivityLed();
+    // 通知展示时 BOOT 短按直接关闭（不发 ack）
+    if (notify_is_active()) {
+        notify_dismiss();
+        return;
+    }
+    // 画板显示时 BOOT 短按拉取下一条待确认通知（异步，不阻塞回调）
+    if (page_sync_is_displaying()) {
+        notify_request_next();
+        return;
+    }
     if (rawdraw_ui_manager_) {
         rawdraw_ui_manager_->HandleInput(rawdraw::ButtonEvent{rawdraw::ButtonEvent::kBootClick});
     }

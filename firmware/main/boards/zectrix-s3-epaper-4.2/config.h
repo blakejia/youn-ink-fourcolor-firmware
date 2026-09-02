@@ -20,11 +20,11 @@
 #define BOOT_BUTTON_GPIO        GPIO_NUM_0
 
 
-#define TODO_UP_BUTTON_GPIO     GPIO_NUM_39
-#define TODO_DOWN_BUTTON_GPIO   GPIO_NUM_18
+#define UP_BUTTON_GPIO          GPIO_NUM_39
+#define DOWN_BUTTON_GPIO        GPIO_NUM_18
 //开机电源键与下键复用
 #define VBAT_PWR_GPIO           GPIO_NUM_18
-#define TODO_CONFIRM_BUTTON_GPIO GPIO_NUM_0
+#define CONFIRM_BUTTON_GPIO     GPIO_NUM_0
 #define CHARGE_DETECT_GPIO      GPIO_NUM_2
 #define CHARGE_FULL_GPIO        GPIO_NUM_1
 // CHARGE_DETECT charging level definition: 0 means low=charging, 1 means high=charging.

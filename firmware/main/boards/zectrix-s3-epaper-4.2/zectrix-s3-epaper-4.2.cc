@@ -43,9 +43,9 @@ static std::atomic<bool> s_down_long_handled{false};
 static std::atomic<bool> s_up_suppress_click{false};
 static std::atomic<bool> s_down_suppress_click{false};
 static std::atomic<bool> s_wifi_config_combo_handled{false};
-constexpr gpio_num_t kBoardUpButtonGpio = TODO_UP_BUTTON_GPIO;
-constexpr gpio_num_t kBoardDownButtonGpio = TODO_DOWN_BUTTON_GPIO;
-constexpr gpio_num_t kBoardConfirmButtonGpio = BOOT_BUTTON_GPIO;
+constexpr gpio_num_t kBoardUpButtonGpio = UP_BUTTON_GPIO;
+constexpr gpio_num_t kBoardDownButtonGpio = DOWN_BUTTON_GPIO;
+constexpr gpio_num_t kBoardConfirmButtonGpio = CONFIRM_BUTTON_GPIO;
 
 int64_t NowMs() {
     return esp_timer_get_time() / 1000;
