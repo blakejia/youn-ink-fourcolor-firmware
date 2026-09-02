@@ -665,6 +665,16 @@ def create_app() -> FastAPI:
         finally:
             session.closed = True
             await app.state.sessions.unregister(session.session_id)
+    # ── FastMCP on /mcp (streamable-http) — must mount before SPA ──
+    try:
+        from .mcp_server import mcp as mcp_server
+        # sub-app routes are already at /mcp; mount at root to avoid double-mount
+        mcp_subapp = mcp_server.http_app(transport="streamable-http")
+        app.mount("/", mcp_subapp)
+        app.router.lifespan_context = mcp_subapp.lifespan
+    except ImportError:
+        log.warning("fastmcp not installed; /mcp endpoint disabled")
+
     # ── Web admin UI (Vite build output) ──
     dist_dir = Path(__file__).resolve().parents[2] / "frontend" / "dist"
     if dist_dir.exists() and (dist_dir / "index.html").exists():
@@ -674,6 +684,7 @@ def create_app() -> FastAPI:
         log.info("web admin UI mounted from %s", dist_dir)
     else:
         log.warning("frontend/dist not found (%s); web admin UI disabled", dist_dir)
+
 
     return app
 
