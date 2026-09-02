@@ -46,7 +46,7 @@ enum class WifiEvent {
 // Configuration
 struct WifiManagerConfig {
     std::string ssid_prefix = "ESP32";    // AP mode SSID prefix
-    std::string ap_password;              // AP password, empty means open AP
+    std::string ap_password = "12345678"; // AP password, default 12345678
     std::string language = "zh-CN";       // Web UI language
     
     // Station mode scan interval with exponential backoff
