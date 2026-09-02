@@ -24,6 +24,13 @@
 - 不引入新 HTTP 栈（固件复用 `http_wrapper_get/post_json`）
 - 设备状态机：`IDLE | FETCHING | NOTIFYING`；5min FreeRTOS timer 对齐 ttl 300s
 
+## Plan Amendment — Task 3 FastMCP 4.x API
+
+**Status:** required (implementer dispatch blocked 27m on dependency discovery)
+**Reason:** plan's `FastMCP("name", transport="streamable-http")` and `mcp.mount(app)` API is removed in fastmcp 4.x (current version resolves to 4.0.1, which is the only one compatible with our pinned `pydantic==2.10.3` / `fastapi==0.115.6` constraint set).
+**Ruling:** Use the 4.x pattern `mcp.http_app(path="/mcp", transport="streamable-http")` and mount via `app.mount("/mcp", sub_app)` with `FastAPI(lifespan=sub_app.lifespan)`. TestClient works on the sub_app directly (no parent app needed in tests).
+**Cost if wrong:** The 4.x API is the only available option for our dependency constraints; 2.x has mcp version conflicts that are unsolvable. Tests in the plan use `client = TestClient(app)` which works because we attach the sub_app to a parent FastAPI with proper lifespan.
+
 ---
 
 ### Task 1: notify_store — FIFO 队列存储层
@@ -549,7 +556,9 @@ from .config import settings
 from . import notify_store as ns
 from . import devices as devices_mod
 
-mcp = FastMCP("youn-notify", transport="streamable-http")
+# fastmcp 4.x: no `transport=` kwarg on FastMCP(). Streamable HTTP
+# transport is selected when mounting via http_app(transport=...).
+mcp = FastMCP("youn-notify")
 
 
 @mcp.tool
@@ -579,14 +588,17 @@ def ack_notification(notification_id: str, decision: str) -> dict:
     if n is None:
         raise ValueError("notification not found")
     return {"ok": True, "status": n.status, "decision": n.decision}
-```
 
 `app.py` 在 `create_app` 末尾（return app 之前）加：
 ```python
-    # Mount FastMCP on /mcp (streamable-http)
+    # Mount FastMCP on /mcp (streamable-http transport).
+    # fastmcp 4.x: get sub-app via http_app(); must propagate its lifespan
+    # into the parent FastAPI or StreamableHTTPSessionManager fails init.
     try:
         from .mcp_server import mcp as mcp_server
-        mcp_server.mount(app)
+        mcp_subapp = mcp_server.http_app(path="/mcp", transport="streamable-http")
+        app.mount("/mcp", mcp_subapp)
+        app.router.lifespan_context = mcp_subapp.lifespan
     except ImportError:
         log.warning("fastmcp not installed; /mcp endpoint disabled")
 ```
@@ -690,53 +702,67 @@ void notify_dismiss(void);
 
 - [ ] **Step 3: 实现 notify.cc**
 
-```c
-/**
- * @file notify.cc
- * @brief 待确认通知实现（IDLE/FETCHING/NOTIFYING 状态机）
- */
-#include "notify.h"
+`server/youn_server/mcp_server.py`：
+```python
+"""FastMCP server exposing notification tools on /mcp (streamable-http)."""
+from __future__ import annotations
 
-#include <cstring>
-#include <esp_log.h>
-#include <esp_timer.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/timers.h>
+from dataclasses import asdict
 
-#include "application.h"
-#include "common/http_client_wrapper.h"
-#include "common/page_sync.h"
-#include "common/server_pairing.h"
-#include "custom_lcd_display.h"
+from fastmcp import FastMCP
 
-static const char *kTag = "notify";
-static const int kNotifyTtlSec = 300;           // 5 min
-static const int kHttpTimeoutMs = 3000;
+from .config import settings
+from . import notify_store as ns
+from . import devices as devices_mod
 
-enum class NotifyState : int { IDLE, FETCHING, NOTIFYING };
-static NotifyState s_state = NotifyState::IDLE;
-static char s_notification_id[64] = {0};
-static TimerHandle_t s_timeout_timer = nullptr;
-static CustomLcdDisplay *s_display = nullptr;
+# fastmcp 4.x: no `transport=` kwarg on FastMCP(). Streamable HTTP
+# transport is selected when mounting via http_app(transport=...).
+mcp = FastMCP("youn-notify")
 
-static void timeout_cb(TimerHandle_t) {
-    ESP_LOGI(kTag, "notify timeout (5min)");
-    notify_dismiss();
-}
 
-void notify_init(void) {
-    s_state = NotifyState::IDLE;
-    s_notification_id[0] = '\0';
-    if (!s_timeout_timer) {
-        s_timeout_timer = xTimerCreate("notify_timeout",
-                                       pdMS_TO_TICKS(kNotifyTtlSec * 1000),
-                                       pdFALSE, nullptr, timeout_cb);
-    }
-}
+@mcp.tool
+def push_notification(device_id: str, title: str, body: str,
+                      ttl_sec: int = 300) -> dict:
+    """Create a pending notification for a device."""
+    if not any(d.device_id == device_id
+               for d in devices_mod.list_all(only_trusted=True)):
+        raise ValueError("device not trusted")
+    n = ns.get_store().enqueue(device_id, title, body, ttl_sec)
+    return {"ok": True, "notification": asdict(n)}
 
-void notify_deinit(void) {
-    if (s_timeout_timer) {
-        xTimerStop(s_timeout_timer, 0);
+
+@mcp.tool
+def list_notifications(device_id: str = "", limit: int = 20) -> dict:
+    """List recent notifications (all devices or filtered by device_id)."""
+    items = ns.get_store().recent(device_id=device_id, limit=limit)
+    return {"notifications": [asdict(n) for n in items]}
+
+
+@mcp.tool
+def ack_notification(notification_id: str, decision: str) -> dict:
+    """Mark a notification as agreed or rejected."""
+    if decision not in ("agree", "reject"):
+        raise ValueError("decision must be agree|reject")
+    n = ns.get_store().ack(notification_id, decision)
+    if n is None:
+        raise ValueError("notification not found")
+    return {"ok": True, "status": n.status, "decision": n.decision}
+```
+
+`app.py` 在 `create_app` 末尾（return app 之前）加：
+```python
+    # Mount FastMCP on /mcp (streamable-http transport).
+    # fastmcp 4.x: get sub-app via http_app(); must propagate its lifespan
+    # into the parent FastAPI or StreamableHTTPSessionManager fails init.
+    try:
+        from .mcp_server import mcp as mcp_server
+        mcp_subapp = mcp_server.http_app(path="/mcp", transport="streamable-http")
+        app.mount("/mcp", mcp_subapp)
+        app.router.lifespan_context = mcp_subapp.lifespan
+    except ImportError:
+        log.warning("fastmcp not installed; /mcp endpoint disabled")
+```
+
     }
     s_state = NotifyState::IDLE;
 }
