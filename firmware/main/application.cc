@@ -496,6 +496,14 @@ void Application::OnBootLongPress() {
         WifiManager::GetInstance().StartStation();
         return;
     }
+    // 画板显示时 BOOT 长按退出画板，回到 Gallery（短按已改为拉取通知）
+    if (page_sync_is_displaying()) {
+        page_sync_stop_display();
+        if (rawdraw_ui_manager_) {
+            rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Gallery);
+        }
+        return;
+    }
     if (rawdraw_ui_manager_) {
         rawdraw_ui_manager_->HandleInput(rawdraw::ButtonEvent{rawdraw::ButtonEvent::kBootLongPress});
     }

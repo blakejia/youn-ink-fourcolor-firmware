@@ -49,6 +49,10 @@ char s_notification_id[40] = {0};           // uuid hex(32) + '\0'
 
 void show_bitmap(const uint8_t* bitmap) {
     if (!s_lcd) {
+        // 懒绑定兜底：与 page_sync_set_display 同一显示实例
+        s_lcd = static_cast<CustomLcdDisplay*>(Board::GetInstance().GetDisplay());
+    }
+    if (!s_lcd) {
         ESP_LOGW(kTag, "no display wired");
         return;
     }
@@ -81,11 +85,21 @@ void dismiss_locked_state() {
     }
 }
 
-// 5min 超时：FreeRTOS timer 回调上下文（timer service task）
-void timeout_timer_cb(TimerHandle_t /*timer*/) {
-    ESP_LOGI(kTag, "notify timeout, auto dismiss");
+// 5min 超时：dismiss 涉及显示工作（xSemaphoreTake + page_sync 重绘），不能跑在
+// timer daemon 回调里——回调只置标志并派一个短任务执行真正的 dismiss。
+void timeout_dismiss_task(void* /*arg*/) {
     if (s_state == NotifyState::NOTIFYING) {
         dismiss_locked_state();
+        ESP_LOGI(kTag, "notify timeout, auto dismissed");
+    }
+    vTaskDelete(nullptr);
+}
+
+void timeout_timer_cb(TimerHandle_t /*timer*/) {
+    if (s_state != NotifyState::NOTIFYING) return;
+    if (xTaskCreate(timeout_dismiss_task, "notify_todis", 4096, nullptr, 3,
+                    nullptr) != pdPASS) {
+        ESP_LOGE(kTag, "timeout dismiss task create failed");
     }
 }
 
@@ -158,6 +172,7 @@ void fetch_task(void* /*arg*/) {
     int status = http_wrapper_get(url, token, buf, &buf_len, kHttpTimeoutMs);
     if (status == 204) {
         ESP_LOGI(kTag, "no pending notification (204)");
+        s_state = NotifyState::IDLE;
     } else if (status == 200) {
         buf[buf_len < kResponseBufSize ? buf_len : kResponseBufSize - 1] = '\0';
         char id[sizeof(s_notification_id)] = {0};
@@ -180,10 +195,13 @@ void fetch_task(void* /*arg*/) {
 }
 
 // 后台任务：POST /api/notifications/{id}/ack（fire-and-forget）
+// arg 指向 PSRAM 块：前 40 字节 id（'\0' 结尾），其后 body（"{\"decision\":...}"）。
+// id 按值传入，避免 dismiss 清空 s_notification_id 后与任务读全局的竞态。
 void ack_task(void* arg) {
-    char* body = static_cast<char*>(arg);  // "{\"decision\":\"...\"}"
-    char id[sizeof(s_notification_id)] = {0};
-    snprintf(id, sizeof(id), "%s", s_notification_id);
+    char* block = static_cast<char*>(arg);
+    const char* id = block;
+    const char* body = block + 40;
+
 
     char path[96];
     snprintf(path, sizeof(path), "/api/notifications/%s/ack", id);
@@ -204,7 +222,7 @@ void ack_task(void* arg) {
                      id, status);
         }
     }
-    heap_caps_free(body);
+    heap_caps_free(block);
     vTaskDelete(nullptr);
 }
 
@@ -251,17 +269,18 @@ extern "C" bool notify_is_active(void) { return s_state == NotifyState::NOTIFYIN
 
 extern "C" void notify_post_ack(const char* decision) {
     if (s_state != NotifyState::NOTIFYING) return;
-    // 复制 body 交后台任务持有（decision 来自调用方栈）
-    char* body = static_cast<char*>(heap_caps_malloc(64, MALLOC_CAP_SPIRAM));
-    if (!body) {
-        ESP_LOGE(kTag, "ack body alloc failed, dismiss without ack");
+    // id + body 一并复制交后台任务持有（decision 来自调用方栈，id 会被 dismiss 清空）
+    char* block = static_cast<char*>(heap_caps_malloc(40 + 64, MALLOC_CAP_SPIRAM));
+    if (!block) {
+        ESP_LOGE(kTag, "ack block alloc failed, dismiss without ack");
         notify_dismiss();
         return;
     }
-    snprintf(body, 64, "{\"decision\":\"%s\"}", decision);
-    if (xTaskCreate(ack_task, "notify_ack", kFetchTaskStack, body, 3, nullptr) != pdPASS) {
+    snprintf(block, 40, "%s", s_notification_id);
+    snprintf(block + 40, 64, "{\"decision\":\"%s\"}", decision);
+    if (xTaskCreate(ack_task, "notify_ack", kFetchTaskStack, block, 3, nullptr) != pdPASS) {
         ESP_LOGE(kTag, "ack task create failed");
-        heap_caps_free(body);
+        heap_caps_free(block);
     }
     // ack 无论成败都关闭展示（失败时通知保持 shown，服务端 5min ttl 过期兜底）
     notify_dismiss();
