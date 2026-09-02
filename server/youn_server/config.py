@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     device_channels: int = Field(default=1)
     asr_chunk_bytes: int = Field(default=3200)
     operator_token: str = Field(default="")
-
+    notify_default_ttl: int = Field(default=300)
 
     # ── Canvas Loop policy ──
     canvas_sleep_start: str = Field(default="00:00")

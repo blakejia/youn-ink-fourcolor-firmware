@@ -22,12 +22,14 @@ registry, or a one-time pairing secret via `?secret=<hex>` query parameter.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import io
 import json
 import logging
 import secrets
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -53,6 +55,8 @@ from fastapi.responses import Response
 
 from .canvas_render import RenderError, render_canvas_to_bitmap, render_canvas_to_png
 from . import pairing as pairing_mod
+
+from . import notify_store as ns
 
 from . import pages as pages_mod
 
@@ -404,19 +408,89 @@ def create_app() -> FastAPI:
         return FileResponse(p, filename=filename, media_type="application/octet-stream")
 
     @app.post("/api/pages/preview")
-    async def preview_page(request: Request, body: dict = Body(...)) -> Response:
-        """Render canvas_json to a PNG preview (used by the web admin UI)."""
+    async def preview_page(
+        request: Request, body: dict = Body(...), debug: int = Query(0),
+    ) -> Response:
+        """Render canvas_json to a PNG preview (used by the web admin UI).
+
+        ?debug=1 → JSON {png_b64, bounds} so the editor can overlay selection
+        rectangles using the server-side layout (single source of truth).
+        """
         _require_operator(request)
         canvas_json = body.get("canvas_json")
         if not isinstance(canvas_json, dict):
             raise HTTPException(400, "canvas_json must be an object")
         try:
+            if debug:
+                from .canvas_render import render_canvas_to_png_debug
+                png, bounds = render_canvas_to_png_debug(canvas_json)
+                return {"png_b64": base64.b64encode(png).decode("ascii"),
+                        "bounds": bounds}
             png = render_canvas_to_png(canvas_json)
         except RenderError as e:
             raise HTTPException(400, f"render failed: {e.path}: {e.message}") from e
         except Exception as e:  # noqa: BLE001
             raise HTTPException(500, f"render failed: {e}") from e
         return Response(content=png, media_type="image/png")
+
+    # ── Notifications ──
+
+    @app.post("/api/notifications", status_code=201)
+    async def create_notification(request: Request, body: dict = Body(...)):
+        _require_operator(request)
+        device_id = body.get("device_id", "")
+        title = body.get("title", "")
+        text = body.get("body", "")
+        ttl = body.get("ttl_sec", settings.notify_default_ttl)
+        if not device_id or not title or not text:
+            raise HTTPException(400, "missing device_id/title/body")
+        if not any(d.device_id == device_id for d in registry.list_all(only_trusted=True)):
+            raise HTTPException(400, "device not trusted")
+        n = ns.get_store().enqueue(device_id, title, text, ttl)
+        return {"notification": asdict(n)}
+
+    @app.get("/api/notifications/next")
+    async def next_notification(request: Request, device_id: str = Query(...)):
+        _require_device_token(request)
+        n = ns.get_store().next_for(device_id)
+        if n is None:
+            return Response(status_code=204)
+        try:
+            bitmap = render_canvas_to_bitmap({
+                "default": [{"type": "div", "props": {
+                    "tw": "flex flex-col p-[16px] gap-[8px] bg-white",
+                    "children": [
+                        {"type": "div", "props": {"tw": "text-[20px] font-bold",
+                                                  "style": {"color": "#000000"},
+                                                  "children": n.title}},
+                        {"type": "div", "props": {"tw": "text-[16px]",
+                                                  "style": {"color": "#000000"},
+                                                  "children": n.body}},
+                    ]}}]
+            })
+        except Exception:
+            ns.get_store()._items[n.id].status = "error"
+            raise HTTPException(500, "render failed")
+        import base64
+        return {"bitmap_base64": base64.b64encode(bitmap).decode("ascii"),
+                "notification": asdict(n)}
+
+    @app.post("/api/notifications/{nid}/ack")
+    async def ack_notification(nid: str, request: Request, body: dict = Body(...)):
+        _require_device_token(request)
+        decision = body.get("decision")
+        if decision not in ("agree", "reject"):
+            raise HTTPException(400, "decision must be agree|reject")
+        n = ns.get_store().ack(nid, decision)
+        if n is None:
+            raise HTTPException(404, "notification not found")
+        return {"status": n.status, "decision": n.decision}
+
+    @app.get("/api/notifications/history")
+    async def notification_history(request: Request, device_id: str = Query(""), limit: int = Query(20)):
+        _require_operator(request)
+        items = ns.get_store().recent(device_id=device_id, limit=limit)
+        return {"notifications": [asdict(n) for n in items]}
 
     # ── Canvas Loop ──
 
