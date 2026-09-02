@@ -42,7 +42,9 @@ export default function Devices() {
         <h2>配对新设备</h2>
         <div className="row">
           <input placeholder="device_id" value={newDeviceId} onChange={(e) => setNewDeviceId(e.target.value)} />
-          <input placeholder="board_type" value={newBoard} onChange={(e) => setNewBoard(e.target.value)} />
+          <select value={newBoard} onChange={(e) => setNewBoard(e.target.value)}>
+            <option value="zectrix-s3-epaper-4.2">zectrix-s3-epaper-4.2 (NOTE4C)</option>
+          </select>
           <button className="btn" onClick={startPair}>获取配对码</button>
         </div>
         {pairing && (

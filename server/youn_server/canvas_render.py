@@ -297,10 +297,12 @@ def _resolve_children(node: dict, path: str) -> list:
 
 # ─── render driver ───────────────────────────────────────────────────
 class _CanvasRenderer:
-    def __init__(self) -> None:
+    def __init__(self, collect_bounds: bool = False) -> None:
         self.surf = Image.new("RGB", (SCREEN_W, SCREEN_H), _PILLOW_BG[IDX_WHITE])
         self._img_url_cache: dict[str, Image.Image] = {}
         self._http = httpx.Client(timeout=10.0, follow_redirects=True)
+        self.collect_bounds = collect_bounds
+        self.bounds: list[dict] = []
 
     def close(self) -> None:
         self._http.close()
@@ -328,6 +330,12 @@ class _CanvasRenderer:
             raise RenderError(f"{path}.type",
                               f"unsupported element type {ntype!r}")
 
+        if self.collect_bounds:
+            self.bounds.append({
+                "path": path, "type": ntype,
+                "x": box.x, "y": box.y, "w": box.w, "h": box.h,
+            })
+
         if ntype == "img":
             self._render_img(node, box, path)
             return
@@ -349,8 +357,14 @@ class _CanvasRenderer:
         if children and not any(c[0] == "text" for c in children):
             self._layout_children(children, tw, style, box, path)
         else:
-            for kind, val in children:
+            for i, (kind, val) in enumerate(children):
                 if kind == "text":
+                    if self.collect_bounds:
+                        self.bounds.append({
+                            "path": f"{path}.props.children[{i}]", "type": "text",
+                            "x": box.x, "y": box.y, "w": box.w, "h": box.h,
+                            "text": val,
+                        })
                     self._draw_text(val, tw, style, box, path)
 
         if _has_border(tw, style):
@@ -383,20 +397,32 @@ class _CanvasRenderer:
         if direction == "row":
             sizes = self._row_layout(measurements, inner, gap, align, justify)
             x = inner.x
-            for ((kind, val), (w, h)), (cx, cy, cw, ch) in zip(measurements, sizes):
+            for i, (((kind, val), (w, h)), (cx, cy, cw, ch)) in enumerate(zip(measurements, sizes)):
                 if kind == "text":
+                    if self.collect_bounds:
+                        self.bounds.append({
+                            "path": f"{path}.props.children[{i}]", "type": "text",
+                            "x": cx, "y": cy, "w": cw, "h": ch, "text": val,
+                        })
                     self._draw_text(val, tw, style, _Box(cx, cy, cw, ch), path)
                 else:
-                    self._render_node(val, _Box(cx, cy, cw, ch), path=path)
+                    self._render_node(val, _Box(cx, cy, cw, ch),
+                                      path=f"{path}.props.children[{i}]")
                 x += cw
         else:
             sizes = self._column_layout(measurements, inner, gap, align, justify)
             y = inner.y
-            for ((kind, val), (w, h)), (cx, cy, cw, ch) in zip(measurements, sizes):
+            for i, (((kind, val), (w, h)), (cx, cy, cw, ch)) in enumerate(zip(measurements, sizes)):
                 if kind == "text":
+                    if self.collect_bounds:
+                        self.bounds.append({
+                            "path": f"{path}.props.children[{i}]", "type": "text",
+                            "x": cx, "y": cy, "w": cw, "h": ch, "text": val,
+                        })
                     self._draw_text(val, tw, style, _Box(cx, cy, cw, ch), path)
                 else:
-                    self._render_node(val, _Box(cx, cy, cw, ch), path=path)
+                    self._render_node(val, _Box(cx, cy, cw, ch),
+                                      path=f"{path}.props.children[{i}]")
                 y += ch
 
     def _row_layout(self, items, box, gap, align, justify):
@@ -573,8 +599,6 @@ def render_canvas_to_png(canvas_json: dict) -> bytes:
 
     Returns PNG bytes; raises RenderError on unsupported element/property.
     """
-    import io
-
     bitmap = render_canvas_to_bitmap(canvas_json)
     img = Image.new("RGB", (SCREEN_W, SCREEN_H))
     px = img.load()
@@ -588,3 +612,19 @@ def render_canvas_to_png(canvas_json: dict) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+def render_canvas_to_png_debug(canvas_json: dict) -> tuple[bytes, list[dict]]:
+    """Render canvas_json → (RGB PNG bytes, element bounds list).
+
+    Used by the web admin editor: canvas selection boxes come from the
+    server-side layout, so what you click is what the device renders.
+    """
+    r = _CanvasRenderer(collect_bounds=True)
+    try:
+        r.render(canvas_json)
+        buf = io.BytesIO()
+        r.surf.save(buf, format="PNG")
+        return buf.getvalue(), r.bounds
+    finally:
+        r.close()

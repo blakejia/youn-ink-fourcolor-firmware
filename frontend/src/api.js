@@ -24,6 +24,7 @@ async function request(path, opts = {}) {
   return res;
 }
 
+export const apiFetch = request;
 export const api = {
   health: () => request('/health'),
   devices: async () => (await request('/devices')).devices ?? [],

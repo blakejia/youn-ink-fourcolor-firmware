@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { api } from '../api.js';
+import React, { useCallback, useEffect, useState } from 'react';
+import { api, apiFetch } from '../api.js';
 import CanvasEditor from '../CanvasEditor.jsx';
 const EMPTY_CANVAS = JSON.stringify(
   { default: [{ type: 'div', props: { tw: 'flex flex-col p-[12px] gap-[8px] bg-white', style: { color: '#000000' }, children: '新页面' } }] },
@@ -15,8 +15,6 @@ export default function Pages() {
   const [duration, setDuration] = useState(10);
   const [order, setOrder] = useState(0);
   const [json, setJson] = useState(EMPTY_CANVAS);
-  const [preview, setPreview] = useState(null); // object URL
-  const [previewErr, setPreviewErr] = useState('');
 
   const load = async () => {
     try { setPages(await api.pages()); setErr(''); }
@@ -26,7 +24,7 @@ export default function Pages() {
 
   const startNew = () => {
     setEditing({});
-    setName(''); setDuration(10); setOrder(0); setJson(EMPTY_CANVAS); setPreview(null);
+    setName(''); setDuration(10); setOrder(0); setJson(EMPTY_CANVAS);
   };
 
   const startEdit = (p) => {
@@ -35,17 +33,8 @@ export default function Pages() {
     setDuration(p.duration_minutes);
     setOrder(p.order);
     setJson(JSON.stringify(p.canvas_json, null, 2));
-    setPreview(null);
   };
 
-  const doPreview = async () => {
-    setPreviewErr('');
-    try {
-      const canvas = JSON.parse(json);
-      const blob = await api.preview(canvas);
-      setPreview(URL.createObjectURL(blob));
-    } catch (e) { setPreviewErr(e.message); }
-  };
 
   const save = async () => {
     setErr(''); setOk('');
@@ -109,19 +98,15 @@ export default function Pages() {
             <label>时长(min) <input type="number" value={duration} onChange={(e) => setDuration(e.target.value)} style={{ width: 70 }} /></label>
             <label>顺序 <input type="number" value={order} onChange={(e) => setOrder(e.target.value)} style={{ width: 60 }} /></label>
           </div>
-          <CanvasEditor canvasJson={json} onChange={(parsed) => setJson(JSON.stringify(parsed, null, 2))} />
-          {previewErr && <div className="err">{previewErr}</div>}
+          <CanvasEditor
+            canvasJson={json}
+            onChange={(parsed) => setJson(JSON.stringify(parsed, null, 2))}
+            operatorFetch={apiFetch}
+          />
           <div className="row" style={{ marginTop: 10 }}>
-            <button className="btn secondary" onClick={doPreview}>预览位图</button>
             <button className="btn" onClick={save}>保存</button>
             <button className="btn secondary" onClick={() => setEditing(null)}>取消</button>
           </div>
-          {preview && (
-            <div style={{ marginTop: 12 }}>
-              <p className="muted">服务端渲染预览（400×300 2bpp）：</p>
-              <img className="preview" src={preview} width="400" height="300" alt="canvas preview" />
-            </div>
-          )}
 
         </div>
       )}
