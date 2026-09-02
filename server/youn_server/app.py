@@ -107,8 +107,13 @@ class _PairClaimBody(BaseModel):
     code: str
 
 
-def _require_device_token(request: Request) -> None:
-    """Validate Authorization: Bearer <token> against device_secrets + trust."""
+def _require_device_token(request: Request) -> "Device":
+    """Validate Authorization: Bearer <token> against device_secrets + trust.
+
+    Returns the authenticated ``Device`` on success so callers that need
+    to cross-check the request's ``device_id`` against the token holder
+    can do so without re-querying the registry.
+    """
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -116,6 +121,7 @@ def _require_device_token(request: Request) -> None:
     dev = registry.get_device_by_token(token)
     if dev is None or not dev.trusted:
         raise HTTPException(status_code=401, detail="unauthorized")
+    return dev
 
 
 
@@ -451,7 +457,9 @@ def create_app() -> FastAPI:
 
     @app.get("/api/notifications/next")
     async def next_notification(request: Request, device_id: str = Query(...)):
-        _require_device_token(request)
+        dev = _require_device_token(request)
+        if dev.device_id != device_id:
+            raise HTTPException(status_code=401, detail="device mismatch")
         n = ns.get_store().next_for(device_id)
         if n is None:
             return Response(status_code=204)
@@ -469,9 +477,8 @@ def create_app() -> FastAPI:
                     ]}}]
             })
         except Exception:
-            ns.get_store()._items[n.id].status = "error"
+            ns.get_store().mark_error(n.id)
             raise HTTPException(500, "render failed")
-        import base64
         return {"bitmap_base64": base64.b64encode(bitmap).decode("ascii"),
                 "notification": asdict(n)}
 

@@ -143,3 +143,22 @@ def test_history(client, trusted_device):
                    headers={"X-Operator-Token": ""})
     assert r.status_code == 200
     assert len(r.json()["notifications"]) == 2
+
+
+def test_next_rejects_token_mismatch(client, trusted_device):
+    """Trusted device's token cannot drain a different device_id's queue."""
+    device_id, token = trusted_device
+    # Create a notification for our own device.
+    client.post("/api/notifications",
+                json={"device_id": device_id, "title": "t", "body": "b"},
+                headers={"X-Operator-Token": ""})
+    # Try to drain it under a different device_id — must 401, queue must be intact.
+    r = client.get("/api/notifications/next",
+                   params={"device_id": "OTHER-DEVICE"},
+                   headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 401
+    # Queue for the legitimate device is still pending and pulls cleanly.
+    r2 = client.get("/api/notifications/next",
+                    params={"device_id": device_id},
+                    headers={"Authorization": f"Bearer {token}"})
+    assert r2.status_code == 200

@@ -98,6 +98,24 @@ class NotifyStore:
             self._append(n)
             return n
 
+    def mark_error(self, notification_id: str) -> Optional[Notification]:
+        """Mark a notification as 'error' (e.g. render failed) and persist.
+
+        Public counterpart to the private ``_items[id].status = "error"``
+        pattern callers used to write inline: this one takes the store lock
+        and writes through ``_append`` so the status change survives a
+        process restart instead of being lost in memory.
+        """
+        with self._lock:
+            n = self._items.get(notification_id)
+            if n is None:
+                return None
+            if n.status == "acked":
+                return n  # terminal; don't overwrite acked state
+            n.status = "error"
+            self._append(n)
+            return n
+
     def recent(self, device_id: str = "", limit: int = 20) -> list[Notification]:
         items = self._items.values()
         if device_id:
