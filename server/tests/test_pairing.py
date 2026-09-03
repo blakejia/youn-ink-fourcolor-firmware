@@ -352,3 +352,48 @@ def test_pair_confirm_no_operator_token_401(client):
         "code": "123456",
     })
     assert r.status_code == 401
+
+# ── Unconfirmed claim polling (device waits for user confirm) ─────────
+
+
+def test_pair_claim_pending_before_confirm(client):
+    """Unconfirmed-but-valid code → 200 pending (not 401), pollable without lockout.
+
+    Regression: device polls pair-claim every 2s while the user reads the
+    6-digit code. 401 here made firmware drop a valid code and hammer
+    pair-start into the IP rate limiter (permanent 429 + blank screen).
+    """
+    device_id = "TEST-PENDING-001"
+
+    r = client.post("/api/devices/pair-start", json={
+        "device_id": device_id,
+        "board_type": "NOTE4C",
+    }, headers=signed_headers(device_id))
+    assert r.status_code == 200
+    code = r.json()["code"]
+
+    # Poll 6x (past the 5-failure lockout threshold): every poll stays
+    # 200-pending, never 401/429, and no token is issued.
+    for _ in range(6):
+        r = client.post("/api/devices/pair-claim", json={
+            "device_id": device_id,
+            "code": code,
+        })
+        assert r.status_code == 200
+        assert r.json().get("status") == "pending"
+        assert "token" not in r.json()
+
+    # After user confirms, the same code claims a token immediately
+    # (no lockout tripped by the polls above).
+    r = client.post("/api/devices/pair-confirm", json={
+        "device_id": device_id,
+        "code": code,
+    }, headers={"X-Operator-Token": "test-operator-token"})
+    assert r.status_code == 200
+
+    r = client.post("/api/devices/pair-claim", json={
+        "device_id": device_id,
+        "code": code,
+    })
+    assert r.status_code == 200
+    assert len(r.json()["token"]) == 64

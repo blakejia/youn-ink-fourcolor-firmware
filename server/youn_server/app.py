@@ -306,6 +306,11 @@ def create_app() -> FastAPI:
 
     @app.post("/api/devices/pair-claim")
     async def pair_claim(body: _PairClaimBody, request: Request) -> dict:
+        # Valid code, user hasn't confirmed yet → pending (200, no token).
+        # Checked before lockout/failure accounting so normal 2s polling
+        # while the user reads the code never trips the claim lockout.
+        if _pairing_store.is_pending(body.device_id, body.code):
+            return {"status": "pending"}
         if _pairing_store.is_claim_locked(body.device_id):
             raise HTTPException(429, detail="too many failed attempts, try again later")
         token = _pairing_store.claim_session(body.device_id, body.code)

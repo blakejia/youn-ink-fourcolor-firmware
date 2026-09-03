@@ -164,6 +164,30 @@ class PairingStore:
         log.info("pairing claimed device_id=%s", device_id)
         return token
 
+    def is_pending(
+        self, device_id: str, code: str, *, now: Optional[int] = None
+    ) -> bool:
+        """True when session exists, code matches, not expired, not yet confirmed.
+
+        Read-only: never records a claim failure. Lets the device poll
+        pair-claim while the user reads the 6-digit code without tripping
+        the claim lockout or dropping a valid code.
+        """
+        if now is None:
+            now = int(time.time())
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT code, confirmed, expires_at FROM pairing_sessions WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if now > row["expires_at"]:
+                return False
+            if row["confirmed"]:
+                return False
+            return secrets.compare_digest(code.encode(), row["code"].encode())
+
     # ── rate limiting (in-memory sliding window) ──
 
     def check_rate_limit(self, ip: str) -> bool:
