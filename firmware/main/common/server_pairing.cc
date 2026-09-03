@@ -20,7 +20,7 @@
 #include <cJSON.h>
 #include <esp_mac.h>
 #include <nvs.h>
-#include <nvs_flash.h>
+#include "device_signature.h"
 
 static const char *kTag = "Pairing";
 
@@ -180,10 +180,27 @@ static bool do_pair_start(const char *device_id, char *code_out, int code_out_le
              "{\"device_id\":\"%s\",\"board_type\":\"%s\"}",
              device_id, kBoardType);
 
+    // Sign the request
+    char mac_hex[16], ts_str[16], nonce_b64[32], sig_b64[64];
+    device_sign_pair_start(device_id,
+                           mac_hex, sizeof(mac_hex),
+                           ts_str, sizeof(ts_str),
+                           nonce_b64, sizeof(nonce_b64),
+                           sig_b64, sizeof(sig_b64));
+    ESP_LOGI(kTag, "pair-start signing: mac=%s ts=%s nonce=%s sig_len=%d",
+             mac_hex, ts_str, nonce_b64, (int)strlen(sig_b64));
+
+    http_header_t extra[] = {
+        {"X-Device-Mac", mac_hex},
+        {"X-Device-Timestamp", ts_str},
+        {"X-Device-Nonce", nonce_b64},
+        {"X-Device-Signature", sig_b64},
+    };
+
     char resp[512];
     int resp_len = sizeof(resp);
-
-    int status = http_wrapper_post_json(url, NULL, body, resp, &resp_len, kHttpTimeoutMs);
+    int status = http_wrapper_post_json_with_headers(
+        url, NULL, body, extra, 4, resp, &resp_len, kHttpTimeoutMs);
     if (status < 0) {
         ESP_LOGE(kTag, "pair-start 网络错误");
         return false;
@@ -314,8 +331,8 @@ bool server_pairing_run(void)
             return true;
         }
 
-        if (status == 401) {
-            ESP_LOGW(kTag, "pair-claim 401: code 过期或未确认，重新 pair-start");
+        if (status == 401 || status == 429) {
+            ESP_LOGW(kTag, "pair-claim %d: 重新发起 pair-start", status);
             start_time = esp_timer_get_time();
             code[0] = '\0';
             continue;
