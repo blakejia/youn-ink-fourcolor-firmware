@@ -17,14 +17,22 @@ extern "C" {
 #endif
 
 /**
- * @brief HTTP GET 请求
+ * @brief Key-value pair for custom HTTP headers.
+ */
+typedef struct {
+    const char *key;
+    const char *value;
+} http_header_t;
+
+/**
+ * @brief HTTP GET request
  *
- * @param url       完整 URL
- * @param token     Bearer token（NULL 表示公开端点）
- * @param out_buf   响应体缓冲区
- * @param out_len   [in] 缓冲区大小 / [out] 实际响应长度
- * @param timeout_ms 超时毫秒
- * @return HTTP 状态码，-1 表示网络/连接错误
+ * @param url       Full URL
+ * @param token     Bearer token (NULL = public endpoint)
+ * @param out_buf   Response body buffer
+ * @param out_len   [in] buffer size / [out] actual response length
+ * @param timeout_ms timeout in milliseconds
+ * @return HTTP status code, -1 for network/connection error
  */
 int http_wrapper_get(const char *url, const char *token,
                      char *out_buf, int *out_len, int timeout_ms);
@@ -32,17 +40,37 @@ int http_wrapper_get(const char *url, const char *token,
 /**
  * @brief HTTP POST (JSON body)
  *
- * @param url        完整 URL
- * @param token      Bearer token（NULL 表示公开端点）
- * @param json_body  JSON 请求体字符串
- * @param out_buf    响应体缓冲区
- * @param out_len    [in] 缓冲区大小 / [out] 实际响应长度
- * @param timeout_ms 超时毫秒
- * @return HTTP 状态码，-1 表示网络/连接错误
+ * @param url        Full URL
+ * @param token      Bearer token (NULL = public endpoint)
+ * @param json_body  JSON request body string
+ * @param out_buf    Response body buffer
+ * @param out_len    [in] buffer size / [out] actual response length
+ * @param timeout_ms timeout in milliseconds
+ * @return HTTP status code, -1 for network/connection error
  */
 int http_wrapper_post_json(const char *url, const char *token,
                            const char *json_body,
                            char *out_buf, int *out_len, int timeout_ms);
+
+/**
+ * @brief HTTP POST (JSON body) with extra custom headers
+ *
+ * @param url           Full URL
+ * @param token         Bearer token (NULL = public endpoint)
+ * @param json_body     JSON request body string
+ * @param extra_headers Array of extra header key-value pairs (may be NULL)
+ * @param extra_count   Number of extra headers (0 if extra_headers is NULL)
+ * @param out_buf       Response body buffer
+ * @param out_len       [in] buffer size / [out] actual response length
+ * @param timeout_ms    timeout in milliseconds
+ * @return HTTP status code, -1 for network/connection error
+ */
+int http_wrapper_post_json_with_headers(const char *url, const char *token,
+                                        const char *json_body,
+                                        const http_header_t *extra_headers,
+                                        int extra_count,
+                                        char *out_buf, int *out_len,
+                                        int timeout_ms);
 
 #ifdef __cplusplus
 }

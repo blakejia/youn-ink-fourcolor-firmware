@@ -154,3 +154,62 @@ int http_wrapper_post_json(const char *url, const char *token,
     esp_http_client_cleanup(client);
     return status;
 }
+
+int http_wrapper_post_json_with_headers(const char *url, const char *token,
+                                        const char *json_body,
+                                        const http_header_t *extra_headers,
+                                        int extra_count,
+                                        char *out_buf, int *out_len,
+                                        int timeout_ms)
+{
+    if (!url || !out_buf || !out_len || *out_len <= 0) {
+        return -1;
+    }
+
+    HttpRespCtx ctx = {};
+    ctx.buf = out_buf;
+    ctx.buf_size = *out_len;
+    ctx.len = 0;
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_POST;
+    config.event_handler = http_event_handler;
+    config.user_data = &ctx;
+    config.timeout_ms = timeout_ms;
+    config.disable_auto_redirect = false;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(kTag, "Failed to init HTTP client for %s", url);
+        return -1;
+    }
+
+    set_bearer_header(client, token);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+
+    if (extra_headers && extra_count > 0) {
+        for (int i = 0; i < extra_count; i++) {
+            esp_http_client_set_header(client,
+                                       extra_headers[i].key,
+                                       extra_headers[i].value);
+        }
+    }
+
+    if (json_body) {
+        esp_http_client_set_post_field(client, json_body, strlen(json_body));
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "HTTP POST %s failed: %s", url, esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return -1;
+    }
+
+    int status = esp_http_client_get_status_code(client);
+    out_buf[ctx.len] = '\0';
+    *out_len = ctx.len;
+    esp_http_client_cleanup(client);
+    return status;
+}
