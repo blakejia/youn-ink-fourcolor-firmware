@@ -63,6 +63,14 @@ class Settings(BaseSettings):
     operator_token: str = Field(default="")
     notify_default_ttl: int = Field(default=300)
 
+    # ── Device signature authentication (HMAC pair-start) ──
+    # Symmetric MASTER_KEY shared with firmware; >=32 random bytes recommended.
+    # Empty = device auth disabled at runtime: server starts but rejects every
+    # pair-start (logged at startup). Read from .env, never hardcoded.
+    master_key: str = Field(default="")
+    # Comma-separated device_id whitelist; empty string = all devices accepted.
+    allowed_device_ids: str = Field(default="")
+
     # ── Canvas Loop policy ──
     canvas_sleep_start: str = Field(default="00:00")
     canvas_sleep_end: str = Field(default="06:00")

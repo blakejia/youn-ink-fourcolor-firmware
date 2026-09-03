@@ -22,6 +22,8 @@ from youn_server.app import create_app, _pairing_store
 from youn_server.devices import registry
 from youn_server.pairing import PairingStore
 
+from .device_sig import signed_headers
+
 
 import os
 
@@ -61,7 +63,7 @@ def test_pair_full_happy_path(client):
     r = client.post("/api/devices/pair-start", json={
         "device_id": device_id,
         "board_type": "NOTE4C",
-    })
+    }, headers=signed_headers(device_id))
     assert r.status_code == 200
     body = r.json()
     assert len(body["code"]) == 6
@@ -105,7 +107,7 @@ def test_pair_claim_expired_code(client):
     r = client.post("/api/devices/pair-start", json={
         "device_id": device_id,
         "board_type": "NOTE4C",
-    })
+    }, headers=signed_headers(device_id))
     code = r.json()["code"]
 
     # Confirm it
@@ -140,7 +142,7 @@ def test_pair_claim_wrong_code_lockout(client):
     r = client.post("/api/devices/pair-start", json={
         "device_id": device_id,
         "board_type": "NOTE4C",
-    })
+    }, headers=signed_headers(device_id))
     code = r.json()["code"]
 
     # Confirm it
@@ -176,7 +178,7 @@ def test_pair_claim_reuse_401(client):
     r = client.post("/api/devices/pair-start", json={
         "device_id": device_id,
         "board_type": "NOTE4C",
-    })
+    }, headers=signed_headers(device_id))
     code = r.json()["code"]
 
     # Confirm
@@ -211,7 +213,7 @@ def test_require_device_token_valid(client):
     # Full pairing flow
     r = client.post("/api/devices/pair-start", json={
         "device_id": device_id, "board_type": "NOTE4C",
-    })
+    }, headers=signed_headers(device_id))
     code = r.json()["code"]
     r = client.post("/api/devices/pair-confirm", json={
         "device_id": device_id, "code": code,
@@ -248,7 +250,7 @@ def test_revoke_then_token_401(client):
     # Full pairing
     r = client.post("/api/devices/pair-start", json={
         "device_id": device_id, "board_type": "NOTE4C",
-    })
+    }, headers=signed_headers(device_id))
     code = r.json()["code"]
     r = client.post("/api/devices/pair-confirm", json={
         "device_id": device_id, "code": code,
@@ -320,14 +322,14 @@ def test_pair_start_rate_limit(client):
         r = client.post("/api/devices/pair-start", json={
             "device_id": f"TEST-RL-{i:03d}",
             "board_type": "NOTE4C",
-        })
+        }, headers=signed_headers(f"TEST-RL-{i:03d}"))
         assert r.status_code == 200, f"request {i+1} should be 200"
 
     # 6th blocked
     r = client.post("/api/devices/pair-start", json={
         "device_id": "TEST-RL-005",
         "board_type": "NOTE4C",
-    })
+    }, headers=signed_headers("TEST-RL-005"))
     assert r.status_code == 429
 
 

@@ -177,6 +177,11 @@ def _push_image_to_device(session: "Session", image_id: str) -> bool:
 # ── app factory ───────────────────────────────────────────────────────
 def create_app() -> FastAPI:
     setup_logging()
+    if not settings.master_key:
+        log.error(
+            "MASTER_KEY is empty: all pair-start requests will be rejected "
+            "(set MASTER_KEY in .env; generate with secrets.token_urlsafe(32))"
+        )
     app = FastAPI(
         title="Youn Ink Server",
         version="1.0.0",
@@ -254,6 +259,19 @@ def create_app() -> FastAPI:
     # ── device pairing ──
     @app.post("/api/devices/pair-start")
     async def pair_start(body: _PairStartBody, request: Request) -> dict:
+        # Device signature auth. Task 1 enforces configuration + header
+        # presence; Tasks 2/3 add HMAC verification and the whitelist.
+        # No MASTER_KEY -> reject every pair-start (server still runs; the
+        # startup log.error explains why).
+        if not settings.master_key:
+            raise HTTPException(401, detail="device authentication failed")
+        mac = request.headers.get("X-Device-Mac", "")
+        ts_str = request.headers.get("X-Device-Timestamp", "")
+        nonce = request.headers.get("X-Device-Nonce", "")
+        sig = request.headers.get("X-Device-Signature", "")
+        if not (mac and ts_str and sig):
+            raise HTTPException(400, detail="missing device auth headers")
+
         ip = request.client.host if request.client else "unknown"
         if not _pairing_store.check_rate_limit(ip):
             raise HTTPException(429, detail="rate limited, try again later")

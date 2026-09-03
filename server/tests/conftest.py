@@ -13,8 +13,22 @@ import pytest
 
 from youn_server.config import settings
 
+from .device_sig import TEST_MASTER_KEY
+
 # Tests run without operator token (auth logic is exercised in test_pairing separately)
 settings.operator_token = ""
+
+
+@pytest.fixture(autouse=True)
+def _device_signature_key():
+    """Provide a MASTER_KEY so pair-start's key gate passes for the whole suite.
+
+    Device-signature tests that need an empty key (test_master_key_required)
+    override and restore it themselves.
+    """
+    settings.master_key = TEST_MASTER_KEY
+    yield
+    settings.master_key = ""
 
 @pytest.fixture(autouse=True)
 def isolate_pages_dir():

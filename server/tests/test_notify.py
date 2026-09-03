@@ -24,6 +24,8 @@ from youn_server.app import create_app, _pairing_store
 from youn_server.config import settings
 from youn_server import notify_store as ns
 
+from .device_sig import signed_headers
+
 
 @pytest.fixture(autouse=True)
 def _clean_notify_state():
@@ -50,7 +52,8 @@ def client():
 @pytest.fixture()
 def trusted_device(client):
     # Register a trusted device via pairing flow (reuse existing pairing)
-    r = client.post("/api/devices/pair-start", json={"device_id": "NOTE4C-TEST", "board_type": "NOTE4C"})
+    r = client.post("/api/devices/pair-start", json={"device_id": "NOTE4C-TEST", "board_type": "NOTE4C"},
+                    headers=signed_headers("NOTE4C-TEST"))
     assert r.status_code == 200
     code = r.json()["code"]
     r = client.post("/api/devices/pair-confirm",
