@@ -70,4 +70,8 @@
 
 
 
+// Device signature master key (compile-time inject, do NOT commit actual value)
+#ifndef DEVICE_MASTER_KEY
+#define DEVICE_MASTER_KEY "REPLACE_ME_AT_BUILD_TIME_WITH_32_BYTE_RANDOM"
+#endif
 #endif // _BOARD_CONFIG_H_

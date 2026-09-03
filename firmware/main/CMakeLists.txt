@@ -64,6 +64,7 @@ set(SOURCES
     "common/server_pairing.cc"
     "common/http_client_wrapper.cc"
     "common/page_sync.cc"
+    "common/device_signature.cc"
     "common/notify.cc"
     "ui/widgets/status_bar.cc"
     "ui/renderers/rawdraw/ebook_renderer.cc"
