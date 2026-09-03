@@ -10,6 +10,9 @@ Rate limiting and claim lockout are in-memory sliding windows.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import logging
 import secrets
 import sqlite3
@@ -17,6 +20,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Optional
+
+from .config import settings
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +41,10 @@ CONFIRM_LOCKOUT_SECONDS = 600  # 10 minutes
 CONFIRM_LOCKOUT_THRESHOLD = 5  # wrong claims before lockout
 RATE_LIMIT_WINDOW = 300  # 5 minutes
 RATE_LIMIT_MAX = 5
+
+# Device signature authentication (HMAC pair-start)
+TIMESTAMP_WINDOW_SEC = 30  # ±30s clock-skew tolerance
+NONCE_CACHE_TTL_SEC = 300  # 5 minutes nonce replay window (in-memory)
 
 
 class PairingStore:
@@ -57,6 +66,8 @@ class PairingStore:
         self._rate_limits: dict[str, list[float]] = {}
         # Claim lockout: device_id → list of failed attempt timestamps
         self._claim_failures: dict[str, list[float]] = {}
+        # Device signature replay cache: "device_id:nonce" → first-seen time
+        self._nonce_cache: dict[str, float] = {}
 
     # ── session CRUD ──
 
@@ -191,6 +202,104 @@ class PairingStore:
             failures = [t for t in failures if t > cutoff]
             self._claim_failures[device_id] = failures
             return len(failures) >= CONFIRM_LOCKOUT_THRESHOLD
+
+    # ── device signature auth (HMAC pair-start) ──
+
+    def verify_device_signature(self, device_id: str, mac: str,
+                                 timestamp: int, nonce: str,
+                                 signature_b64: str) -> bool:
+        """Verify a pair-start device signature.
+
+        Signed payload (fixed byte order): ``MAC(6 bytes) || timestamp(ASCII)
+        || nonce(ASCII)`` under ``derived_key = HMAC-SHA256(MASTER_KEY,
+        device_id)``, then base64-encoded. Enforces a ±30s timestamp window
+        and a 5-minute in-memory nonce replay cache. Returns False on any
+        failure; never raises.
+        """
+        master_key = settings.master_key
+        if not master_key or len(master_key) < 32:
+            log.error(
+                "device signature rejected: MASTER_KEY not configured or <32 bytes"
+            )
+            return False
+
+        # Timestamp window: reject both stale and far-future timestamps.
+        now = int(time.time())
+        if abs(now - timestamp) > TIMESTAMP_WINDOW_SEC:
+            log.warning(
+                "signature failed: timestamp out of window device_id=%s delta=%d",
+                device_id, now - timestamp,
+            )
+            return False
+
+        # Per-device derived key: HMAC-SHA256(MASTER_KEY, device_id).
+        derived_key = hmac.new(
+            master_key.encode(), device_id.encode(), hashlib.sha256
+        ).digest()
+
+        # Parse MAC: must be 12 hex chars decoding to exactly 6 bytes.
+        try:
+            mac_bytes = bytes.fromhex(mac)
+        except (ValueError, TypeError):
+            log.warning(
+                "signature failed: bad MAC hex device_id=%s mac=%r", device_id, mac
+            )
+            return False
+        if len(mac_bytes) != 6:
+            log.warning(
+                "signature failed: MAC is not 6 bytes device_id=%s mac=%r",
+                device_id, mac,
+            )
+            return False
+
+        # Reconstruct the exact payload the device signed.
+        payload = mac_bytes + str(timestamp).encode() + nonce.encode()
+
+        try:
+            provided = base64.b64decode(signature_b64)
+        except Exception:  # noqa: BLE001 — never raise at the auth boundary
+            log.warning(
+                "signature failed: undecodable base64 device_id=%s", device_id
+            )
+            return False
+        expected = hmac.new(derived_key, payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, provided):
+            log.warning("signature failed: HMAC mismatch device_id=%s", device_id)
+            return False
+
+        # Nonce replay protection. Cache key is scoped per device so the same
+        # nonce from two different devices does not collide.
+        nonce_key = f"{device_id}:{nonce}"
+        with self._lock:
+            now_f = time.time()
+            # Evict entries older than the replay window (bounded cache).
+            self._nonce_cache = {
+                k: t for k, t in self._nonce_cache.items()
+                if now_f - t < NONCE_CACHE_TTL_SEC
+            }
+            if nonce_key in self._nonce_cache:
+                log.warning("signature failed: nonce replay device_id=%s", device_id)
+                return False
+            self._nonce_cache[nonce_key] = now_f
+
+        log.info("device signature verified device_id=%s", device_id)
+        return True
+
+    def check_whitelist(self, device_id: str) -> bool:
+        """Return True if device_id is allowed to pair.
+
+        ``settings.allowed_device_ids`` is a comma-separated string; an empty
+        value means every device is accepted. Surrounding whitespace on
+        entries is ignored.
+        """
+        raw = settings.allowed_device_ids
+        if isinstance(raw, str):
+            allowed = [d.strip() for d in raw.split(",") if d.strip()]
+        else:  # tolerate a list/tuple if configured that way
+            allowed = [str(d).strip() for d in raw if str(d).strip()]
+        if not allowed:
+            return True
+        return device_id in allowed
 
     def cleanup_expired(self) -> int:
         """Delete all expired sessions. Returns count deleted."""
