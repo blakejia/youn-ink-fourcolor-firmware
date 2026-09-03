@@ -11,6 +11,8 @@ from youn_server.app import create_app
 from youn_server.config import settings
 from youn_server import pairing as pairing_mod
 
+from .device_sig import signed_headers
+
 
 @pytest.fixture(autouse=True)
 def enable_pairing(monkeypatch):
@@ -160,3 +162,48 @@ def test_check_whitelist_rejects_unlisted(store):
         assert store.check_whitelist("NOT-ALLOWED") is False
     finally:
         settings.allowed_device_ids = ""
+
+
+# ── Task 3: pair-start endpoint wires in signature + whitelist checks ──
+# The store-level methods are covered above; this exercises the HTTP
+# endpoint end-to-end via TestClient.
+
+
+def test_pair_start_full_flow_401_then_200():
+    """End-to-end: no headers → 400, forged signature → 401, valid → 200."""
+    device_id = "NOTE4C-FLOW"
+    app = create_app()
+    with TestClient(app) as c:
+        # 1. No auth headers at all → 400 missing device auth headers
+        r = c.post("/api/devices/pair-start",
+                   json={"device_id": device_id, "board_type": "NOTE4C"})
+        assert r.status_code == 400
+        assert "missing device auth headers" in r.json()["detail"]
+
+        # 2. All headers present but signature forged → 401
+        headers = signed_headers(device_id)
+        forged = dict(headers)
+        forged["X-Device-Signature"] = base64.b64encode(b"\x00" * 32).decode()
+        r = c.post("/api/devices/pair-start",
+                   json={"device_id": device_id, "board_type": "NOTE4C"},
+                   headers=forged)
+        assert r.status_code == 401
+        assert "device authentication failed" in r.json()["detail"]
+
+        # 3. Valid signature but device not in whitelist → 401
+        try:
+            settings.allowed_device_ids = "SOME-OTHER-DEVICE"
+            r = c.post("/api/devices/pair-start",
+                       json={"device_id": device_id, "board_type": "NOTE4C"},
+                       headers=signed_headers(device_id))
+            assert r.status_code == 401
+            assert "whitelist" in r.json()["detail"]
+        finally:
+            settings.allowed_device_ids = ""
+
+        # 4. Valid signature, empty whitelist → 200 with 6-digit code
+        r = c.post("/api/devices/pair-start",
+                   json={"device_id": device_id, "board_type": "NOTE4C"},
+                   headers=headers)
+        assert r.status_code == 200
+        assert len(r.json()["code"]) == 6

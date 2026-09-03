@@ -259,18 +259,35 @@ def create_app() -> FastAPI:
     # ── device pairing ──
     @app.post("/api/devices/pair-start")
     async def pair_start(body: _PairStartBody, request: Request) -> dict:
-        # Device signature auth. Task 1 enforces configuration + header
-        # presence; Tasks 2/3 add HMAC verification and the whitelist.
-        # No MASTER_KEY -> reject every pair-start (server still runs; the
-        # startup log.error explains why).
+        # No MASTER_KEY configured -> reject every pair-start (the startup
+        # log.error explains why). Checked before header presence so an
+        # unconfigured server never hints at the expected request shape.
         if not settings.master_key:
             raise HTTPException(401, detail="device authentication failed")
+
         mac = request.headers.get("X-Device-Mac", "")
         ts_str = request.headers.get("X-Device-Timestamp", "")
         nonce = request.headers.get("X-Device-Nonce", "")
         sig = request.headers.get("X-Device-Signature", "")
+
         if not (mac and ts_str and sig):
             raise HTTPException(400, detail="missing device auth headers")
+        try:
+            timestamp = int(ts_str)
+        except ValueError:
+            raise HTTPException(400, detail="invalid timestamp")
+
+        # HMAC signature over MAC(6) || timestamp || nonce; also enforces
+        # the ±30s time window and the 5-min nonce replay cache.
+        if not _pairing_store.verify_device_signature(
+            body.device_id, mac, timestamp, nonce, sig
+        ):
+            raise HTTPException(401, detail="device authentication failed")
+
+        # Whitelist checked only after authentication so its existence is
+        # not revealed to unauthenticated callers.
+        if not _pairing_store.check_whitelist(body.device_id):
+            raise HTTPException(401, detail="device not in whitelist")
 
         ip = request.client.host if request.client else "unknown"
         if not _pairing_store.check_rate_limit(ip):
