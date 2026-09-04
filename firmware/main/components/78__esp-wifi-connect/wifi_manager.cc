@@ -309,7 +309,13 @@ void WifiManager::StartConfigAp() {
         StopConfigAp();
         StartStation();
     });
-    
+
+    // Notify app of provisioning state changes (for screen display)
+    config_ap_->OnProvisioningState([this](const std::string& state, int reason) {
+        ESP_LOGI(TAG, "Provisioning state: %s (reason=%d)", state.c_str(), reason);
+        if (provisioning_state_callback_) provisioning_state_callback_(state, reason);
+    });
+
     config_ap_->Start();
     config_mode_active_ = true;
 
@@ -372,4 +378,10 @@ void WifiManager::SetPowerSaveLevel(WifiPowerSaveLevel level) {
 void WifiManager::SetEventCallback(std::function<void(WifiEvent)> callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     event_callback_ = std::move(callback);
+}
+
+void WifiManager::SetProvisioningStateCallback(
+    std::function<void(const std::string&, int)> callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    provisioning_state_callback_ = std::move(callback);
 }

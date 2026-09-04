@@ -55,6 +55,17 @@ public:
      */
     void OnExitRequested(std::function<void()> callback);
 
+    /**
+     * @brief Register a callback for provisioning state changes.
+     *
+     * The callback receives one of:
+     *   "ap_started"             — config AP is up
+     *   "ap_client_connected"    — phone joined the AP
+     *   "provisioning"           — form submitted, attempting WiFi
+     *   "provisioned"            — WiFi connected (got IP)
+     *   "error"                  — last attempt failed (second arg = reason code, -1 = other)
+     */
+    void OnProvisioningState(std::function<void(const std::string& state, int reason)> callback);
 private:
     std::mutex mutex_;
     std::unique_ptr<DnsServer> dns_server_;
@@ -73,9 +84,9 @@ private:
     int8_t max_tx_power_;
     bool remember_bssid_;
     bool sleep_mode_;
-
     // Callbacks
     std::function<void()> on_exit_requested_;
+    std::function<void(const std::string&, int)> on_provisioning_state_;
 
     void StartAccessPoint();
     void StartWebServer();

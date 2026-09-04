@@ -213,6 +213,7 @@ const char* RawDrawUiManager::GetPageTitle(RawDrawPageId page) {
         case RawDrawPageId::Calendar:   return "日历";
         case RawDrawPageId::FontDebug:  return "对齐测试";
         case RawDrawPageId::FontMetrics: return "字体指标";
+        case RawDrawPageId::Pairing: return "配对";
         default:               return "未知";
     }
 }
@@ -243,6 +244,7 @@ RawDrawUiManager::RawDrawUiManager()
     lifebar_renderer_ = std::make_unique<rawdraw::LifeBarRenderer>();
     almanac_renderer_ = std::make_unique<rawdraw::AlmanacRenderer>();
     log_renderer_ = std::make_unique<rawdraw::LogRenderer>();
+    pairing_renderer_ = std::make_unique<rawdraw::PairingRenderer>();
     yearprogress_renderer_ = std::make_unique<rawdraw::YearProgressRenderer>();
     calendar_renderer_ = std::make_unique<rawdraw::CalendarRenderer>();
     font_debug_renderer_ = std::make_unique<rawdraw::FontDebugRenderer>();
@@ -394,7 +396,8 @@ void RawDrawUiManager::SwitchPage(RawDrawPageId page) {
     // Initialize the new page renderer
     InitRenderer(page);
 
-    // Switch current page
+    // Switch current page (remember where we came from for UP-long back)
+    previous_page_ = current_page_;
     current_page_ = page;
     if (page_switch_cb_) {
         page_switch_cb_(page);
@@ -465,6 +468,7 @@ rawdraw::PageRenderer* RawDrawUiManager::GetRendererForPage(RawDrawPageId page) 
         case RawDrawPageId::LifeBar:  return lifebar_renderer_.get();
         case RawDrawPageId::Almanac:  return almanac_renderer_.get();
         case RawDrawPageId::Log:      return log_renderer_.get();
+        case RawDrawPageId::Pairing:  return pairing_renderer_.get();
         case RawDrawPageId::YearProgress: return yearprogress_renderer_.get();
         case RawDrawPageId::Calendar:   return calendar_renderer_.get();
         case RawDrawPageId::FontDebug:  return font_debug_renderer_.get();
@@ -569,6 +573,15 @@ void RawDrawUiManager::ShowWifiConfigPage(const std::string& ssid,
     SwitchPage(RawDrawPageId::Wifi);
 }
 
+void RawDrawUiManager::ShowPairingCodePage(const std::string& code, int expires_in) {
+    if (pairing_renderer_) {
+        pairing_renderer_->SetCode(code, expires_in);
+    }
+    SwitchPage(RawDrawPageId::Pairing);
+    // SwitchPage early-returns when already on this page (e.g. code
+    // refreshed after pairing timeout) — force repaint regardless.
+    RequestActivePageRefresh();
+}
 bool RawDrawUiManager::StartLanHttpServer(const std::string& ip_address) {
     // LAN HTTP server is now handled by the server-side pairing flow
     // (no local HTTP server needed for AP transfer).

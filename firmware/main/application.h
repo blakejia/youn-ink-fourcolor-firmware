@@ -2,6 +2,7 @@
 #define _APPLICATION_H_
 
 #include <atomic>
+#include <string>
 #include <functional>
 #include <memory>
 #include <string_view>
@@ -28,6 +29,8 @@ public:
 
     DeviceState GetDeviceState() const { return state_.load(std::memory_order_acquire); }
     bool SetDeviceState(DeviceState state);
+    LifecycleState GetLifecycleState() const { return lifecycle_.load(std::memory_order_acquire); }
+    void TransitionLifecycle(LifecycleState next, const char* reason);
 
     void Schedule(std::function<void()>&& callback);
     void PlaySound(const std::string_view& sound);
@@ -39,7 +42,9 @@ public:
     AudioService& GetAudioService() { return audio_service_; }
     ui::RawDrawUiManager* GetRawDrawUiManager() { return rawdraw_ui_manager_.get(); }
     void UpdateStatusBarForUi();
-    void OnUpClick();
+    void UpdateWifiStatusForProvisioning(const std::string& state, int reason);
+
+     void OnUpClick();
     void OnDownClick();
     void OnUpLongPress();
     void OnDownLongPress();
@@ -50,8 +55,9 @@ public:
 private:
     Application();
     ~Application();
-
     std::atomic<DeviceState> state_{kDeviceStateUnknown};
+    std::atomic<LifecycleState> lifecycle_{kLifecycleUnknown};
+
     std::atomic<bool> wifi_connected_{false};
     AudioService audio_service_;
     std::unique_ptr<ui::RawDrawUiManager> rawdraw_ui_manager_;

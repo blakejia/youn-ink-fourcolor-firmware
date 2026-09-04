@@ -97,14 +97,24 @@ void WifiRenderer::Render(uint8_t* fb, int width, int height) {
 
     // === Content based on state ===
     switch (status_.state) {
+        case WifiState::Disconnected:
+            RenderDisconnected(fb, width, height);
+            break;
         case WifiState::Connecting:
-            RenderConnecting(fb, width, height);
+        case WifiState::Provisioning:
+            RenderProvisioning(fb, width, height);
             break;
         case WifiState::Connected:
             RenderConnected(fb, width, height);
             break;
-        case WifiState::Disconnected:
-            RenderDisconnected(fb, width, height);
+        case WifiState::ApStarted:
+            RenderApStarted(fb, width, height);
+            break;
+        case WifiState::ApClientConnected:
+            RenderApClientConnected(fb, width, height);
+            break;
+        case WifiState::Error:
+            RenderError(fb, width, height);
             break;
     }
 
@@ -365,6 +375,236 @@ void WifiRenderer::RenderDisconnected(uint8_t* fb, int width, int height) {
 }
 
 // ============================================================
+// AP_STARTED STATE — show hotspot info + URL
+// ============================================================
+
+void WifiRenderer::RenderApStarted(uint8_t* fb, int width, int height) {
+    const auto& theme = ThemeManager::Get();
+    const Color text = theme.ColorFor(ThemeToken::TextPrimary);
+    const Color secondary_text = theme.ColorFor(ThemeToken::TextSecondary);
+    const Color accent = theme.ColorFor(ThemeToken::Accent);
+    const int top = Style::kStatusBarHeight + Style::kSpacingXL;
+
+    // Title
+    const char* title = "配网模式已开启";
+    int title_w = MeasureTextWidth(title, title_font_);
+    DrawText(fb, width, (width - title_w) / 2, top, title, title_font_, text);
+
+    // AP card area
+    const int card_x = Style::kSpacingXL;
+    const int card_w = width - 2 * Style::kSpacingXL;
+    const int card_y = top + title_font_->line_height + Style::kSpacingLG;
+
+    int y = card_y;
+    // SSID
+    if (!status_.ap_ssid.empty()) {
+        const char* ssid_label = "热点名:";
+        int label_w = MeasureTextWidth(ssid_label, font_);
+        DrawText(fb, width, card_x, y, ssid_label, font_, secondary_text);
+        std::string ssid = FitTextToWidth(status_.ap_ssid, font_, card_w - label_w - Style::kSpacingMD);
+        DrawText(fb, width, card_x + label_w + Style::kSpacingMD, y, ssid.c_str(), font_, text);
+        y += font_->line_height + Style::kSpacingSM;
+    }
+    // Password
+    if (!status_.ap_password.empty()) {
+        const char* pw_label = "密码:";
+        int label_w = MeasureTextWidth(pw_label, font_);
+        DrawText(fb, width, card_x, y, pw_label, font_, secondary_text);
+        std::string pw = FitTextToWidth(status_.ap_password, font_, card_w - label_w - Style::kSpacingMD);
+        DrawText(fb, width, card_x + label_w + Style::kSpacingMD, y, pw.c_str(), font_, text);
+        y += font_->line_height + Style::kSpacingSM;
+    }
+    // URL
+    if (!status_.ap_url.empty()) {
+        const char* url_label = "访问:";
+        int label_w = MeasureTextWidth(url_label, font_);
+        DrawText(fb, width, card_x, y, url_label, font_, secondary_text);
+        std::string url = FitTextToWidth(status_.ap_url, font_, card_w - label_w - Style::kSpacingMD);
+        DrawText(fb, width, card_x + label_w + Style::kSpacingMD, y, url.c_str(), font_, accent);
+        y += font_->line_height + Style::kSpacingMD;
+    }
+
+    // Hint at bottom
+    const char* hint = "用手机连此热点,打开浏览器";
+    int hint_w = MeasureTextWidth(hint, font_);
+    DrawText(fb, width, (width - hint_w) / 2,
+             height - font_->line_height - Style::kSpacingSM, hint, font_, secondary_text);
+}
+
+// ============================================================
+// AP_CLIENT_CONNECTED STATE — phone joined the config AP
+// ============================================================
+
+void WifiRenderer::RenderApClientConnected(uint8_t* fb, int width, int height) {
+    const auto& theme = ThemeManager::Get();
+    const Color text = theme.ColorFor(ThemeToken::TextPrimary);
+    const Color secondary_text = theme.ColorFor(ThemeToken::TextSecondary);
+    const Color accent = theme.ColorFor(ThemeToken::Accent);
+    const int top = Style::kStatusBarHeight + Style::kSpacingXL;
+
+    const char* title = "手机已连接";
+    int title_w = MeasureTextWidth(title, title_font_);
+    DrawText(fb, width, (width - title_w) / 2, top, title, title_font_, accent);
+
+    const char* sub = "请在浏览器打开配网页面";
+    int sub_w = MeasureTextWidth(sub, font_);
+    DrawText(fb, width, (width - sub_w) / 2, top + title_font_->line_height + Style::kSpacingMD,
+             sub, font_, secondary_text);
+
+    if (!status_.ap_url.empty()) {
+        const char* url = status_.ap_url.c_str();
+        int url_w = MeasureTextWidth(url, font_);
+        int url_y = top + title_font_->line_height + Style::kSpacingXL * 2;
+        DrawText(fb, width, (width - url_w) / 2, url_y, url, font_, text);
+    }
+
+    // Hint
+    const char* hint = "等待提交 WiFi 配置...";
+    int hint_w = MeasureTextWidth(hint, font_);
+    DrawText(fb, width, (width - hint_w) / 2,
+             height - font_->line_height - Style::kSpacingSM, hint, font_, secondary_text);
+}
+
+// ============================================================
+// PROVISIONING STATE — submitted, attempting WiFi connection
+// ============================================================
+
+void WifiRenderer::RenderProvisioning(uint8_t* fb, int width, int height) {
+    const auto& theme = ThemeManager::Get();
+    const Color text = theme.ColorFor(ThemeToken::TextPrimary);
+    const Color secondary_text = theme.ColorFor(ThemeToken::TextSecondary);
+    const Color accent = theme.ColorFor(ThemeToken::Accent);
+    const int top = Style::kStatusBarHeight + Style::kSpacingXL;
+
+    // Title with blinking dot effect (using blink_frame_)
+    blink_frame_++;
+    const bool visible = (blink_frame_ % 20) < 14;
+    const char* title = visible ? "正在连接" : "正在连接.";
+    int title_w = MeasureTextWidth(title, title_font_);
+    DrawText(fb, width, (width - title_w) / 2, top, title, title_font_, text);
+
+    // SSID
+    if (!status_.ssid.empty()) {
+        std::string ssid = FitTextToWidth(status_.ssid, font_, width - 2 * Style::kSpacingXL);
+        int ssid_w = MeasureTextWidth(ssid.c_str(), font_);
+        int ssid_y = top + title_font_->line_height + Style::kSpacingLG;
+        DrawText(fb, width, (width - ssid_w) / 2, ssid_y, ssid.c_str(), font_, secondary_text);
+
+        // Progress bar
+        const int bar_y = ssid_y + font_->line_height + Style::kSpacingLG;
+        const int bar_w = width - 2 * Style::kSpacingXL;
+        const int bar_x = Style::kSpacingXL;
+        ProgressBar bar(bar_x, bar_y, bar_w, Style::kProgressHeight);
+        bar.SetValue(status_.provisioning_step);
+        bar.Draw(fb, width, height);
+
+        // Percentage
+        char pct_buf[8];
+        snprintf(pct_buf, sizeof(pct_buf), "%d%%", status_.provisioning_step);
+        int pct_w = MeasureTextWidth(pct_buf, font_);
+        DrawText(fb, width, (width - pct_w) / 2,
+                 bar_y - font_->line_height - Style::kSpacingXS,
+                 pct_buf, font_, text);
+    }
+
+    // Hint
+    const char* hint = "请稍候,可能需要 10-30 秒";
+    int hint_w = MeasureTextWidth(hint, font_);
+    DrawText(fb, width, (width - hint_w) / 2,
+             height - font_->line_height - Style::kSpacingSM, hint, font_, secondary_text);
+}
+
+// ============================================================
+// ERROR STATE — last attempt failed
+// ============================================================
+
+void WifiRenderer::RenderError(uint8_t* fb, int width, int height) {
+    const auto& theme = ThemeManager::Get();
+    const PaintStyle button_style = theme.Component(ComponentRole::ButtonSelected);
+    const Color text = theme.ColorFor(ThemeToken::TextPrimary);
+    const Color secondary_text = theme.ColorFor(ThemeToken::TextSecondary);
+    const Color danger = theme.ColorFor(ThemeToken::Danger);
+    const int top = Style::kStatusBarHeight + Style::kSpacingXL;
+
+    // X icon
+    const char* cross = "X";
+    int cross_w = MeasureTextWidth(cross, large_icon_font_);
+    int cross_y = top;
+    int cross_center_x = (width - cross_w) / 2;
+    DrawText(fb, width, cross_center_x, cross_y, cross, large_icon_font_, danger);
+
+    // Title
+    const char* title = "配网失败";
+    int title_w = MeasureTextWidth(title, title_font_);
+    DrawText(fb, width, (width - title_w) / 2,
+             cross_y + large_icon_font_->line_height + Style::kSpacingLG,
+             title, title_font_, danger);
+
+    // Error message (Chinese, from reason code or custom)
+    std::string msg = status_.error_msg;
+    if (msg.empty() && status_.error_code > 0) {
+        msg = ReasonToMessage(status_.error_code);
+    }
+    if (!msg.empty()) {
+        std::string wrapped = FitTextToWidth(msg, font_, width - 2 * Style::kSpacingXL);
+        int msg_w = MeasureTextWidth(wrapped.c_str(), font_);
+        int msg_y = top + large_icon_font_->line_height + title_font_->line_height + Style::kSpacingLG * 2;
+        DrawText(fb, width, (width - msg_w) / 2, msg_y, wrapped.c_str(), font_, secondary_text);
+    }
+
+    // SSID context
+    if (!status_.ssid.empty()) {
+        std::string ssid = FitTextToWidth("网络: " + status_.ssid, font_, width - 2 * Style::kSpacingXL);
+        int ssid_w = MeasureTextWidth(ssid.c_str(), font_);
+        int ssid_y = height - Style::kSpacingXL * 3;
+        DrawText(fb, width, (width - ssid_w) / 2, ssid_y, ssid.c_str(), font_, secondary_text);
+    }
+
+    // Action button
+    const char* primary = "按 BOOT 重试";
+    int primary_w = MeasureTextWidth(primary, font_);
+    int btn_h = font_->line_height + Style::kSpacingSM * 2;
+    int btn_w = primary_w + Style::kSpacingXL;
+    int btn_x = (width - btn_w) / 2;
+    int btn_y = height - btn_h - Style::kSpacingMD;
+
+    DrawStyledRoundRect(fb, width, height, {btn_x, btn_y, btn_w, btn_h},
+                        Style::kBorderRadiusPill, button_style);
+    DrawText(fb, width, btn_x + Style::kSpacingMD,
+             InkCenteredTextTopYInBox(font_, primary, btn_y, btn_h, 0),
+             primary, font_, button_style.fg);
+}
+
+// ============================================================
+// REASON CODE → Chinese message mapping
+// ============================================================
+
+const char* WifiRenderer::ReasonToMessage(int reason) {
+    switch (reason) {
+        case 1:  return "网络繁忙,请重试";
+        case 2:  return "连接已过期";
+        case 3:  return "未找到目标网络";
+        case 4:  return "连接超时";
+        case 5:  return "旧认证失效";
+        case 6:  return "需要从 AP 端断开";
+        case 7:  return "关联失败";
+        case 8:  return "信标超时";
+        case 15: return "四次握手失败,密码可能错误";
+        case 16: return "关联失败,请检查密码";
+        case 17: return "认证失败,密码错误";
+        case 18: return "需要重新认证";
+        case 19: return "密钥协商失败";
+        case 23: return "802.11 TX 失败";
+        case 201: return "密码错误";
+        case 202: return "未找到目标网络";
+        case 203: return "密码错误或网络不可达";
+        case 204: return "连接超时,请检查信号";
+        default: return "连接失败,请重试";
+    }
+}
+
+// ============================================================
+ // SIGNAL BARS
 // SIGNAL BARS
 // ============================================================
 

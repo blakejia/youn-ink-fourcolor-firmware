@@ -98,9 +98,14 @@ public:
     void SetPowerSaveLevel(WifiPowerSaveLevel level);
 
     // ==================== Event ====================
-    
+
     void SetEventCallback(std::function<void(WifiEvent)> callback);
 
+    // ==================== Provisioning State (for screen display) ====================
+    //
+    // Callback fires when config AP state changes: "ap_started" | "ap_client_connected"
+    // | "provisioning" | "provisioned" | "error" (reason = WiFi reason code, -1 = other)
+    void SetProvisioningStateCallback(std::function<void(const std::string& state, int reason)> cb);
     const WifiManagerConfig& GetConfig() const { return config_; }
 
     WifiManager(const WifiManager&) = delete;
@@ -121,9 +126,8 @@ private:
     bool station_active_ = false;
     bool config_mode_active_ = false;
     NetworkProbeTarget probe_target_ = NetworkProbeTarget::Mqtt;
-
-    std::function<void(WifiEvent)> event_callback_;
     mutable std::string mac_address_;
+    std::function<void(WifiEvent)> event_callback_;
+    std::function<void(const std::string&, int)> provisioning_state_callback_;
 };
-
 #endif // _WIFI_MANAGER_H_

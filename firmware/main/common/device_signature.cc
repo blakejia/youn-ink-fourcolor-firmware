@@ -5,6 +5,7 @@
 #include <esp_random.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 
 // ─── SHA-256 (RFC 6234, no external deps) ───────────────────────────────────
@@ -156,8 +157,7 @@ static void hmac_sha256(const uint8_t *key, size_t key_len,
 // ─── Base64 (no padding for 16/32-byte inputs) ───────────────────────────────
 
 static const char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-static void base64_encode_nopad(const uint8_t *in, size_t in_len, char *out) {
+static void base64_encode(const uint8_t *in, size_t in_len, char *out) {
     size_t o = 0;
     for (size_t i = 0; i < in_len; i += 3) {
         uint32_t triple = (uint32_t)in[i] << 16;
@@ -165,8 +165,8 @@ static void base64_encode_nopad(const uint8_t *in, size_t in_len, char *out) {
         if (i + 2 < in_len) triple |= (uint32_t)in[i+2];
         out[o++] = kB64[(triple >> 18) & 0x3F];
         out[o++] = kB64[(triple >> 12) & 0x3F];
-        if (i + 1 < in_len) out[o++] = kB64[(triple >> 6) & 0x3F];
-        if (i + 2 < in_len) out[o++] = kB64[triple & 0x3F];
+        out[o++] = (i + 1 < in_len) ? kB64[(triple >> 6) & 0x3F] : '=';
+        out[o++] = (i + 2 < in_len) ? kB64[triple & 0x3F] : '=';
     }
     out[o] = '\0';
 }
@@ -184,17 +184,15 @@ void device_sign_pair_start(const char *device_id,
     snprintf(mac_out, mac_len, "%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    // 2. Timestamp (unix seconds)
-    int64_t now_us = esp_timer_get_time();
-    int64_t now_s = now_us / 1000000;
+    // 2. Timestamp (unix seconds, SNTP-synced wall clock — NOT boot uptime)
+    time_t now_s = time(NULL);
     snprintf(ts_out, ts_len, "%lld", (long long)now_s);
 
     // 3. Nonce (16 random bytes → 24-char base64)
     uint8_t nonce_raw[16];
     esp_fill_random(nonce_raw, 16);
-    base64_encode_nopad(nonce_raw, 16, nonce_out);
 
-    // 4. Derive key: derived_key = HMAC-SHA256(DEVICE_MASTER_KEY, device_id)
+    base64_encode(nonce_raw, 16, nonce_out);
     uint8_t derived_key[32];
     hmac_sha256(
         (const uint8_t *)DEVICE_MASTER_KEY, strlen(DEVICE_MASTER_KEY),
@@ -215,7 +213,7 @@ void device_sign_pair_start(const char *device_id,
     // 6. Sign: sig = base64(HMAC-SHA256(derived_key, payload))
     uint8_t sig_raw[32];
     hmac_sha256(derived_key, 32, payload, payload_len, sig_raw);
-    base64_encode_nopad(sig_raw, 32, sig_out);
+    base64_encode(sig_raw, 32, sig_out);
 
     free(payload);
 }

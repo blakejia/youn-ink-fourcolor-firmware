@@ -773,8 +773,12 @@ void WifiStation::Start() {
     // Clear scan done bit so Stop() can wait for scan to complete
     xEventGroupClearBits(event_group_, WIFI_EVENT_STOPPED | WIFI_EVENT_SCAN_DONE_BIT);
     
-    // Create the default WiFi station interface
-    station_netif_ = esp_netif_create_default_wifi_sta();
+    // Create the default WiFi station interface (reuse the shared instance
+    // if AP mode already ensured it — never create a duplicate STA netif).
+    station_netif_ = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (station_netif_ == NULL) {
+        station_netif_ = esp_netif_create_default_wifi_sta();
+    }
     int64_t t_ms = esp_timer_get_time() / 1000;
     ESP_LOGI(FAST_RC_TAG, "stage=wifi event=station_start path=slow t_ms=%lld fast_enable=%d",
              static_cast<long long>(t_ms), kFastRcEnable ? 1 : 0);

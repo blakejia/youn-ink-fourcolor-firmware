@@ -18,9 +18,13 @@ namespace rawdraw {
  * @brief WiFi connection state
  */
 enum class WifiState {
-    Connecting,   ///< Blinking WiFi icon + progress bar
-    Connected,    ///< Solid WiFi icon + SSID + signal bars
-    Disconnected, ///< Cross icon + disconnected message
+    Disconnected,        ///< Initial state / WiFi lost
+    ApStarted,           ///< Config AP started (e.g. ZecTrix-XXXX visible)
+    ApClientConnected,   ///< Phone joined the config AP
+    Provisioning,        ///< Form submitted, attempting WiFi connection
+    Connecting,          ///< Legacy alias (renders as Provisioning)
+    Connected,           ///< WiFi connected (got IP)
+    Error,               ///< Last attempt failed (see error_msg)
 };
 
 /**
@@ -33,8 +37,14 @@ struct WifiStatus {
     int progress = 0;           ///< Connection progress (0-100)
     bool server_connected = false;
     std::string server_uri;
+    // Provisioning state additions
+    std::string ap_ssid;       ///< Config AP SSID (e.g. ZecTrix-00FD)
+    std::string ap_password;   ///< Config AP password
+    std::string ap_url;        ///< Config web URL (e.g. http://192.168.4.1)
+    std::string error_msg;     ///< Error text (state==Error)
+    int error_code = 0;        ///< Raw WiFi reason code
+    int provisioning_step = 0; ///< 0-100 (Provisioning only)
 };
-
 /**
  * @brief Modernized WiFi status page renderer
  *
@@ -68,6 +78,13 @@ private:
     void RenderConnecting(uint8_t* fb, int width, int height);
     void RenderConnected(uint8_t* fb, int width, int height);
     void RenderDisconnected(uint8_t* fb, int width, int height);
+    void RenderApStarted(uint8_t* fb, int width, int height);
+    void RenderApClientConnected(uint8_t* fb, int width, int height);
+    void RenderProvisioning(uint8_t* fb, int width, int height);
+    void RenderError(uint8_t* fb, int width, int height);
+
+    // Map WiFi reason code (from WIFI_EVENT_STA_DISCONNECTED) to Chinese message
+    static const char* ReasonToMessage(int reason);
 
     // Draw signal strength bars (5-bar visualization)
     void DrawSignalBars(uint8_t* fb, int width, int x, int y,

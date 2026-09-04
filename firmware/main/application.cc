@@ -101,18 +101,33 @@ void ServerPairingTaskTrampoline(void*) {
     ServerPairStatus st = server_pairing_init();
     if (st == SERVER_PAIR_NEEDS_PROVISION) {
         ESP_LOGW(kTag, "ServerPairing: no base_url — 请重新配网");
+        Application::GetInstance().TransitionLifecycle(
+            kLifecycleApProvision, "no base_url");
         vTaskDelete(nullptr);
         return;
     }
     if (st == SERVER_PAIR_NEEDS_PAIRING) {
         char dev_id[32] = {0};
         server_pairing_get_device_id(dev_id, sizeof(dev_id));
+        Application::GetInstance().TransitionLifecycle(
+            kLifecyclePairStart, "needs pairing");
         server_pairing_set_display_cb([](const char* code, int expires_in) {
+            if (code == nullptr) {
+                return;  // 配对成功清除显示，SyncIdle 跃迁随后即到
+            }
             ESP_LOGI(kTag, "ServerPairing: 配对码 %s (有效 %d 秒)", code, expires_in);
+            Application::GetInstance().TransitionLifecycle(
+                kLifecyclePairWaitCode, code);
+            auto* ui = Application::GetInstance().GetRawDrawUiManager();
+            if (ui != nullptr) {
+                ui->ShowPairingCodePage(code, expires_in);
+            }
         });
         ESP_LOGI(kTag, "ServerPairing: device=%s 开始配对流程", dev_id);
         if (!server_pairing_run()) {
             ESP_LOGE(kTag, "ServerPairing: 配对失败（超时/网络不可达）");
+            Application::GetInstance().TransitionLifecycle(
+                kLifecycleError, "pairing failed");
             vTaskDelete(nullptr);
             return;
         }
@@ -126,11 +141,12 @@ void ServerPairingTaskTrampoline(void*) {
     auto& board = Board::GetInstance();
     page_sync_set_display(board.GetDisplay());
     page_sync_start();
+    Application::GetInstance().TransitionLifecycle(
+        kLifecycleSyncIdle, "paired, sync running");
     ESP_LOGI(kTag, "PageSync: started");
     notify_init();
     vTaskDelete(nullptr);
 }
-
 }  // namespace
 
 Application::Application() = default;
@@ -146,6 +162,7 @@ Application::~Application() {
 void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
+    TransitionLifecycle(kLifecycleBoot, "init");
 
     AudioCodec* codec = board.GetAudioCodec();
     if (codec == nullptr) {
@@ -312,11 +329,15 @@ void Application::Initialize() {
             case NetworkEvent::Connecting:
             case NetworkEvent::Scanning:
                 wifi_connected_.store(false, std::memory_order_release);
+                Application::GetInstance().TransitionLifecycle(
+                    kLifecycleWifiConnecting, "STA connecting");
                 UpdateStatusBarForUi();
                 break;
             case NetworkEvent::WifiConfigModeEnter:
                 ESP_LOGI(kTag, "WiFi config mode entered: %s", data.c_str());
                 wifi_connected_.store(false, std::memory_order_release);
+                Application::GetInstance().TransitionLifecycle(
+                    kLifecycleApProvision, "config AP entered");
                 if (rawdraw_ui_manager_) {
                     auto& wifi = WifiManager::GetInstance();
                     rawdraw_ui_manager_->ShowWifiConfigPage(wifi.GetApSsid(),
@@ -328,6 +349,8 @@ void Application::Initialize() {
             case NetworkEvent::WifiConfigModeExit:
                 wifi_connected_.store(WifiManager::GetInstance().IsConnected(),
                                       std::memory_order_release);
+                Application::GetInstance().TransitionLifecycle(
+                    kLifecycleWifiConnecting, "config AP exited");
                 UpdateStatusBarForUi();
                 break;
             case NetworkEvent::ModemDetecting:
@@ -385,16 +408,25 @@ void Application::OnDownClick() {
 void Application::OnUpLongPress() {
     ESP_LOGI(kTag, "UP long press");
     NoteButtonActivity();
+    // Settings 页 UP 长按返回上一个页面（修：之前原地切 Settings 不动）
     if (rawdraw_ui_manager_ &&
         rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::Settings) {
-        ESP_LOGI(kTag, "UP long press - leaving settings");
-        rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Settings);
+        const auto prev = rawdraw_ui_manager_->GetPreviousPage();
+        if (prev != ui::RawDrawPageId::Settings) {
+            ESP_LOGI(kTag, "UP long press - leaving settings");
+            rawdraw_ui_manager_->SwitchPage(prev);
+        }
     }
 }
 
 void Application::OnDownLongPress() {
     ESP_LOGI(kTag, "DOWN long press");
     NoteButtonActivity();
+    // 配网中屏蔽：误触离开配网屏会让用户找不到回来的路（AP 本身继续跑）
+    if (GetLifecycleState() == kLifecycleApProvision) {
+        ESP_LOGI(kTag, "DOWN long press ignored during provisioning");
+        return;
+    }
     if (rawdraw_ui_manager_) {
         ESP_LOGI(kTag, "DOWN long press - entering settings");
         rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Settings);
@@ -465,6 +497,19 @@ void Application::EnterWifiConfigMode() {
     WifiManager::GetInstance().StartConfigAp();
     if (rawdraw_ui_manager_ && WifiManager::GetInstance().IsConfigMode()) {
         auto& wifi = WifiManager::GetInstance();
+        // Register provisioning state callback for screen updates
+        wifi.SetProvisioningStateCallback(
+            [this](const std::string& state, int reason) {
+                UpdateWifiStatusForProvisioning(state, reason);
+                if (state == "provisioned") {
+                    TransitionLifecycle(kLifecycleWifiConnecting, "provisioned");
+                } else if (state == "error") {
+                    TransitionLifecycle(kLifecycleApProvision,
+                        ("provision failed reason=" + std::to_string(reason)).c_str());
+                } else {
+                    TransitionLifecycle(kLifecycleApProvision, state.c_str());
+                }
+            });
         rawdraw_ui_manager_->ShowWifiConfigPage(wifi.GetApSsid(),
                                                 wifi.GetApPassword(),
                                                 wifi.GetApWebUrl());
@@ -524,14 +569,20 @@ void Application::ServerPairingTaskEntry(void* arg) {
 }
 
 void Application::EnterScheduledSleep() {
+    // 只有 SYNC_IDLE 才允许休眠：配网/配对/连接中一律跳过。
+    // （替代旧的 IsConfigMode 特判——状态机统一覆盖）
+    if (GetLifecycleState() != kLifecycleSyncIdle) {
+        ESP_LOGI(kTag, "Scheduled sleep skipped: lifecycle not SyncIdle");
+        return;
+    }
     if (IsLocalHttpServiceRunning(rawdraw_ui_manager_.get())) {
         ESP_LOGI(kTag, "Scheduled sleep skipped: local HTTP transfer service is running");
         ArmSyncSleepTimer();
         return;
     }
 
-
     ESP_LOGI(kTag, "Entering deep sleep after sync interval; BOOT wakes device");
+    TransitionLifecycle(kLifecycleSleep, "scheduled sleep");
     wifi_connected_.store(false, std::memory_order_release);
     esp_wifi_disconnect();
     esp_wifi_stop();
@@ -569,6 +620,33 @@ bool Application::SetDeviceState(DeviceState state) {
     const DeviceState old_state = state_.exchange(state, std::memory_order_acq_rel);
     ESP_LOGI(kTag, "State %d -> %d", old_state, state);
     return true;
+}
+
+namespace {
+
+const char* LifecycleName(LifecycleState s) {
+    switch (s) {
+        case kLifecycleUnknown: return "Unknown";
+        case kLifecycleBoot: return "Boot";
+        case kLifecycleWifiConnecting: return "WifiConnecting";
+        case kLifecycleApProvision: return "ApProvision";
+        case kLifecyclePairStart: return "PairStart";
+        case kLifecyclePairWaitCode: return "PairWaitCode";
+        case kLifecycleSyncIdle: return "SyncIdle";
+        case kLifecycleSleep: return "Sleep";
+        case kLifecycleError: return "Error";
+        default: return "?";
+    }
+}
+
+}  // namespace
+void Application::TransitionLifecycle(LifecycleState next, const char* reason) {
+    const LifecycleState old = lifecycle_.exchange(next, std::memory_order_acq_rel);
+    if (old == next) {
+        return;  // 只记录真正的变更，重复上报由各模块自带 LOG 覆盖
+    }
+    ESP_LOGI(kTag, "Lifecycle: %s -> %s (%s)",
+             LifecycleName(old), LifecycleName(next), reason ? reason : "");
 }
 
 void Application::Schedule(std::function<void()>&& callback) {
@@ -625,4 +703,35 @@ void Application::UpdateStatusBarForUi() {
         rawdraw_ui_manager_->RequestActivePageRefresh();
     }
     return;
+}
+
+void Application::UpdateWifiStatusForProvisioning(const std::string& state, int reason) {
+    if (!rawdraw_ui_manager_) return;
+    auto* renderer = rawdraw_ui_manager_->GetWifiRenderer();
+    if (!renderer) return;
+    rawdraw::WifiStatus status = renderer->GetStatus();
+    auto& wifi = WifiManager::GetInstance();
+
+    if (state == "ap_started") {
+        status.state = rawdraw::WifiState::ApStarted;
+        status.ap_ssid = wifi.GetApSsid();
+        status.ap_password = wifi.GetApPassword();
+        status.ap_url = wifi.GetApWebUrl();
+    } else if (state == "ap_client_connected") {
+        status.state = rawdraw::WifiState::ApClientConnected;
+    } else if (state == "provisioning") {
+        status.state = rawdraw::WifiState::Provisioning;
+        status.ssid = wifi.GetSsid();
+        status.provisioning_step = 10;  // starting
+    } else if (state == "provisioned") {
+        status.state = rawdraw::WifiState::Connected;
+        status.ssid = wifi.GetSsid();
+        status.server_uri = "http://" + wifi.GetIpAddress() + ":9002";
+    } else if (state == "error") {
+        status.state = rawdraw::WifiState::Error;
+        status.error_code = reason;
+        // error_msg will be filled by ReasonToMessage at render time
+    }
+    renderer->Update(status);
+    rawdraw_ui_manager_->RequestActivePageRefresh();
 }

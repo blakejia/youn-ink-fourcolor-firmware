@@ -25,6 +25,7 @@
 #include "ui/renderers/rawdraw/lifebar_renderer.h"
 #include "ui/renderers/rawdraw/almanac_renderer.h"
 #include "ui/renderers/rawdraw/log_renderer.h"
+#include "ui/renderers/rawdraw/pairing_renderer.h"
 #include "ui/renderers/rawdraw/yearprogress_renderer.h"
 #include "ui/renderers/rawdraw/font_debug_renderer.h"
 #include "ui/renderers/rawdraw/font_metrics_renderer.h"
@@ -72,6 +73,7 @@ enum class RawDrawPageId {
     Calendar = 14,
     FontDebug = 15,
     FontMetrics = 16,
+    Pairing = 17,
     Count,
 };
 
@@ -153,6 +155,7 @@ public:
      * @brief Get the current active page
      */
     RawDrawPageId GetCurrentPage() const { return current_page_; }
+    RawDrawPageId GetPreviousPage() const { return previous_page_; }
     bool IsDisplayRefreshPending() const;
 
     /**
@@ -257,6 +260,7 @@ public:
     rawdraw::LifeBarRenderer* GetLifeBarRenderer() { return lifebar_renderer_.get(); }
     rawdraw::AlmanacRenderer* GetAlmanacRenderer() { return almanac_renderer_.get(); }
     rawdraw::LogRenderer* GetLogRenderer() { return log_renderer_.get(); }
+    rawdraw::PairingRenderer* GetPairingRenderer() { return pairing_renderer_.get(); }
     rawdraw::YearProgressRenderer* GetYearProgressRenderer() { return yearprogress_renderer_.get(); }
     rawdraw::CalendarRenderer* GetCalendarRenderer() { return calendar_renderer_.get(); }
     rawdraw::FontDebugRenderer* GetFontDebugRenderer() { return font_debug_renderer_.get(); }
@@ -289,6 +293,10 @@ public:
     void ShowWifiConfigPage(const std::string& ssid,
                             const std::string& password,
                             const std::string& url);
+    /**
+     * @brief Show pairing code page (Lifecycle PairWaitCode binding)
+     */
+    void ShowPairingCodePage(const std::string& code, int expires_in);
 
     /**
      * @brief Marks entire framebuffer dirty and calls refresh_cb_ to push
@@ -329,6 +337,7 @@ private:
 
     // Current page
     RawDrawPageId current_page_ = RawDrawPageId::Chat;
+    RawDrawPageId previous_page_ = RawDrawPageId::Chat;
 
     // Status bar
     RawDrawStatusBarData status_bar_data_;
@@ -349,6 +358,7 @@ private:
     std::unique_ptr<rawdraw::LifeBarRenderer> lifebar_renderer_;
     std::unique_ptr<rawdraw::AlmanacRenderer> almanac_renderer_;
     std::unique_ptr<rawdraw::LogRenderer> log_renderer_;
+    std::unique_ptr<rawdraw::PairingRenderer> pairing_renderer_;
     std::unique_ptr<rawdraw::YearProgressRenderer> yearprogress_renderer_;
     std::unique_ptr<rawdraw::CalendarRenderer> calendar_renderer_;
     std::unique_ptr<rawdraw::FontDebugRenderer> font_debug_renderer_;

@@ -76,6 +76,7 @@ set(SOURCES
     "ui/renderers/rawdraw/lifebar_renderer.cc"
     "ui/renderers/rawdraw/almanac_renderer.cc"
     "ui/renderers/rawdraw/log_renderer.cc"
+    "ui/renderers/rawdraw/pairing_renderer.cc"
     "ui/renderers/rawdraw/yearprogress_renderer.cc"
     "ui/renderers/rawdraw/calendar_renderer.cc"
     "ui/renderers/rawdraw/photo_gallery.cc"
@@ -154,3 +155,15 @@ target_compile_definitions(
     BUILTIN_ICON_FONT=font_zectrix_16_1
     PROJECT_VER=\"6.5.9\"  # F5: Make version available to renderer code
 )
+
+# Device signature master key: injected at build time via
+# `idf.py -DDEVICE_MASTER_KEY=... build` (CMake cache, gitignored build/).
+# config.h falls back to REPLACE_ME placeholder when absent — signatures
+# then fail HMAC verification server-side. Value NEVER committed.
+if(DEFINED DEVICE_MASTER_KEY AND NOT "${DEVICE_MASTER_KEY}" STREQUAL "")
+    target_compile_definitions(
+        ${COMPONENT_LIB}
+        PRIVATE
+        DEVICE_MASTER_KEY=\"${DEVICE_MASTER_KEY}\"
+    )
+endif()

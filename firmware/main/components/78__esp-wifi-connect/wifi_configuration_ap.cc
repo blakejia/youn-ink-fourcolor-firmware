@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <memory>
 #include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
 #include <freertos/event_groups.h>
 #include <esp_err.h>
 #include <esp_event.h>
@@ -151,6 +153,15 @@ void WifiConfigurationAp::StartAccessPoint()
     // Create the default WiFi AP interface
     ap_netif_ = esp_netif_create_default_wifi_ap();
 
+    // STA netif is required for ConnectToWifi's DHCP: assoc works at L2
+    // without one, but GOT_IP never arrives (silent 10s timeout). Station
+    // boots create it in WifiStation::Start(), but AP-from-boot never runs
+    // that path — ensure the shared default instance here. Later
+    // WifiStation::Start() reuses it via the same ifkey guard.
+    if (esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") == NULL) {
+        esp_netif_create_default_wifi_sta();
+    }
+
     // Set the router IP address to 192.168.4.1
     esp_netif_ip_info_t ip_info;
     IP4_ADDR(&ip_info.ip, 192, 168, 4, 1);
@@ -193,7 +204,7 @@ void WifiConfigurationAp::StartAccessPoint()
 
     ESP_LOGI(TAG, "Access Point started with SSID %s auth=%s", ssid.c_str(),
              wifi_config.ap.authmode == WIFI_AUTH_OPEN ? "open" : "wpa2");
-
+    if (on_provisioning_state_) on_provisioning_state_("ap_started", 0);
     // 加载高级配置
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("wifi", NVS_READONLY, &nvs);
@@ -445,8 +456,14 @@ void WifiConfigurationAp::StartWebServer()
 
             // 获取当前对象
             auto *this_ = static_cast<WifiConfigurationAp *>(req->user_ctx);
+            ESP_LOGI(TAG, "WiFi config submit: SSID='%s' len=%d, password_len=%d, server='%s'",
+                     ssid_str.c_str(), (int)ssid_str.length(), (int)password_str.length(),
+                     server_url_str.c_str());
             if (!this_->ConnectToWifi(ssid_str, password_str)) {
                 cJSON_Delete(json);
+                ESP_LOGE(TAG, "WiFi connect failed for SSID='%s'", ssid_str.c_str());
+                // 保存凭据以便下次启动自动重试
+                this_->Save(ssid_str, password_str);
                 httpd_resp_send(req, "{\"success\":false,\"error\":\"Failed to connect to the Access Point\"}", HTTPD_RESP_USE_STRLEN);
                 return ESP_OK;
             }
@@ -716,6 +733,11 @@ bool WifiConfigurationAp::ConnectToWifi(const std::string &ssid, const std::stri
     
     is_connecting_ = true;
     esp_wifi_scan_stop();
+    // APSTA 下驱动可能残留 STA 状态（"sta is connected"），其内部 async
+    // disconnect 与新 connect 竞争会导致 10s 零事件超时。先显式断开并
+    // 等事件落定，再清 event bits，保证 connect 从干净状态开始。
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(200));
     xEventGroupClearBits(event_group_, WIFI_GOT_IP_BIT | WIFI_FAIL_BIT);
 
     wifi_config_t wifi_config;
@@ -769,18 +791,26 @@ void WifiConfigurationAp::OnExitRequested(std::function<void()> callback)
     on_exit_requested_ = callback;
 }
 
+void WifiConfigurationAp::OnProvisioningState(
+    std::function<void(const std::string&, int)> callback)
+{
+    on_provisioning_state_ = callback;
+}
+
 void WifiConfigurationAp::WifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
     WifiConfigurationAp* self = static_cast<WifiConfigurationAp*>(arg);
     if (event_id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
         ESP_LOGI(TAG, "Station " MACSTR " joined, AID=%d", MAC2STR(event->mac), event->aid);
-    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
-        ESP_LOGI(TAG, "Station " MACSTR " left, AID=%d", MAC2STR(event->mac), event->aid);
+        if (self->on_provisioning_state_) self->on_provisioning_state_("ap_client_connected", 0);
     } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
         ESP_LOGI(TAG, "Associated with WiFi, waiting for IP address");
+        if (self->on_provisioning_state_) self->on_provisioning_state_("provisioning", 0);
     } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*) event_data;
+        ESP_LOGE(TAG, "WiFi disconnected: reason=%d (SSID=%s)", event->reason, event->ssid);
+        if (self->on_provisioning_state_) self->on_provisioning_state_("error", event->reason);
         xEventGroupSetBits(self->event_group_, WIFI_FAIL_BIT);
     } else if (event_id == WIFI_EVENT_SCAN_DONE) {
         std::lock_guard<std::mutex> lock(self->mutex_);
@@ -801,6 +831,7 @@ void WifiConfigurationAp::IpEventHandler(void* arg, esp_event_base_t event_base,
     if (event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
+        if (self->on_provisioning_state_) self->on_provisioning_state_("provisioned", 0);
         xEventGroupSetBits(self->event_group_, WIFI_GOT_IP_BIT);
     }
 }
