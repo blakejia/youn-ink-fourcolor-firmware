@@ -188,6 +188,22 @@ class PairingStore:
                 return False
             return secrets.compare_digest(code.encode(), row["code"].encode())
 
+    def list_pending(self, *, now: Optional[int] = None) -> list[dict]:
+        """Unconfirmed, unexpired sessions for the operator confirm UI."""
+        if now is None:
+            now = int(time.time())
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT device_id, code, expires_at FROM pairing_sessions"
+                " WHERE confirmed = 0 AND expires_at > ?",
+                (now,),
+            ).fetchall()
+            return [
+                {"device_id": r["device_id"], "code": r["code"],
+                 "expires_in": r["expires_at"] - now}
+                for r in rows
+            ]
+
     # ── rate limiting (in-memory sliding window) ──
 
     def check_rate_limit(self, ip: str) -> bool:

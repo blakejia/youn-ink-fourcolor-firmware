@@ -4,33 +4,37 @@ import { api } from '../api.js';
 export default function Devices() {
   const [devices, setDevices] = useState([]);
   const [err, setErr] = useState('');
-  const [pairing, setPairing] = useState(null); // {code, device_id}
+  const [pending, setPending] = useState([]); // [{device_id, code, expires_in}]
   const [pairCode, setPairCode] = useState('');
-  const [newDeviceId, setNewDeviceId] = useState('');
-  const [newBoard, setNewBoard] = useState('zectrix-s3-epaper-4.2');
+  const [manualDeviceId, setManualDeviceId] = useState('');
 
   const load = async () => {
     try { setDevices(await api.devices()); setErr(''); }
     catch (e) { setErr(e.message); }
   };
-  useEffect(() => { load(); }, []);
+  const loadPending = async () => {
+    try { setPending(await api.pairPending()); }
+    catch (e) { setErr(e.message); }
+  };
+  useEffect(() => { load(); loadPending(); }, []);
 
-  const startPair = async () => {
-    if (!newDeviceId.trim()) { setErr('请输入 device_id（或读设备日志获取）'); return; }
+  // One-click confirm for a device-initiated session (code shown on device screen).
+  const confirmPair = async (deviceId, code) => {
     try {
-      const r = await api.pairStart(newDeviceId.trim(), newBoard);
-      setPairing({ code: r.code, device_id: newDeviceId.trim() });
+      await api.pairConfirm(deviceId, code);
       setPairCode('');
-      setErr('');
+      setManualDeviceId('');
+      loadPending();
+      load();
     } catch (e) { setErr(e.message); }
   };
 
-  const confirmPair = async () => {
-    try {
-      await api.pairConfirm(pairing.device_id, pairCode.trim());
-      setPairing(null);
-      load();
-    } catch (e) { setErr(e.message); }
+  // Manual fallback: type the 6-digit code read from the device screen.
+  const confirmManual = async () => {
+    const target = pending.length === 1 ? pending[0].device_id : manualDeviceId.trim();
+    if (!target) { setErr('无待确认设备，请先刷新或填写 device_id'); return; }
+    if (!pairCode.trim()) { setErr('请输入设备屏幕上的 6 位码'); return; }
+    confirmPair(target, pairCode.trim());
   };
 
   return (
@@ -39,24 +43,32 @@ export default function Devices() {
       {err && <div className="err">{err}</div>}
 
       <div className="card">
-        <h2>配对新设备</h2>
-        <div className="row">
-          <input placeholder="device_id" value={newDeviceId} onChange={(e) => setNewDeviceId(e.target.value)} />
-          <select value={newBoard} onChange={(e) => setNewBoard(e.target.value)}>
-            <option value="zectrix-s3-epaper-4.2">zectrix-s3-epaper-4.2 (NOTE4C)</option>
-          </select>
-          <button className="btn" onClick={startPair}>获取配对码</button>
-        </div>
-        {pairing && (
-          <div style={{ marginTop: 12 }}>
-            <p>配对码已生成：<b className="mono">{pairing.code}</b>（有效期 300 秒）</p>
-            <p className="muted">查看设备屏幕上的 6 位码，输入确认：</p>
-            <div className="row">
-              <input value={pairCode} onChange={(e) => setPairCode(e.target.value)} placeholder="6 位码" maxLength={6} />
-              <button className="btn" onClick={confirmPair}>确认配对</button>
-            </div>
-          </div>
+        <h2>待确认配对 <button className="btn secondary" onClick={loadPending}>刷新</button></h2>
+        <p className="muted">设备开机联网后自动发起配对，屏幕显示 6 位码后在此确认。</p>
+        {pending.length === 0 ? (
+          <p className="muted">暂无待确认设备</p>
+        ) : (
+          <table>
+            <thead><tr><th>Device ID</th><th>配对码</th><th>剩余秒</th><th>操作</th></tr></thead>
+            <tbody>
+              {pending.map((s) => (
+                <tr key={s.device_id}>
+                  <td className="mono">{s.device_id}</td>
+                  <td className="mono"><b>{s.code}</b></td>
+                  <td className="muted">{s.expires_in}</td>
+                  <td>
+                    <button className="btn" onClick={() => confirmPair(s.device_id, s.code)}>确认配对</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
+        <div className="row" style={{ marginTop: 12 }}>
+          <input value={manualDeviceId} onChange={(e) => setManualDeviceId(e.target.value)} placeholder="device_id（多台待确认时填）" />
+          <input value={pairCode} onChange={(e) => setPairCode(e.target.value)} placeholder="6 位码（手动核对）" maxLength={6} />
+          <button className="btn secondary" onClick={confirmManual}>手动确认</button>
+        </div>
       </div>
 
       <div className="card">

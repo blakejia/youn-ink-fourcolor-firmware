@@ -304,6 +304,12 @@ def create_app() -> FastAPI:
             raise HTTPException(401, detail="invalid or expired code")
         return {"status": "ready"}
 
+    @app.get("/api/devices/pair-pending")
+    async def pair_pending(request: Request) -> dict:
+        """Operator view: sessions waiting for user confirmation."""
+        _require_operator(request)
+        return {"sessions": _pairing_store.list_pending()}
+
     @app.post("/api/devices/pair-claim")
     async def pair_claim(body: _PairClaimBody, request: Request) -> dict:
         # Valid code, user hasn't confirmed yet → pending (200, no token).
@@ -705,7 +711,28 @@ def create_app() -> FastAPI:
         finally:
             session.closed = True
             await app.state.sessions.unregister(session.session_id)
-    # ── FastMCP on /mcp (streamable-http) — must mount before SPA ──
+    # ── Web admin UI (Vite build output) ──
+    # Explicit index routes (NOT a "/" StaticFiles mount): the MCP root mount
+    # below matches every path, so a second "/" mount would be dead code.
+    # Keep this list in sync with frontend/src/App.jsx <Route> paths.
+    dist_dir = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    if dist_dir.exists() and (dist_dir / "index.html").exists():
+        from fastapi.responses import FileResponse
+        from fastapi.staticfiles import StaticFiles
+
+        app.mount("/assets", StaticFiles(directory=str(dist_dir / "assets")), name="spa-assets")
+        for _spa_path in ("/", "/login", "/devices", "/pages", "/images", "/ota"):
+            app.get(_spa_path, response_class=FileResponse, include_in_schema=False)(
+                lambda _p=_spa_path: FileResponse(str(dist_dir / "index.html"))
+            )
+        log.info("web admin UI mounted from %s", dist_dir)
+    else:
+        log.warning("frontend/dist not found (%s); web admin UI disabled", dist_dir)
+
+    # ── FastMCP on /mcp (streamable-http), mounted LAST ──
+    # Sub-app routes already live at /mcp; mounting at "/mcp" would double
+    # them to /mcp/mcp. A root mount matches every path, so it MUST stay
+    # after ALL explicit routes above (API + SPA index routes).
     try:
         from .mcp_server import mcp as mcp_server
         # sub-app routes are already at /mcp; mount at root to avoid double-mount
@@ -725,18 +752,6 @@ def create_app() -> FastAPI:
         app.router.lifespan_context = _composed_lifespan
     except ImportError:
         log.warning("fastmcp not installed; /mcp endpoint disabled")
-
-    # ── Web admin UI (Vite build output) ──
-    dist_dir = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-    if dist_dir.exists() and (dist_dir / "index.html").exists():
-        from fastapi.staticfiles import StaticFiles
-
-        app.mount("/", StaticFiles(directory=str(dist_dir), html=True), name="spa")
-        log.info("web admin UI mounted from %s", dist_dir)
-    else:
-        log.warning("frontend/dist not found (%s); web admin UI disabled", dist_dir)
-
-
     return app
 
 

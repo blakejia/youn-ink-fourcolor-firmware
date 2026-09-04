@@ -397,3 +397,44 @@ def test_pair_claim_pending_before_confirm(client):
     })
     assert r.status_code == 200
     assert len(r.json()["token"]) == 64
+
+# ── Pending sessions list (operator confirms device-initiated codes) ───
+
+
+def test_pair_pending_list(client):
+    """GET /api/devices/pair-pending shows unconfirmed, unexpired sessions."""
+    import os
+    from youn_server.pairing import PairingStore
+
+    # device A: pending
+    r = client.post("/api/devices/pair-start", json={
+        "device_id": "TEST-PEND-A",
+        "board_type": "NOTE4C",
+    }, headers=signed_headers("TEST-PEND-A"))
+    assert r.status_code == 200
+    code_a = r.json()["code"]
+
+    # device B: pending then confirmed → disappears from list
+    r = client.post("/api/devices/pair-start", json={
+        "device_id": "TEST-PEND-B",
+        "board_type": "NOTE4C",
+    }, headers=signed_headers("TEST-PEND-B"))
+    code_b = r.json()["code"]
+    r = client.post("/api/devices/pair-confirm", json={
+        "device_id": "TEST-PEND-B",
+        "code": code_b,
+    }, headers={"X-Operator-Token": "test-operator-token"})
+    assert r.status_code == 200
+
+    # operator auth required
+    r = client.get("/api/devices/pair-pending")
+    assert r.status_code == 401
+
+    r = client.get("/api/devices/pair-pending",
+                   headers={"X-Operator-Token": "test-operator-token"})
+    assert r.status_code == 200
+    sessions = {s["device_id"]: s for s in r.json()["sessions"]}
+    assert "TEST-PEND-A" in sessions
+    assert sessions["TEST-PEND-A"]["code"] == code_a
+    assert sessions["TEST-PEND-A"]["expires_in"] > 0
+    assert "TEST-PEND-B" not in sessions

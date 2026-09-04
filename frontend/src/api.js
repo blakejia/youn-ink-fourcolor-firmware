@@ -30,10 +30,9 @@ export const api = {
   devices: async () => (await request('/devices')).devices ?? [],
   approve: (id) => request(`/devices/${id}/approve`, { method: 'POST' }),
   revoke: (id) => request(`/devices/${id}/revoke`, { method: 'POST' }),
-  pairStart: (deviceId, boardType) =>
-    request('/devices/pair-start', { method: 'POST', body: { device_id: deviceId, board_type: boardType } }),
   pairConfirm: (deviceId, code) =>
     request('/devices/pair-confirm', { method: 'POST', body: { device_id: deviceId, code } }),
+  pairPending: async () => (await request('/devices/pair-pending')).sessions ?? [],
   pages: async () => (await request('/pages')).pages ?? [],
   createPage: (data) => request('/pages', { method: 'POST', body: data }),
   deletePage: (name) => request(`/pages/${encodeURIComponent(name)}`, { method: 'DELETE' }),
@@ -61,17 +60,13 @@ export const api = {
   },
   deleteImage: (id) => request(`/images/${id}`, { method: 'DELETE' }),
   otaCheck: async () => {
-    // /ota/check returns either {"available": false} or {available: true, version, size, sha256, filename, url}
-    const j = await request('/ota/check');
-    return j;
-  },
-  uploadOta: async (file, version, channel, notes) => {
-    const fd = new FormData();
-  otaCheck: async () => {
     // operator view of latest firmware (device-facing /ota/check needs Bearer)
     const j = await request('/ota');
     return j;
   },
+  uploadOta: async (file, version, channel, notes) => {
+    const fd = new FormData();
+    fd.append('firmware', file);
     fd.append('version', version);
     if (channel) fd.append('channel', channel);
     if (notes) fd.append('notes', notes);
