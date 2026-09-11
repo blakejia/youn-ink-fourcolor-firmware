@@ -26,6 +26,11 @@
 
 ---
 
+**执行顺序说明（2026-09-11 修订）：先 Task 7 后 Task 6。** Task 6 的文本引用了 Task 7 的
+`ServicePowerPolicy()`（两条启动路径共用同一个一次性周期），按原编号顺序执行会撞上前向引用。
+任务编号保持不变，只是执行次序对调：T7 先引入 `RunPowerCycle()` 并接上电源策略，T6 再把 `quiet`
+分流接进来。
+
 ### Task 1: 服务端排期位置（纯函数 + 响应字段 + 保存夹取）
 
 **Files:**
@@ -1006,7 +1011,7 @@ reset path is unchanged; only the quiet wake can now skip it entirely."
 - Modify: `firmware/main/boards/zectrix-s3-epaper-4.2/zectrix-s3-epaper-4.2.cc`（按 quiet 决定是否建 UI/上电面板）
 
 **Interfaces:**
-- Consumes: Task 3 的 `rf_wakeup_cause()`；Task 5 的 `CreateDisplay(..., bring_up_panel)`。
+- Consumes: Task 3 的 `rf_wakeup_cause()`；Task 5 的 `InitializeLcdDisplay(..., bring_up_panel)`；**Task 7 的 `RunPowerCycle()` / `ServicePowerPolicy()`**。
 - Produces: `Application::Initialize(bool quiet)`；`Application::IsQuietBoot() const`。
 
 - [ ] **Step 1: 实现唤醒原因判定**
