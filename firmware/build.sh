@@ -89,6 +89,14 @@ if [[ -z "$OTA_URL" ]]; then
   exit 1
 fi
 
+# device_signature 的主密钥必须传到 idf.py（release.py 会拒绝用 REPLACE_ME 占位符打包）。
+# 放在构建之前：缺键时立刻失败，而不是烧完一次全量编译再报错。
+export DEVICE_MASTER_KEY="${DEVICE_MASTER_KEY:-}"
+if [[ -z "$DEVICE_MASTER_KEY" ]]; then
+  echo "[ERROR] .env 缺少 DEVICE_MASTER_KEY，固件会用 REPLACE_ME 占位符，pair-start 会全部 401" >&2
+  exit 1
+fi
+
 load_idf_env() {
   if command -v idf.py >/dev/null 2>&1; then
     return 0
@@ -216,12 +224,6 @@ if [[ -n "${DEFAULT_WIFI_SSID:-}" ]]; then
 fi
 
 echo "[INFO] 开始打包: board_type=$BOARD_TYPE, build_name=$BUILD_NAME, ota_url=$OTA_URL"
-# device_signature 的主密钥必须传到 idf.py（release.py 会拒绝用 REPLACE_ME 占位符打包）
-export DEVICE_MASTER_KEY="${DEVICE_MASTER_KEY:-}"
-if [[ -z "$DEVICE_MASTER_KEY" ]]; then
-  echo "[ERROR] .env 缺少 DEVICE_MASTER_KEY，pair-start 会全部 401" >&2
-  exit 1
-fi
 python3 scripts/release.py "$BOARD_TYPE" --config "$TEMP_CONFIG_NAME" --name "$BUILD_NAME"
 
 LATEST_ZIP="$(ls -1t releases/v*_${BUILD_NAME}.zip 2>/dev/null | head -n 1 || true)"
