@@ -85,12 +85,36 @@ class DeviceRegistry:
         # check_same_thread=False; we serialize via _lock.
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        # Prove writability first, because SQLite will not: it opens a file it
+        # cannot write in read-only mode *without raising*, and every statement
+        # below is a no-op on an existing database, so the server starts looking
+        # healthy and only fails when a device tries to pair. BEGIN IMMEDIATE
+        # alone is not enough — that only takes a lock, which a read-only
+        # database grants. Creating a table forces a page write and is rolled
+        # straight back, leaving the database exactly as it was found.
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute("CREATE TABLE IF NOT EXISTS __write_probe(x INTEGER)")
+            self._conn.execute("ROLLBACK")
+        except sqlite3.OperationalError as exc:
+            self._conn.close()
+            raise RuntimeError(
+                f"devices database is not writable: {db_path} ({exc}). "
+                "Check the file and directory permissions for the user running "
+                "the server — SQLite opens a database read-only, silently, when "
+                "it cannot write it, so without this check the failure surfaces "
+                "later as a 500 on a device request."
+            ) from exc
         self._conn.executescript(_SCHEMA)
-        # Migrate existing device_secrets: add token column if missing.
+        # Migrate existing device_secrets: add token column if missing. Only that
+        # error is expected here; swallowing OperationalError generally is how a
+        # read-only database stayed hidden (the probe above now catches it, but
+        # narrowing this keeps the next one from hiding the same way).
         try:
             self._conn.execute("ALTER TABLE device_secrets ADD COLUMN token TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
         # Ensure unique index on token (idempotent).
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_device_secrets_token ON device_secrets(token)"
