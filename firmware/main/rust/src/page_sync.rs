@@ -27,6 +27,28 @@ const MD5_LEN: usize = 32;
 /// Magic of `rf_panel_record_t` (see `shim_power.h`): gated together with the
 /// valid byte, so an all-zero record (power-on RTC memory) reads as unknown.
 const PANEL_MAGIC: u32 = 0x50414E31;
+
+/// 48-byte `rf_panel_record_t` with the alignment the device side assumes:
+/// shim.cpp publishes the record with a struct assignment (`*out = g_panel_rec`)
+/// whose members are 4-byte, so the buffer must be 4-aligned (`[u8; 48]` alone
+/// only guarantees 1-byte alignment).
+#[repr(C, align(4))]
+struct PanelRecord([u8; 48]);
+
+fn read_panel_record() -> PanelRecord {
+    let mut rec = PanelRecord([0u8; 48]);
+    unsafe { shim::rf_panel_record_get(rec.0.as_mut_ptr()) };
+    rec
+}
+
+fn record_magic_ok(rec: &[u8; 48]) -> bool {
+    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) == PANEL_MAGIC
+}
+
+/// Index the record says is on the glass (-1 = the empty hint).
+fn record_index(rec: &[u8; 48]) -> i32 {
+    i32::from_le_bytes([rec[44], rec[45], rec[46], rec[47]])
+}
 /// Fallbacks when the server sends no policy: the old hardcoded 10 s poll was
 /// 60x the server's intent and kept the radio up all day.
 const DEFAULT_POLL_S: u32 = 600;
@@ -522,15 +544,26 @@ pub fn paint_if_changed() -> bool {
     if SUSPENDED.load(Ordering::Acquire) {
         return false;
     }
-    let Some(idx) = target_index() else { return false; };
+    let Some(idx) = target_index() else {
+        // Empty schedule: the hint is a recorded state (index -1), not an
+        // unrecorded draw. Key on the index only: the md5 payload is 32 zero
+        // bytes, which the shim stores as an empty string, so comparing md5
+        // here would never match. Returning true leaves the panel showing
+        // something the canvas chose, which is what makes start()'s ownership
+        // claim honest.
+        let rec = read_panel_record();
+        if record_magic_ok(&rec.0) && rec.0[4] != 0 && record_index(&rec.0) == -1 {
+            return false;
+        }
+        show_empty_hint();
+        return true;
+    };
     let md5 = with_table(|t| if idx < t.count { Some(t.pages[idx].md5) } else { None });
     let Some(md5) = md5 else { return false; };
-    let mut rec = [0u8; 48];
-    unsafe { shim::rf_panel_record_get(rec.as_mut_ptr()) };
+    let rec = read_panel_record();
     // Magic AND valid: an all-zero record (power-on RTC memory) is "no known
     // content", never a match — the device only ever sets the two together.
-    let magic = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
-    if magic == PANEL_MAGIC && rec[4] != 0 && rec[8..40] == md5 {
+    if record_magic_ok(&rec.0) && rec.0[4] != 0 && rec.0[8..40] == md5 {
         log_i!("PageSync", "glass already shows {:?}, skipping repaint",
             core::str::from_utf8(&md5[..8]).unwrap_or("?"));
         return false;
@@ -581,10 +614,16 @@ fn show_empty_hint() {
     }
     unsafe { shim::rf_draw_empty_hint() };
     unsafe { shim::rf_request_full_refresh() };
+    // Record the hint as displayed_index -1 with EMPTY_PAGE.md5 (32 zero bytes)
+    // as the payload. The zero bytes store as an empty string, which does not
+    // matter: the reader keys on the index only. Marked here rather than at the
+    // callers so every hand-back path (allow/resume/redraw/empty wake) stays truthful.
+    unsafe {
+        shim::rf_panel_mark_pending(EMPTY_PAGE.md5.as_ptr() as *const core::ffi::c_char, -1)
+    };
     DISPLAYING.store(true, Ordering::Release);
     log_i!("PageSync", "show empty page hint (no pages configured)");
 }
-
 fn show_current() {
     // Force-paint, never `paint_if_changed`: while the UI owned the panel it
     // drew over the glass, so the RTC record may claim a page that is no
@@ -868,14 +907,55 @@ mod tests {
     }
 
     #[test]
+    fn a_record_with_wrong_magic_is_not_trusted() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        scripted_schedule_with_position(0, 240, &[(0xa1, 10)]);
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        assert!(sync_once());
+        // Garbage RTC: valid bit set and md5 matching, but the magic is wrong
+        // (cold boot / corruption). Only the magic makes this safe to distrust.
+        shim::host::stage_panel_record(0xDEAD_BEEF, 1, md5hex(0xa1).as_bytes(), 0);
+        assert!(paint_if_changed(), "wrong magic -> repaint even though valid and md5 match");
+        assert_eq!(shim::host::fb()[0], 0xa1);
+        assert_eq!(shim::host::refreshes(), 1);
+    }
+
+    #[test]
+    fn an_empty_schedule_paints_the_hint_once_and_records_it() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        assert!(sync_once());
+        assert!(paint_if_changed(), "empty schedule still shows the hint");
+        assert_eq!(shim::host::hint_draws(), 1);
+        assert_eq!(shim::host::refreshes(), 1);
+        // Second wake: the hint recorded as index -1 means the glass already
+        // shows it — keyed on the index only, never the (empty) md5.
+        assert!(!paint_if_changed(), "hint recorded as index -1 -> no panel cycle");
+        assert_eq!(shim::host::refreshes(), 1);
+    }
+    #[test]
     fn a_failed_sync_reports_failure_and_does_not_paint() {
         let _g = shim::host::lock();
         reset_for_test();
         shim::host::set_fb();
+        scripted_schedule_with_position(0, 240, &[(0xa1, 10)]);
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        assert!(sync_once());
+        assert!(paint_if_changed(), "first wake records the glass");
+        let refreshes = shim::host::refreshes();
+
+        // The next wake finds the server down: the previous table must survive.
         shim::host::script_get("/api/pages/schedule", 500, b"");
         assert!(!sync_once());
-        assert!(!paint_if_changed());
-        assert_eq!(shim::host::refreshes(), 0);
+        assert!(!sync_ok());
+        let (count, md5) = with_table(|t| (t.count, t.pages[0].md5));
+        assert_eq!(count, 1, "the previous table is intact");
+        assert_eq!(&md5[..], md5hex(0xa1).as_bytes(), "still page 0xa1's entry");
+        assert_eq!(shim::host::refreshes(), refreshes, "no panel cycle on a failed sync");
     }
 
     #[test]
@@ -887,15 +967,17 @@ mod tests {
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), &bitmap_body(0xb2));
         assert!(sync_once());
-
         next();  // local override -> page 2
         assert_eq!(shim::host::fb()[0], 0xb2);
-
-        // A later sync re-imposes the server's index.
-        scripted_schedule_with_position(0, 240, &[(0xa1, 10), (0xb2, 5)]);
-        sync_once();
-        assert!(paint_if_changed(), "override cleared -> back to the server's page");
+        prev();  // manual paging works both ways
         assert_eq!(shim::host::fb()[0], 0xa1);
+
+        // Meanwhile the server moved on: the next sync re-imposes its index
+        // and releases the override.
+        scripted_schedule_with_position(1, 240, &[(0xa1, 10), (0xb2, 5)]);
+        sync_once();
+        assert!(paint_if_changed(), "override cleared -> the server's page");
+        assert_eq!(shim::host::fb()[0], 0xb2);
     }
 
     #[test]

@@ -249,7 +249,11 @@ pub(crate) mod host {
         guard
     }
 
-    static PANEL_REC: Mutex<Option<(String, i32)>> = Mutex::new(None);
+    /// The staged RTC panel record: (magic, valid, md5 bytes, displayed index).
+    /// A zero-length md5 stages as an empty string — exactly what the device
+    /// stores when the empty hint is recorded (32 zero bytes start with NUL) —
+    /// so readers must key the hint on the index (-1) only, never on the md5.
+    static PANEL_REC: Mutex<Option<(u32, u8, Vec<u8>, i32)>> = Mutex::new(None);
     // rf_panel_record_get writes 48 bytes; see rf_panel_record_t.
     static AUDIO_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     /// Same value as RF_PANEL_MAGIC in shim_power.h; the stub must mirror the
@@ -268,9 +272,9 @@ pub(crate) mod host {
             // sizeof(rf_panel_record_t) == 48; the caller's buffer is the struct,
             // and zeroing only the md5 slot would leave index/pad bytes stale.
             core::ptr::write_bytes(out, 0, 48);
-            if let Some((md5, index)) = g.as_ref() {
-                core::ptr::write_unaligned(out as *mut u32, RF_PANEL_MAGIC);
-                *out.add(4) = 1;
+            if let Some((magic, valid, md5, index)) = g.as_ref() {
+                core::ptr::write_unaligned(out as *mut u32, *magic);
+                *out.add(4) = *valid;
                 core::ptr::copy_nonoverlapping(md5.as_ptr(), out.add(8), md5.len().min(32));
                 core::ptr::write_unaligned(out.add(44) as *mut i32, *index);
             }
@@ -279,8 +283,17 @@ pub(crate) mod host {
 
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_panel_mark_pending(md5: *const c_char, index: c_int) {
-        let md5 = cstr(md5);
-        *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = Some((md5, index));
+        let md5 = cstr(md5).into_bytes();
+        *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((RF_PANEL_MAGIC, 1, md5, index));
+    }
+
+    /// Stage an arbitrary panel record (tests only): writes the record directly
+    /// instead of going through `rf_panel_mark_pending`, so a test can stage
+    /// states the firmware never produces (wrong magic, cleared valid bit).
+    pub fn stage_panel_record(magic: u32, valid: u8, md5: &[u8], index: i32) {
+        *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((magic, valid, md5.to_vec(), index));
     }
 
     #[unsafe(no_mangle)]
