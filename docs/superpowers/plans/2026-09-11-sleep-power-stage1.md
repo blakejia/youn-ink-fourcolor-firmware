@@ -786,6 +786,7 @@ reports idle, so a refresh interrupted by power loss is not remembered as done."
         scripted_schedule_with_position(0, 240, &[(0xa1, 10), (0xb2, 5)]);
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), &bitmap_body(0xb2));
+        assert!(sync_once());        // 必须先同步：没有页时 next() 无处可去
 
         next();  // local override -> page 2
         assert_eq!(shim::host::fb()[0], 0xb2);
