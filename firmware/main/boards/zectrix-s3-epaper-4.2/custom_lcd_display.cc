@@ -240,25 +240,9 @@ CustomLcdDisplay::CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_p
         sample_interval_ms = kFourColorSampleIntervalMs;
     }
 
-    ESP_LOGI(TAG, "EPD init");
-    EPD_Init();
-
-    // buffer init
-    EPD_Clear();
-    memcpy(prev_buffer, buffer, lcd_spi_data.buffer_len);
-#if CONFIG_ZECTRIX_EPD_4COLOR_BOOT_TEST_PATTERN
-    if (IsFourColorPanel()) {
-        EPD_DisplayFourColorTestPattern();
-    } else {
-        EPD_Display();
-    }
-#else
-    EPD_Display();
-#endif
-    prev_buffer_synced = true;
-    if (IsFourColorPanel()) {
-        last_sample_tick = xTaskGetTickCount();
-    }
+    // Panel bring-up is deferred: a duty-cycled wake that changes nothing must
+    // not pay the ~20 s blank+refresh this used to do on every boot.
+    ESP_LOGI(TAG, "EPD buffers ready, panel bring-up deferred");
     // start async refresh
     dirty_mutex = xSemaphoreCreateMutex();
     assert(dirty_mutex);
@@ -287,6 +271,33 @@ CustomLcdDisplay::~CustomLcdDisplay() {
     }
     // 如需释放 buffer/prev_buffer/tx_buf 可在此处补充
 }
+
+// =======================================================
+// Deferred panel bring-up (moved out of the constructor so a duty-cycled
+// wake that changes nothing does not pay the ~20 s blank+refresh).
+// Idempotent: later callers may invoke it unconditionally before a paint.
+// =======================================================
+void CustomLcdDisplay::BringUpPanel() {
+    if (panel_brought_up_) {
+        return;
+    }
+    panel_brought_up_ = true;
+    ESP_LOGI(TAG, "EPD bring-up");
+    EPD_Init();
+    EPD_Clear();
+    memcpy(prev_buffer, buffer, lcd_spi_data.buffer_len);
+#if CONFIG_ZECTRIX_EPD_4COLOR_BOOT_TEST_PATTERN
+    if (IsFourColorPanel()) {
+        EPD_DisplayFourColorTestPattern();
+    } else {
+        EPD_Display();
+    }
+#else
+    EPD_Display();
+#endif
+    prev_buffer_synced = true;
+}
+
 
 // =======================================================
 // Async refresh task

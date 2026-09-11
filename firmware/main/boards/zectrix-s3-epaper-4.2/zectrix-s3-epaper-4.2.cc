@@ -328,7 +328,10 @@ private:
         charge_status_.Init(CHARGE_DETECT_GPIO, CHARGE_FULL_GPIO, GetNowMs());
     }
 
-    void InitializeLcdDisplay() {
+    // bring_up_panel defaults to true so every current caller keeps today's
+    // cold-boot behavior; a later duty-cycle task will pass false on quiet
+    // wakes to skip the ~20 s panel blank+refresh entirely.
+    void InitializeLcdDisplay(bool bring_up_panel = true) {
         custom_lcd_spi_t lcd_spi_data = {};
         lcd_spi_data.cs = EPD_CS_PIN;
         lcd_spi_data.dc = EPD_DC_PIN;
@@ -357,6 +360,9 @@ private:
                                         DISPLAY_MIRROR_Y,
                                         DISPLAY_SWAP_XY,
                                         lcd_spi_data);
+        if (bring_up_panel) {
+            display_->BringUpPanel();
+        }
     }
 
     void InitializeButtons() {

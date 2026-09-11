@@ -64,6 +64,9 @@ public:
     void EPD_Clear();
     void EPD_Display();
 
+    // Deferred panel bring-up: runs the EPD_Init + EPD_Clear + first
+    // EPD_Display sequence the constructor used to do. Idempotent.
+    void BringUpPanel();
     void EPD_DisplayPartBaseImage();
     void EPD_Init_Partial();
     void EPD_DisplayPart();
@@ -164,6 +167,7 @@ private:
     int sample_interval_ms = 300; // 节流：采样间隔（可调 200~800）
 
     bool prev_buffer_synced = false;  // 标志：prev_buffer 是否已与屏幕同步
+    bool panel_brought_up_ = false;  // BringUpPanel() 幂等守卫：面板上电序列只执行一次
     bool refresh_in_progress = false;
     // Diagnostic label of the last refresh requester (string literal, not owned).
     const char* last_refresh_reason_ = "none";
