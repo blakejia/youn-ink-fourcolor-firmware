@@ -36,6 +36,20 @@ def test_expired_skipped(store):
     assert store.next_for("DEV-1") is None
 
 
+def test_shown_still_expires(store):
+    """A shown-but-never-acked notification must expire like a pending one.
+
+    Regression: the TTL check only ran for ``pending`` items, so anything
+    marked ``shown`` (BOOT-dismissed, or ack lost on the wire) stayed ``shown``
+    forever — ``_items`` and notifications.jsonl grew without bound.
+    """
+    n = store.enqueue("DEV-1", "t", "b", 300)
+    assert store.next_for("DEV-1").status == "shown"
+
+    n.ttl_sec = 0  # simulate the TTL window elapsing
+    assert store.recent(device_id="DEV-1")[0].status == "expired"
+
+
 def test_ack_sets_decision(store):
     n = store.enqueue("DEV-1", "t", "b", 300)
     store.next_for("DEV-1")

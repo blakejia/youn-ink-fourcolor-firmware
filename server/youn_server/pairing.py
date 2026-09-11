@@ -46,6 +46,10 @@ RATE_LIMIT_MAX = 5
 TIMESTAMP_WINDOW_SEC = 30  # ±30s clock-skew tolerance
 NONCE_CACHE_TTL_SEC = 300  # 5 minutes nonce replay window (in-memory)
 
+# 限流/锁定表的 key 上限：pair-start/pair-claim 是公开端点，任意 IP 或
+# device_id 都会建 key；超过该数量时清理窗口已完全过期的 key。
+_MAX_LIMIT_KEYS = 4096
+
 
 class PairingStore:
     """Thread-safe SQLite-backed pairing session store.
@@ -219,7 +223,22 @@ class PairingStore:
                 return False
             timestamps.append(now)
             self._rate_limits[ip] = timestamps
+            self._prune_dead_keys(self._rate_limits, cutoff, now)
         return True
+
+    @staticmethod
+    def _prune_dead_keys(table: dict[str, list[float]], cutoff: float,
+                          now: float) -> None:
+        """Drop keys whose window has fully elapsed.
+
+        pair-start / pair-claim are public endpoints, so any source IP or
+        device_id can create a key; without pruning the dicts grow without
+        bound for the process lifetime.
+        """
+        if len(table) <= _MAX_LIMIT_KEYS:
+            return
+        for k in [k for k, v in table.items() if not any(t > cutoff for t in v)]:
+            del table[k]
 
     # ── claim lockout (in-memory sliding window) ──
 
@@ -241,6 +260,7 @@ class PairingStore:
             failures = self._claim_failures.get(device_id, [])
             failures = [t for t in failures if t > cutoff]
             self._claim_failures[device_id] = failures
+            self._prune_dead_keys(self._claim_failures, cutoff, now)
             return len(failures) >= CONFIRM_LOCKOUT_THRESHOLD
 
     # ── device signature auth (HMAC pair-start) ──

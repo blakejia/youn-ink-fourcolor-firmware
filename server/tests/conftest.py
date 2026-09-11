@@ -18,6 +18,14 @@ from .device_sig import TEST_MASTER_KEY
 # Tests run without operator token (auth logic is exercised in test_pairing separately)
 settings.operator_token = ""
 
+# Isolate the device/pairing database from production ``data/devices.db``.
+# ``youn_server.devices.registry`` and ``app._pairing_store`` are constructed at
+# *import* time from ``settings.devices_db``, and the test modules that import
+# them are collected after this module — so pointing the setting at a throwaway
+# path here is enough to keep the suite off real pairing data.
+_DEVICES_DB_DIR = tempfile.mkdtemp(prefix="devices_test_")
+settings.devices_db = Path(_DEVICES_DB_DIR) / "devices.db"
+
 
 @pytest.fixture(autouse=True)
 def _device_signature_key():

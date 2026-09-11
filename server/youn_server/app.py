@@ -182,6 +182,12 @@ def create_app() -> FastAPI:
             "MASTER_KEY is empty: all pair-start requests will be rejected "
             "(set MASTER_KEY in .env; generate with secrets.token_urlsafe(32))"
         )
+    if not _operator_token():
+        log.error(
+            "OPERATOR_TOKEN is empty: every operator endpoint (/api/devices, "
+            "/api/pages, /api/images, /api/ota, /api/notifications, /mcp) is "
+            "OPEN to anyone who can reach this port. Set OPERATOR_TOKEN in .env."
+        )
     app = FastAPI(
         title="Youn Ink Server",
         version="1.0.0",
@@ -291,7 +297,12 @@ def create_app() -> FastAPI:
 
         ip = request.client.host if request.client else "unknown"
         if not _pairing_store.check_rate_limit(ip):
-            raise HTTPException(429, detail="rate limited, try again later")
+            # Retry-After 让客户端知道要退避多久；此前没有该头，
+            # 固件收到 429 就立即重发 → 打点循环。
+            raise HTTPException(
+                429, detail="rate limited, try again later",
+                headers={"Retry-After": str(pairing_mod.RATE_LIMIT_WINDOW)},
+            )
         # Upsert device if new
         registry.upsert(body.device_id, body.board_type)
         code, expires_in = _pairing_store.create_session(body.device_id)
@@ -318,7 +329,10 @@ def create_app() -> FastAPI:
         if _pairing_store.is_pending(body.device_id, body.code):
             return {"status": "pending"}
         if _pairing_store.is_claim_locked(body.device_id):
-            raise HTTPException(429, detail="too many failed attempts, try again later")
+            raise HTTPException(
+                429, detail="too many failed attempts, try again later",
+                headers={"Retry-After": str(pairing_mod.CONFIRM_LOCKOUT_SECONDS)},
+            )
         token = _pairing_store.claim_session(body.device_id, body.code)
         if token is None:
             _pairing_store.record_claim_failure(body.device_id)
@@ -530,10 +544,15 @@ def create_app() -> FastAPI:
 
     @app.post("/api/notifications/{nid}/ack")
     async def ack_notification(nid: str, request: Request, body: dict = Body(...)):
-        _require_device_token(request)
+        dev = _require_device_token(request)
         decision = body.get("decision")
         if decision not in ("agree", "reject"):
             raise HTTPException(400, "decision must be agree|reject")
+        # 归属校验：next 端点有 device_id 交叉检查，ack 此前只验 token，
+        # 任一受信设备可替任意通知回执。
+        n = ns.get_store().get(nid)
+        if n is not None and n.device_id != dev.device_id:
+            raise HTTPException(403, "notification belongs to another device")
         n = ns.get_store().ack(nid, decision)
         if n is None:
             raise HTTPException(404, "notification not found")
@@ -660,20 +679,29 @@ def create_app() -> FastAPI:
         )
 
         # 2) Auth via Bearer token in WebSocket handshake headers.
+        #    The token must belong to *this* device_id: `dev.trusted` alone is
+        #    not sufficient — device_id comes straight from the client's hello,
+        #    so trusting it would let anyone who knows a paired device_id
+        #    impersonate that device without a token.
         auth_header = websocket.headers.get("authorization", "")
         token = ""
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
         dev_by_token = registry.get_device_by_token(token) if token else None
-        authorized = dev.trusted or (
-            dev_by_token is not None and dev_by_token.trusted
+        authorized = (
+            dev_by_token is not None
+            and dev_by_token.trusted
+            and dev_by_token.device_id == device_id
         )
         if not authorized:
             await websocket.send_text(json.dumps(P.ok(
                 P.OutMsg.ERROR, message="device not trusted; pair via operator API",
             )))
             await websocket.close()
-            log.warning("ws refused device=%s (not trusted, no valid token)", device_id)
+            log.warning(
+                "ws refused device=%s (no valid token bound to this device_id)",
+                device_id,
+            )
             return
 
         # 3) Hand off to session manager.
@@ -738,6 +766,22 @@ def create_app() -> FastAPI:
         # sub-app routes are already at /mcp; mount at root to avoid double-mount
         mcp_subapp = mcp_server.http_app(transport="streamable-http")
         app.mount("/", mcp_subapp)
+        # MCP tools (push/list/ack notifications) have no auth of their own and
+        # the root mount makes them world-reachable. Gate /mcp on the operator
+        # token: clients must send `X-Operator-Token`. If no token is configured
+        # the mount stays open (same fail-open semantics as the HTTP API).
+        @app.middleware("http")
+        async def _mcp_operator_gate(request: Request, call_next):
+            path = request.url.path
+            if path == "/mcp" or path.startswith("/mcp/"):
+                expected = _operator_token()
+                if expected:
+                    provided = request.headers.get("X-Operator-Token", "")
+                    if not secrets.compare_digest(provided.encode(), expected.encode()):
+                        return JSONResponse(
+                            {"detail": "bad operator token"}, status_code=401
+                        )
+            return await call_next(request)
         # Compose lifespans so we don't clobber any existing lifespan
         # (or legacy on_event handlers) that may be added later.
         from contextlib import asynccontextmanager

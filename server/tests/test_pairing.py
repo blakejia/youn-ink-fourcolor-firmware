@@ -290,6 +290,54 @@ def test_ws_no_token_closes(client):
         assert msg.get("type") == "error" or "unauthorized" in str(msg).lower()
 
 
+def test_ws_token_must_bind_to_the_claimed_device(client):
+    """A *trusted* device_id is not enough: the Bearer token must own it.
+
+    Regression: WS auth accepted ``dev.trusted`` where ``dev`` came from the
+    client's own hello, so anyone who knew a paired device_id could open a
+    session without any token (making the device token meaningless on WS).
+    """
+    import json
+
+    def pair(device_id):
+        r = client.post("/api/devices/pair-start", json={
+            "device_id": device_id, "board_type": "NOTE4C",
+        }, headers=signed_headers(device_id))
+        code = r.json()["code"]
+        client.post("/api/devices/pair-confirm", json={
+            "device_id": device_id, "code": code,
+        }, headers={"X-Operator-Token": "test-operator-token"})
+        r = client.post("/api/devices/pair-claim", json={
+            "device_id": device_id, "code": code,
+        })
+        return r.json()["token"]
+
+    device_id = "TEST-WSBIND-001"
+    token = pair(device_id)
+    other_token = pair("TEST-WSBIND-002")
+
+    hello = {"deviceId": device_id, "boardType": "NOTE4C"}
+
+    # Trusted device_id but no token → refused.
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json(hello)
+        assert json.loads(ws.receive_text()).get("type") == "error"
+
+    # Another device's (valid) token → refused for this device_id.
+    with client.websocket_connect(
+        "/ws", headers={"Authorization": f"Bearer {other_token}"}
+    ) as ws:
+        ws.send_json(hello)
+        assert json.loads(ws.receive_text()).get("type") == "error"
+
+    # The token that owns this device_id → accepted.
+    with client.websocket_connect(
+        "/ws", headers={"Authorization": f"Bearer {token}"}
+    ) as ws:
+        ws.send_json(hello)
+        assert json.loads(ws.receive_text()).get("type") == "hello_ack"
+
+
 # ── Public endpoints stay public ─────────────────────────────────────
 
 

@@ -135,6 +135,46 @@ def test_ack_404_for_unknown(client, trusted_device):
     assert r.status_code == 404
 
 
+def test_ack_rejects_another_devices_notification(client, trusted_device):
+    """A paired device's token cannot ack a notification owned by another device.
+
+    Regression: ack discarded the Device returned by ``_require_device_token``,
+    so any trusted device could agree/reject any notification id (the ``next``
+    endpoint does cross-check device_id, ack did not).
+    """
+    device_id, token = trusted_device
+    client.post("/api/notifications",
+                json={"device_id": device_id, "title": "t", "body": "b"})
+    r = client.get("/api/notifications/next", params={"device_id": device_id},
+                   headers={"Authorization": f"Bearer {token}"})
+    nid = r.json()["notification"]["id"]
+
+    # Pair a second device and take its token.
+    other_id = "NOTE4C-OTHER"
+    r = client.post("/api/devices/pair-start",
+                    json={"device_id": other_id, "board_type": "NOTE4C"},
+                    headers=signed_headers(other_id))
+    code = r.json()["code"]
+    client.post("/api/devices/pair-confirm",
+                json={"device_id": other_id, "code": code},
+                headers={"X-Operator-Token": ""})
+    other_token = client.post("/api/devices/pair-claim",
+                              json={"device_id": other_id, "code": code}
+                              ).json()["token"]
+
+    r = client.post(f"/api/notifications/{nid}/ack",
+                    json={"decision": "reject"},
+                    headers={"Authorization": f"Bearer {other_token}"})
+    assert r.status_code == 403
+
+    # The owner's decision is what lands.
+    r = client.post(f"/api/notifications/{nid}/ack",
+                    json={"decision": "agree"},
+                    headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200
+    assert r.json()["decision"] == "agree"
+
+
 def test_history(client, trusted_device):
     device_id, token = trusted_device
     client.post("/api/notifications",
