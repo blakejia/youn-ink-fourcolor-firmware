@@ -101,6 +101,17 @@ fn with_table<R>(f: impl FnOnce(&mut Table) -> R) -> R {
     out
 }
 
+/// Drop all cached state so a host test starts from a cold boot.
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    with_table(|t| {
+        t.free_pages();
+        *t = Table::new();
+    });
+    DISPLAYING.store(false, Ordering::Release);
+    SUSPENDED.store(false, Ordering::Release);
+}
+
 fn now_us() -> u64 {
     unsafe { shim::rf_now_us() }
 }
@@ -226,11 +237,24 @@ pub fn parse_schedule(body: &[u8]) -> Option<ParsedSchedule> {
 
 /// One poll: refresh the page table when the schedule changed.
 fn sync_once() {
-    let mut raw = [0u8; SCHEDULE_BUF];
-    let Some(len) = fetch_schedule(&mut raw) else {
+    // PSRAM, not the stack: this buffer is as large as the whole task stack
+    // (the C++ original kept it in a file-scope static for the same reason).
+    // +1 because `http_wrapper_get` NUL-terminates one byte past the length.
+    let raw = unsafe { shim::rf_alloc(SCHEDULE_BUF + 1) };
+    if raw.is_null() {
+        log_e!("PageSync", "schedule buffer alloc failed");
         return;
-    };
-    let Some(parsed) = parse_schedule(&raw[..len]) else {
+    }
+    let body = unsafe { core::slice::from_raw_parts_mut(raw, SCHEDULE_BUF) };
+    if let Some(len) = fetch_schedule(body) {
+        sync_schedule(&body[..len]);
+    }
+    unsafe { shim::rf_free(raw) };
+}
+
+/// Apply a fetched `/api/pages/schedule` body.
+fn sync_schedule(body: &[u8]) {
+    let Some(parsed) = parse_schedule(body) else {
         log_w!("PageSync", "schedule json unusable (missing schedule_md5/pages)");
         return;
     };
@@ -458,6 +482,14 @@ extern "C" fn task_entry(_arg: *mut c_void) {
             break;
         }
         sync_once();
+        if first {
+            // Measured after the deepest path (schedule fetch + bitmap
+            // downloads) has returned; a tight margin here means the stack
+            // constants at the top of this file need revisiting.
+            log_i!("PageSync", "stack headroom {} bytes", unsafe {
+                shim::rf_task_stack_free()
+            });
+        }
 
         if SUSPENDED.load(Ordering::Acquire) {
             // Keep the data fresh but do not touch the panel: the UI owns it.
@@ -551,6 +583,174 @@ mod tests {
         assert_eq!(parsed.count, 1);
         assert_eq!(&parsed.pages[0].md5[..4], b"cdcd");
         assert_eq!(parsed.pages[0].duration_s, 600);
+    }
+
+    // ── flows driven through the module, against the scripted shim ──
+
+    fn md5hex(tag: u8) -> String {
+        format!("{tag:02x}").repeat(16)
+    }
+
+    fn schedule_json(entries: &[(u8, u32)]) -> Vec<u8> {
+        let pages: Vec<String> = entries
+            .iter()
+            .map(|(tag, min)| {
+                format!(r#"{{"md5":"{}","duration_minutes":{}}}"#, md5hex(*tag), min)
+            })
+            .collect();
+        format!(
+            r#"{{"schedule_md5":"{}","pages":[{}]}}"#,
+            md5hex(0x11),
+            pages.join(",")
+        )
+        .into_bytes()
+    }
+
+    /// A bitmap body whose every byte is `fill`, so the framebuffer shows which
+    /// page was blitted.
+    fn bitmap_body(fill: u8) -> Vec<u8> {
+        vec![fill; PAGE_BITMAP_SIZE]
+    }
+
+    fn page0_byte() -> u8 {
+        with_table(|t| unsafe { *t.pages[0].bitmap })
+    }
+
+    /// Script and apply a two-page schedule, markers 0xa1 / 0xb2.
+    fn setup_two_pages() {
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10), (0xb2, 5)]));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), &bitmap_body(0xb2));
+        sync_once();
+    }
+
+    #[test]
+    fn sync_downloads_pages_and_commits_the_schedule() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_now_us(1_000_000);
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10), (0xb2, 5)]));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), &bitmap_body(0xb2));
+
+        sync_once();
+
+        let (count, current, committed, md5) =
+            with_table(|t| (t.count, t.current, t.have_schedule_md5, t.schedule_md5));
+        assert_eq!(count, 2);
+        assert_eq!(current, 0, "a fresh schedule starts at the first page");
+        assert!(committed, "every bitmap arrived, so the md5 is committed");
+        assert_eq!(&md5[..2], b"11");
+        assert_eq!(page0_byte(), 0xa1, "page 0 holds its own bitmap");
+        assert_eq!(
+            with_table(|t| unsafe { *t.pages[1].bitmap }),
+            0xb2,
+            "page 1 holds its own bitmap"
+        );
+        assert_eq!(shim::host::calls_matching("http_get").len(), 3, "schedule + 2 bitmaps");
+    }
+
+    #[test]
+    fn unchanged_schedule_is_not_re_downloaded() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_now_us(1_000_000);
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        sync_once();
+
+        let before = with_table(|t| t.pages[0].bitmap);
+        let gets_before = shim::host::calls_matching("http_get").len();
+        sync_once();
+
+        assert_eq!(
+            with_table(|t| t.pages[0].bitmap),
+            before,
+            "the cached bitmap is kept, not re-fetched"
+        );
+        assert_eq!(
+            shim::host::calls_matching("http_get").len() - gets_before,
+            1,
+            "the second poll hit only the schedule endpoint"
+        );
+    }
+
+    #[test]
+    fn a_missing_bitmap_keeps_the_schedule_uncommitted_for_a_retry() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10), (0xb2, 5)]));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        shim::host::script_get(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), 500, b"");
+
+        sync_once();
+
+        let (count, committed) = with_table(|t| (t.count, t.have_schedule_md5));
+        assert_eq!(count, 2);
+        assert!(
+            !committed,
+            "committing here would make the 'unchanged' fast path skip the missing page forever"
+        );
+
+        // The retry downloads only the page that is still missing.
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), &bitmap_body(0xb2));
+        sync_once();
+        assert!(with_table(|t| t.have_schedule_md5));
+        assert!(with_table(|t| t.pages[1].bitmap) != core::ptr::null_mut());
+    }
+
+    #[test]
+    fn rotation_blits_the_next_page_and_a_suspend_blocks_it() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        setup_two_pages();
+        shim::host::set_fb();
+
+        next();
+        assert_eq!(shim::host::fb()[0], 0xb2, "page 1 is on the panel");
+        assert_eq!(shim::host::refreshes(), 1);
+
+        prev();
+        assert_eq!(shim::host::fb()[0], 0xa1, "back to page 0");
+        assert_eq!(shim::host::refreshes(), 2);
+
+        // Suspended = the UI owns the panel: rotation must not repaint.
+        stop_display();
+        next();
+        assert_eq!(shim::host::refreshes(), 2, "no refresh while suspended");
+        assert_eq!(shim::host::fb()[0], 0xa1, "framebuffer untouched");
+
+        allow_display();
+        assert_eq!(shim::host::fb()[0], 0xb2, "resuming repaints the current page");
+        assert_eq!(shim::host::refreshes(), 3);
+    }
+
+    #[test]
+    fn an_empty_schedule_still_repaints_when_the_screen_is_handed_back() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        assert_eq!(with_table(|t| t.count), 0);
+        shim::host::set_fb();
+
+        // With no pages the old code could take the screen back without
+        // repainting, leaving the notification (or Settings) on the panel.
+        stop_display();
+        allow_display();
+        assert_eq!(shim::host::hint_draws(), 1, "the empty hint is drawn");
+        assert_eq!(shim::host::refreshes(), 1);
+        assert!(is_displaying());
+
+        // While the UI owns the panel a repaint is dropped, not drawn under it.
+        stop_display();
+        show_current();
+        assert_eq!(shim::host::hint_draws(), 1);
+        assert!(!is_displaying());
+
+        resume_display();
+        redraw_current();
+        assert_eq!(shim::host::hint_draws(), 2, "resuming repaints");
     }
 
     #[test]

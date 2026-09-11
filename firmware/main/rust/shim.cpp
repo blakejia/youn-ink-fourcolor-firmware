@@ -129,6 +129,10 @@ extern "C" void rf_delay_ms(uint32_t ms) {
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
+extern "C" uint32_t rf_task_stack_free(void) {
+    return uxTaskGetStackHighWaterMark(nullptr);
+}
+
 extern "C" uint64_t rf_now_us(void) {
     return (uint64_t)esp_timer_get_time();
 }

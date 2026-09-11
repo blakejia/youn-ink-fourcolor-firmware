@@ -36,6 +36,8 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn rf_task_exit() -> !;
     pub fn rf_delay_ms(ms: u32);
+    /// Free bytes left on the *calling* task's stack (`uxTaskGetStackHighWaterMark`).
+    pub fn rf_task_stack_free() -> u32;
     /// `esp_timer_get_time()`, i.e. microseconds since boot.
     pub fn rf_now_us() -> u64;
     /// One-shot FreeRTOS timer; the callback runs in the timer daemon task.
@@ -138,6 +140,16 @@ impl<const N: usize> CBuf<N> {
     pub fn as_mut_ptr(&mut self) -> *mut c_char {
         self.bytes.as_mut_ptr() as *mut c_char
     }
+
+    /// Recompute the length after a C function wrote a NUL-terminated string
+    /// through [`Self::as_mut_ptr`].
+    ///
+    /// That write goes around the Rust side, so `len` still reports 0 and
+    /// anything reading the buffer through Rust sees it as empty.
+    pub fn set_len_from_terminator(&mut self) {
+        self.len = self.bytes.iter().position(|b| *b == 0).unwrap_or(N);
+        self.overflowed = false;
+    }
 }
 
 impl<const N: usize> core::fmt::Write for CBuf<N> {
@@ -150,117 +162,405 @@ impl<const N: usize> core::fmt::Write for CBuf<N> {
     }
 }
 
-/// Host-only stand-ins for the `shim.cpp` symbols, so `cargo test` can link.
+/// Host test harness: scriptable stand-ins for the `shim.cpp` symbols.
 ///
-/// They are inert on purpose: the modules' *logic* is covered by the pure
-/// parsers, and anything that needs real I/O (HTTP, PSRAM, the panel, RTOS
-/// tasks) can only be verified on hardware. Keeping them here — rather than
-/// behind a feature flag — means the device build cannot accidentally use them.
+/// The device resolves these against `shim.cpp`; on the host they let the
+/// ported state machines run for real — scripted HTTP responses, a working
+/// allocator, a real mutex and a framebuffer the tests can inspect. Only the
+/// genuinely hardware-bound parts (panel, Wi-Fi, RTOS scheduling) stay inert,
+/// and those can only be verified on the device.
 #[cfg(all(test, not(target_arch = "xtensa")))]
-mod host_stubs {
+pub(crate) mod host {
     use core::ffi::{c_char, c_int, c_void};
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Matches the panel, so `show_page`'s length check passes.
+    pub const FB_LEN: usize = 30_000;
+
+    struct Response {
+        suffix: String,
+        status: i32,
+        body: Vec<u8>,
+    }
+
+    #[derive(Default)]
+    struct Counters {
+        refreshes: u32,
+        hint_draws: u32,
+        timers_started: u32,
+        now_us: u64,
+    }
+
+    static LOCK: Mutex<()> = Mutex::new(());
+    static RESPONSES: Mutex<Vec<Response>> = Mutex::new(Vec::new());
+    static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static TASKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static COUNTERS: Mutex<Counters> = Mutex::new(Counters {
+        refreshes: 0,
+        hint_draws: 0,
+        timers_started: 0,
+        now_us: 0,
+    });
+    static FB: Mutex<Option<&'static mut [u8]>> = Mutex::new(None);
+
+    fn counters<R>(f: impl FnOnce(&mut Counters) -> R) -> R {
+        let mut g = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut g)
+    }
+
+    fn calls<R>(f: impl FnOnce(&mut Vec<String>) -> R) -> R {
+        let mut g = CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut g)
+    }
+
+    fn note(s: impl Into<String>) {
+        calls(|c| c.push(s.into()));
+    }
+
+    /// Take the harness lock, resetting all recorded state.
+    ///
+    /// Tests share one process, so anything touching the module globals must
+    /// hold this for its whole body.
+    pub fn lock() -> MutexGuard<'static, ()> {
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        RESPONSES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        CALLS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        LOGS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        TASKS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut c = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+        *c = Counters::default();
+        drop(c);
+        FB.lock().unwrap_or_else(|e| e.into_inner()).take();
+        guard
+    }
+
+    /// Any request whose URL contains `suffix` gets `status` + `body`.
+    ///
+    /// Re-scripting the same suffix replaces the earlier response, so a test can
+    /// model "the backend recovered on the next poll".
+    pub fn script_get(suffix: &str, status: i32, body: &[u8]) {
+        let mut g = RESPONSES.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|r| r.suffix != suffix);
+        g.push(Response { suffix: suffix.to_string(), status, body: body.to_vec() });
+    }
+
+    /// Shortcut for the common case: a 200 whose body is `body`.
+    pub fn script_ok(suffix: &str, body: &[u8]) {
+        script_get(suffix, 200, body);
+    }
+
+    pub fn calls_matching(needle: &str) -> Vec<String> {
+        calls(|c| c.iter().filter(|s| s.contains(needle)).cloned().collect())
+    }
+
+    pub fn refreshes() -> u32 {
+        counters(|c| c.refreshes)
+    }
+
+    pub fn hint_draws() -> u32 {
+        counters(|c| c.hint_draws)
+    }
+
+    pub fn timers_started() -> u32 {
+        counters(|c| c.timers_started)
+    }
+
+    pub fn set_now_us(t: u64) {
+        counters(|c| c.now_us = t);
+    }
+
+    pub fn tasks() -> Vec<String> {
+        TASKS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn logs() -> Vec<String> {
+        LOGS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Install the framebuffer the panel stub hands out.
+    pub fn set_fb() {
+        let buf = vec![0u8; FB_LEN].leak();
+        *FB.lock().unwrap_or_else(|e| e.into_inner()) = Some(buf);
+    }
+
+    pub fn fb() -> Vec<u8> {
+        let g = FB.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|b| b.to_vec()).unwrap_or_default()
+    }
+
+    pub fn fb_ptr() -> *mut u8 {
+        FB.lock().unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .map(|b| b.as_mut_ptr())
+            .unwrap_or(core::ptr::null_mut())
+    }
+
+    fn cstr(p: *const c_char) -> String {
+        if p.is_null() {
+            return String::new();
+        }
+        let mut out = Vec::new();
+        let mut i = 0isize;
+        loop {
+            let b = unsafe { *p.offset(i) } as u8;
+            if b == 0 {
+                break;
+            }
+            out.push(b);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn write_cstr(src: &str, out: *mut c_char, cap: usize) -> bool {
+        let bytes = src.as_bytes();
+        if bytes.len() >= cap {
+            return false;
+        }
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len()) };
+        unsafe { *out.add(bytes.len()) = 0 };
+        true
+    }
+
+    /// 16-byte header so `rf_free` can rebuild the layout.
+    fn payload_layout(bytes: usize) -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(bytes + 16, 16).unwrap()
+    }
 
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_abort() -> ! {
         panic!("rf_abort")
     }
+
     #[unsafe(no_mangle)]
-    pub extern "C" fn rf_log(_level: c_int, _tag: *const c_char, _msg: *const c_char) {}
-    #[unsafe(no_mangle)]
-    pub extern "C" fn rf_alloc(_bytes: usize) -> *mut u8 {
-        core::ptr::null_mut()
+    pub extern "C" fn rf_log(_level: c_int, tag: *const c_char, msg: *const c_char) {
+        LOGS.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("{}: {}", cstr(tag), cstr(msg)));
     }
+
     #[unsafe(no_mangle)]
-    pub extern "C" fn rf_free(_p: *mut u8) {}
+    pub extern "C" fn rf_alloc(bytes: usize) -> *mut u8 {
+        if bytes == 0 {
+            return core::ptr::null_mut();
+        }
+        unsafe {
+            let p = std::alloc::alloc_zeroed(payload_layout(bytes));
+            if p.is_null() {
+                return p;
+            }
+            *(p as *mut usize) = bytes;
+            p.add(16)
+        }
+    }
+
     #[unsafe(no_mangle)]
-    pub extern "C" fn rf_state_lock() {}
+    pub extern "C" fn rf_free(p: *mut u8) {
+        if p.is_null() {
+            return;
+        }
+        unsafe {
+            let base = p.sub(16);
+            let bytes = *(base as *const usize);
+            std::alloc::dealloc(base, payload_layout(bytes));
+        }
+    }
+
+    /// A take-twice-detecting flag rather than a `std::sync::Mutex`: tests are
+    /// single-threaded inside `lock()`, and a second take without a release is
+    /// exactly the deadlock the device would hit, so it should panic here
+    /// instead of hanging.
+    static STATE_HELD: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
     #[unsafe(no_mangle)]
-    pub extern "C" fn rf_state_unlock() {}
+    pub extern "C" fn rf_state_lock() {
+        assert!(
+            !STATE_HELD.swap(true, std::sync::atomic::Ordering::Acquire),
+            "state lock taken while already held (reentrant take deadlocks on device)"
+        );
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_state_unlock() {
+        assert!(
+            STATE_HELD.swap(false, std::sync::atomic::Ordering::Release),
+            "state unlock without a matching lock"
+        );
+    }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_task_create(
         _entry: extern "C" fn(*mut c_void),
-        _name: *const c_char,
+        name: *const c_char,
         _stack_bytes: u32,
         _priority: u8,
         _arg: *mut c_void,
     ) -> c_int {
-        -1
-    }
-    #[unsafe(no_mangle)]
-    pub extern "C" fn rf_task_exit() -> ! {
-        panic!("rf_task_exit")
-    }
-    #[unsafe(no_mangle)]
-    pub extern "C" fn rf_delay_ms(_ms: u32) {}
-    #[unsafe(no_mangle)]
-    pub extern "C" fn rf_now_us() -> u64 {
+        TASKS.lock().unwrap_or_else(|e| e.into_inner()).push(cstr(name));
         0
     }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_task_exit() -> ! {
+        // Task entries are never called by tests; they call the extracted bodies
+        // instead. (Panicking here would abort: `extern "C"` cannot unwind.)
+        panic!("rf_task_exit reached on the host")
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_delay_ms(_ms: u32) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_task_stack_free() -> u32 {
+        4096
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_now_us() -> u64 {
+        counters(|c| c.now_us)
+    }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_timer_create_once(
         _name: *const c_char,
         _period_ms: u32,
         _cb: extern "C" fn(),
     ) -> c_int {
-        -1
+        0
     }
+
     #[unsafe(no_mangle)]
-    pub extern "C" fn rf_timer_start() {}
+    pub extern "C" fn rf_timer_start() {
+        counters(|c| c.timers_started += 1);
+        note("timer_start");
+    }
+
     #[unsafe(no_mangle)]
-    pub extern "C" fn rf_timer_stop() {}
+    pub extern "C" fn rf_timer_stop() {
+        note("timer_stop");
+    }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_timer_delete() {}
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_http_get(
-        _url: *const c_char,
+        url: *const c_char,
         _token: *const c_char,
-        _buf: *mut c_char,
-        _len: *mut c_int,
+        buf: *mut c_char,
+        len: *mut c_int,
         _timeout_ms: c_int,
     ) -> c_int {
-        -1
+        let url = cstr(url);
+        note(format!("http_get {url}"));
+        let cap = unsafe { *len }.max(0) as usize;
+        let hit = {
+            let g = RESPONSES.lock().unwrap_or_else(|e| e.into_inner());
+            g.iter()
+                .find(|r| url.contains(&r.suffix))
+                .map(|r| (r.status, r.body.clone()))
+        };
+        match hit {
+            Some((status, body)) => {
+                let n = body.len().min(cap);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(body.as_ptr(), buf as *mut u8, n);
+                    // http_wrapper_get NUL-terminates one past the length, which
+                    // is why every caller over-allocates by one byte.
+                    *buf.add(n) = 0;
+                    *len = n as c_int;
+                }
+                status
+            }
+            None => {
+                unsafe { *len = 0 };
+                -1
+            }
+        }
     }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_http_post_json(
-        _url: *const c_char,
+        url: *const c_char,
         _token: *const c_char,
-        _body: *const c_char,
-        _buf: *mut c_char,
-        _len: *mut c_int,
+        body: *const c_char,
+        buf: *mut c_char,
+        len: *mut c_int,
         _timeout_ms: c_int,
     ) -> c_int {
-        -1
+        let url = cstr(url);
+        let payload = cstr(body);
+        note(format!("http_post {url} {payload}"));
+        let cap = unsafe { *len }.max(0) as usize;
+        let hit = {
+            let g = RESPONSES.lock().unwrap_or_else(|e| e.into_inner());
+            g.iter().find(|r| url.contains(&r.suffix)).map(|r| (r.status, r.body.clone()))
+        };
+        match hit {
+            Some((status, body)) => {
+                let n = body.len().min(cap);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(body.as_ptr(), buf as *mut u8, n);
+                    *buf.add(n) = 0;
+                    *len = n as c_int;
+                }
+                status
+            }
+            None => {
+                unsafe { *len = 0 };
+                -1
+            }
+        }
     }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_build_endpoint(
-        _path: *const c_char,
-        _out: *mut c_char,
-        _out_len: c_int,
+        path: *const c_char,
+        out: *mut c_char,
+        out_len: c_int,
     ) -> c_int {
-        0
+        let full = format!("http://host{}", cstr(path));
+        write_cstr(&full, out, out_len.max(0) as usize) as c_int
     }
+
     #[unsafe(no_mangle)]
-    pub extern "C" fn rf_get_token(_out: *mut c_char, _out_len: c_int) -> c_int {
-        0
+    pub extern "C" fn rf_get_token(out: *mut c_char, out_len: c_int) -> c_int {
+        write_cstr("test-token", out, out_len.max(0) as usize) as c_int
     }
+
     #[unsafe(no_mangle)]
-    pub extern "C" fn rf_get_device_id(_out: *mut c_char, _out_len: c_int) -> c_int {
-        0
+    pub extern "C" fn rf_get_device_id(out: *mut c_char, out_len: c_int) -> c_int {
+        write_cstr("NOTE4C-TEST", out, out_len.max(0) as usize) as c_int
     }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_set_display(_display: *mut c_void) {}
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_fb_len() -> c_int {
-        0
+        FB_LEN as c_int
     }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_fb_begin() -> *mut u8 {
-        core::ptr::null_mut()
+        fb_ptr()
     }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_fb_end() {}
+
     #[unsafe(no_mangle)]
-    pub extern "C" fn rf_request_full_refresh() {}
+    pub extern "C" fn rf_request_full_refresh() {
+        counters(|c| c.refreshes += 1);
+        note("full_refresh");
+    }
+
     #[unsafe(no_mangle)]
-    pub extern "C" fn rf_draw_empty_hint() {}
+    pub extern "C" fn rf_draw_empty_hint() {
+        counters(|c| c.hint_draws += 1);
+        note("empty_hint");
+    }
 }

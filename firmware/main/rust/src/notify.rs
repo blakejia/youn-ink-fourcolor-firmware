@@ -156,16 +156,78 @@ fn decode_next(b64: &[u8], out_bitmap: *mut u8) -> bool {
     }
 }
 
+/// Apply a `/next` response.
+///
+/// Returns true only when a notification is now on screen, i.e. the response
+/// carried both a decodable bitmap and a usable id.
+fn handle_next(status: i32, body: &[u8], bitmap: *mut u8) -> bool {
+    match status {
+        200 => match parse_next(body) {
+            Some((b64, id)) if decode_next(b64, bitmap) => {
+                store_id(&id);
+                show_bitmap(bitmap);
+                set_state(NOTIFYING);
+                unsafe { shim::rf_timer_start() };
+                let id_len = id.iter().position(|b| *b == 0).unwrap_or(id.len());
+                log_i!(TAG, "notify {:?} displaying",
+                       core::str::from_utf8(&id[..id_len]).unwrap_or("?"));
+                true
+            }
+            _ => false,
+        },
+        204 => {
+            log_i!(TAG, "no pending notification (204)");
+            false
+        }
+        other => {
+            log_w!(TAG, "next fetch failed (status={})", other);
+            false
+        }
+    }
+}
+
+/// `/api/notifications/{id}/ack`.
+fn ack_path(id: &[u8]) -> CBuf<96> {
+    let mut path = CBuf::<96>::new();
+    path.push("/api/notifications/");
+    path.push_bytes(id);
+    path.push("/ack");
+    path
+}
+
+/// `{"decision":"…"}`.
+fn ack_body(decision: &[u8]) -> CBuf<64> {
+    let mut body = CBuf::<64>::new();
+    body.push("{\"decision\":\"");
+    body.push_bytes(decision);
+    body.push("\"}");
+    body
+}
+
+/// Clear all module state so a host test starts from a cold boot.
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    set_state(IDLE);
+    with_id(|slot| slot.fill(0));
+}
+
 extern "C" fn fetch_task(_arg: *mut c_void) {
+    fetch_once();
+    unsafe { shim::rf_task_exit() };
+}
+
+/// Pull `/next` and act on it. Runs in its own task on the device so the button
+/// callback returns immediately; the body is called directly by the host tests.
+fn fetch_once() {
     log_i!(TAG, "fetch task started");
 
     let mut device_id = CBuf::<32>::new();
-    if unsafe { shim::rf_get_device_id(device_id.as_mut_ptr(), 32) } == 0
-        || device_id.is_empty()
-    {
+    let ok = unsafe { shim::rf_get_device_id(device_id.as_mut_ptr(), 32) } != 0;
+    device_id.set_len_from_terminator();
+    if !ok || device_id.is_empty() {
         log_w!(TAG, "no device_id, abort fetch");
         set_state(IDLE);
-        unsafe { shim::rf_task_exit() };
+        return;
     }
 
     use core::fmt::Write as _;
@@ -179,7 +241,7 @@ extern "C" fn fetch_task(_arg: *mut c_void) {
     if unsafe { shim::rf_build_endpoint(path.as_ptr(), url.as_mut_ptr(), 320) } == 0 {
         log_w!(TAG, "cannot build endpoint");
         set_state(IDLE);
-        unsafe { shim::rf_task_exit() };
+        return;
     }
     let mut token = CBuf::<80>::new();
     unsafe { shim::rf_get_token(token.as_mut_ptr(), 80) };
@@ -198,7 +260,7 @@ extern "C" fn fetch_task(_arg: *mut c_void) {
             }
         }
         set_state(IDLE);
-        unsafe { shim::rf_task_exit() };
+        return;
     }
 
     let mut len = RESPONSE_BUF as i32;
@@ -207,37 +269,15 @@ extern "C" fn fetch_task(_arg: *mut c_void) {
                           HTTP_TIMEOUT_MS)
     };
 
-    match status {
-        204 => {
-            log_i!(TAG, "no pending notification (204)");
-            set_state(IDLE);
-        }
-        200 => {
-            let len = (len.max(0) as usize).min(RESPONSE_BUF);
-            match parse_next(unsafe { core::slice::from_raw_parts(buf, len) }) {
-                Some((b64, id)) if decode_next(b64, bitmap) => {
-                    store_id(&id);
-                    show_bitmap(bitmap);
-                    set_state(NOTIFYING);
-                    unsafe { shim::rf_timer_start() };
-                    let id_len = id.iter().position(|b| *b == 0).unwrap_or(id.len());
-                    log_i!(TAG, "notify {:?} displaying",
-                           core::str::from_utf8(&id[..id_len]).unwrap_or("?"));
-                }
-                _ => set_state(IDLE),
-            }
-        }
-        other => {
-            log_w!(TAG, "next fetch failed (status={})", other);
-            set_state(IDLE);
-        }
+    let len = (len.max(0) as usize).min(RESPONSE_BUF);
+    if !handle_next(status, unsafe { core::slice::from_raw_parts(buf, len) }, bitmap) {
+        set_state(IDLE);
     }
 
     unsafe {
         shim::rf_free(buf);
         shim::rf_free(bitmap);
     }
-    unsafe { shim::rf_task_exit() };
 }
 
 /// Fire-and-forget `POST /api/notifications/{id}/ack`.
@@ -246,20 +286,20 @@ extern "C" fn fetch_task(_arg: *mut c_void) {
 /// is copied in so a concurrent dismiss clearing the module state cannot race
 /// with the task reading it.
 extern "C" fn ack_task(arg: *mut c_void) {
-    let block = arg as *mut u8;
+    send_ack(arg as *mut u8);
+    unsafe { shim::rf_task_exit() };
+}
+
+/// POST the ack for the block built by [`post_ack`]; frees it.
+fn send_ack(block: *mut u8) {
     let id_len = c_str_len(block, ACK_ID_OFF);
 
-    let mut path = CBuf::<96>::new();
-    path.push("/api/notifications/");
-    path.push_bytes(unsafe { core::slice::from_raw_parts(block, id_len) });
-    path.push("/ack");
+    let path = ack_path(unsafe { core::slice::from_raw_parts(block, id_len) });
     let mut url = CBuf::<320>::new();
     if unsafe { shim::rf_build_endpoint(path.as_ptr(), url.as_mut_ptr(), 320) } == 0 {
         log_w!(TAG, "cannot build ack endpoint");
-        unsafe {
-            shim::rf_free(block);
-            shim::rf_task_exit()
-        };
+        unsafe { shim::rf_free(block) };
+        return;
     }
 
     let mut token = CBuf::<80>::new();
@@ -277,10 +317,7 @@ extern "C" fn ack_task(arg: *mut c_void) {
         log_w!(TAG, "ack failed: status={} (stays shown until the server TTL)", status);
     }
 
-    unsafe {
-        shim::rf_free(block);
-        shim::rf_task_exit()
-    };
+    unsafe { shim::rf_free(block) };
 }
 
 /// The timer callback runs in the FreeRTOS timer daemon, and dismissing touches
@@ -304,11 +341,16 @@ extern "C" fn timeout_cb() {
 }
 
 extern "C" fn timeout_task(_arg: *mut c_void) {
+    on_timeout();
+    unsafe { shim::rf_task_exit() };
+}
+
+/// Dismissing touches the panel, so it runs in a task on the device.
+fn on_timeout() {
     if state() == NOTIFYING {
         dismiss_locked_state();
         log_i!(TAG, "notify timeout, auto dismissed");
     }
-    unsafe { shim::rf_task_exit() };
 }
 
 // ── public API ─────────────────────────────────────────────────────────────
@@ -377,10 +419,7 @@ pub unsafe fn post_ack(decision: *const core::ffi::c_char) {
         let n = c_str_len(decision as *const u8, 8);
         unsafe { core::slice::from_raw_parts(decision as *const u8, n) }
     };
-    let mut body = CBuf::<64>::new();
-    body.push("{\"decision\":\"");
-    body.push_bytes(decision);
-    body.push("\"}");
+    let body = ack_body(decision);
     unsafe {
         core::ptr::copy_nonoverlapping(
             body.as_bytes().as_ptr(),
@@ -464,10 +503,190 @@ pub extern "C" fn notify_dismiss() {
 pub extern "C" fn notify_dismiss_quiet() {
     dismiss_quiet();
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
+
+    /// base64 of `data`. The firmware builds without base64's `alloc` feature,
+    /// so only the caller-provided-buffer variants exist here.
+    fn encode(data: &[u8]) -> String {
+        use base64::Engine as _;
+        let mut out = vec![0u8; data.len().div_ceil(3) * 4];
+        let n = STANDARD.encode_slice(data, &mut out).expect("fits");
+        out.truncate(n);
+        String::from_utf8(out).expect("ascii")
+    }
+
+    /// A `/next` response carrying a full-size bitmap tagged with `fill`.
+    fn next_body(fill: u8, id: &str) -> Vec<u8> {
+        let bitmap = vec![fill; page_sync::PAGE_BITMAP_SIZE];
+        format!(
+            r#"{{"bitmap_base64":"{}","notification":{{"id":"{}","title":"t"}}}}"#,
+            encode(&bitmap),
+            id
+        )
+        .into_bytes()
+    }
+
+    /// Cold start with the canvas owning the screen, then one scripted pull.
+    fn boot_with(fill: u8, id: &str) {
+        page_sync::reset_for_test();
+        reset_for_test();
+        shim::host::set_fb();
+        let body = next_body(fill, id);
+        shim::host::script_ok("/api/notifications/next", &body);
+        fetch_once();
+    }
+
+    #[test]
+    fn a_pull_displays_the_bitmap_and_arms_the_timeout() {
+        let _g = shim::host::lock();
+        boot_with(0x5a, "abcd1234");
+
+        assert!(is_active(), "a 200 with a decodable bitmap moves to NOTIFYING");
+        assert_eq!(shim::host::fb()[0], 0x5a, "the decoded bitmap is on the panel");
+        assert_eq!(shim::host::refreshes(), 1);
+        assert_eq!(shim::host::timers_started(), 1, "the dismiss timeout is armed");
+        assert!(!page_sync::is_displaying(), "the notification owns the panel");
+        assert_eq!(with_id(|slot| slot[..8].to_vec()), b"abcd1234".to_vec());
+        assert_eq!(shim::host::calls_matching("/api/notifications/next").len(), 1);
+    }
+
+    #[test]
+    fn request_next_is_non_blocking() {
+        let _g = shim::host::lock();
+        reset_for_test();
+
+        request_next();
+
+        assert_eq!(state(), FETCHING, "the button callback returns while the fetch runs");
+        assert_eq!(shim::host::tasks(), vec!["notify_fetch".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_queue_leaves_the_device_idle() {
+        let _g = shim::host::lock();
+        page_sync::reset_for_test();
+        reset_for_test();
+        shim::host::set_fb();
+        shim::host::script_get("/api/notifications/next", 204, b"");
+
+        fetch_once();
+
+        assert_eq!(state(), IDLE);
+        assert_eq!(shim::host::refreshes(), 0, "nothing was drawn");
+    }
+
+    #[test]
+    fn a_short_or_corrupt_response_is_rejected() {
+        let full = vec![0u8; page_sync::PAGE_BITMAP_SIZE];
+        let cases: Vec<Vec<u8>> = vec![
+            // valid base64, but not a whole panel
+            br#"{"bitmap_base64":"AAAA","notification":{"id":"x1"}}"#.to_vec(),
+            // truncated JSON
+            next_body(0x11, "x2")[..40].to_vec(),
+            // parsed, but nothing to ack with
+            format!(r#"{{"bitmap_base64":"{}","notification":{{}}}}"#, encode(&full)).into_bytes(),
+        ];
+        for body in cases {
+            let _g = shim::host::lock();
+            page_sync::reset_for_test();
+            reset_for_test();
+            shim::host::set_fb();
+            shim::host::script_get("/api/notifications/next", 200, &body);
+
+            fetch_once();
+
+            assert_eq!(state(), IDLE, "never leaves a half-displayed notification");
+            assert_eq!(shim::host::refreshes(), 0, "the panel is not touched");
+        }
+    }
+
+    #[test]
+    fn ack_posts_the_decision_for_the_stored_id() {
+        let _g = shim::host::lock();
+        boot_with(0x5a, "deadbeeffeedface");
+        assert!(is_active());
+
+        // Build the block the way `post_ack` does, then run its task body.
+        let block = unsafe { shim::rf_alloc(ACK_BLOCK) };
+        copy_id_into(block);
+        let body = ack_body(b"agree");
+        unsafe {
+            core::ptr::copy_nonoverlapping(body.as_bytes().as_ptr(), block.add(ACK_ID_OFF), body.as_bytes().len());
+            *block.add(ACK_ID_OFF + body.as_bytes().len()) = 0;
+        }
+        shim::host::script_ok("/api/notifications/deadbeeffeedface/ack", b"{\"status\":\"acked\"}");
+
+        send_ack(block);
+
+        let posts = shim::host::calls_matching("http_post");
+        assert_eq!(posts.len(), 1, "exactly one ack is sent");
+        assert!(
+            posts[0].starts_with("http_post http://host/api/notifications/deadbeeffeedface/ack"),
+            "{}",
+            posts[0]
+        );
+        assert!(posts[0].ends_with(r#"{"decision":"agree"}"#), "{}", posts[0]);
+    }
+
+    #[test]
+    fn post_ack_dismisses_whatever_the_ack_does() {
+        let _g = shim::host::lock();
+        boot_with(0x5a, "dismissme");
+
+        unsafe { post_ack(c"reject".as_ptr()) };
+
+        assert_eq!(shim::host::tasks(), vec!["notify_ack".to_string()]);
+        assert!(!is_active(), "the popup goes away even before the ack lands");
+        assert!(page_sync::is_displaying(), "and the canvas takes the screen back");
+    }
+
+    #[test]
+    fn post_ack_is_ignored_when_nothing_is_showing() {
+        let _g = shim::host::lock();
+        reset_for_test();
+
+        unsafe { post_ack(c"agree".as_ptr()) };
+
+        assert!(shim::host::tasks().is_empty(), "no ack task without a notification");
+    }
+
+    #[test]
+    fn the_timeout_dismisses_and_repaints_the_canvas() {
+        let _g = shim::host::lock();
+        boot_with(0x5a, "timeoutid");
+        assert!(is_active());
+
+        on_timeout();
+
+        assert_eq!(state(), IDLE, "the popup is cleared when the timer fires");
+        assert_eq!(with_id(|slot| slot.to_vec()), vec![0u8; ID_CAP], "and the id with it");
+        assert_eq!(shim::host::calls_matching("timer_stop").len(), 1);
+        assert!(page_sync::is_displaying(), "the canvas owns the panel again");
+        assert_eq!(shim::host::hint_draws(), 1, "and repaints instead of leaving the popup up");
+    }
+
+    #[test]
+    fn a_quiet_dismiss_leaves_screen_ownership_to_the_caller() {
+        let _g = shim::host::lock();
+        boot_with(0x5a, "quietid");
+        let refreshes_before = shim::host::refreshes();
+
+        dismiss_quiet();
+
+        assert_eq!(state(), IDLE);
+        assert!(
+            !page_sync::is_displaying(),
+            "a caller about to draw over the panel must not have the canvas repaint under it"
+        );
+        assert_eq!(
+            shim::host::refreshes(),
+            refreshes_before,
+            "and no extra panel refresh is spent"
+        );
+    }
 
     #[test]
     fn extracts_bitmap_and_id() {
@@ -501,3 +720,4 @@ mod tests {
         assert!(parse_next(body.as_bytes()).is_some());
     }
 }
+
