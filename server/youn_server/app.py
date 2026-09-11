@@ -591,8 +591,9 @@ def create_app() -> FastAPI:
             raise HTTPException(400, "name required")
         if not isinstance(canvas_json, dict):
             raise HTTPException(400, "canvas_json must be an object")
-        # policy 的最小页时长此前只在响应里出现，保存时没生效
-        duration_minutes = max(duration_minutes, settings.canvas_min_page_duration_minutes)
+        if duration_minutes < settings.canvas_min_page_duration_minutes:
+            raise HTTPException(400,
+                f"duration_minutes must be >= min_page_duration_minutes={settings.canvas_min_page_duration_minutes}")
         try:
             bitmap = render_canvas_to_bitmap(canvas_json)
         except RenderError as e:

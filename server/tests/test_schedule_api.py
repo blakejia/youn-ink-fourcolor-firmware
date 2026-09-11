@@ -109,7 +109,7 @@ def test_delete_page_cleans_bitmap(client):
     assert r3.status_code == 404
 
 
-def test_min_duration_clamped_on_save(client):
+def test_min_duration_validation(client):
     body = {
         "name": "p4",
         "canvas_json": {"default": []},
@@ -117,8 +117,8 @@ def test_min_duration_clamped_on_save(client):
         "order": 0,
     }
     r = client.post("/api/pages", json=body)
-    assert r.status_code == 200
-    assert r.json()["duration_minutes"] == 10
+    assert r.status_code == 400
+    assert "min_page_duration_minutes" in r.json()["detail"]
 
 
 def test_render_error_returns_400_with_path(client):
@@ -190,13 +190,3 @@ def test_schedule_response_carries_position_but_md5_ignores_it(client):
     md5_a = pages_mod.compute_schedule_md([pages_mod.PageEntry("a" * 32, 10, 0, "x")])
     md5_b = pages_mod.compute_schedule_md([pages_mod.PageEntry("a" * 32, 10, 0, "x")])
     assert md5_a == md5_b
-
-
-def test_create_page_clamps_duration_to_policy_minimum(client):
-    r = client.post("/api/pages", json={
-        "name": "clamped",
-        "canvas_json": {"default": [{"type": "div", "props": {"tw": "bg-white", "children": "x"}}]},
-        "duration_minutes": 0,
-    })
-    assert r.status_code in (200, 201)
-    assert r.json()["duration_minutes"] >= 10
