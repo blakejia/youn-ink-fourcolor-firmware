@@ -567,7 +567,9 @@ user-activity grace window can hold it awake for its own sake."
         // 33-byte md5 slot + valid byte at offset 4, matching rf_panel_record_t.
         let g = PANEL_REC.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
-            core::ptr::write_bytes(out, 0, 33);
+            // sizeof(rf_panel_record_t) == 48; the caller's buffer is the struct,
+            // and zeroing only the md5 slot would leave index/pad bytes stale.
+            core::ptr::write_bytes(out, 0, 48);
             match g.as_ref() {
                 Some((md5, _)) => {
                     *out.add(4) = 1;
