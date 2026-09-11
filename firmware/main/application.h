@@ -84,6 +84,11 @@ private:
     int64_t last_activity_ms_ = 0;
     // (The sync-failure backoff streak is NOT here: it lives in RTC memory
     // via rf_fail_streak_*, because RAM is cleared on every deep-sleep wake.)
+    // Set by RunPowerCycle immediately before page_sync_sync_once(); consumed
+    // (cleared) by ServicePowerPolicy. The streak advances at most once per
+    // real sync attempt — timer re-arms (mains/grace/busy) must not ratchet
+    // it. Per-boot RAM by design; only the counter outlives sleep.
+    bool sync_attempted_ = false;
 
     void RearmPowerTimer(uint32_t delay_ms);
     void EnterManualSleep();

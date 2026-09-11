@@ -30,19 +30,20 @@
 // CHARGE_DETECT charging level definition: 0 means low=charging, 1 means high=charging.
 #define CHARGE_DETECT_CHARGING_LEVEL 0
 // Deep-sleep charger-insert wake (Stage 1 power policy, see application.cc):
-// the level follows charge_status.cc's convention — power_present is set when
-// the detect pin reads HIGH, i.e. attach = HIGH and unplugged = LOW — so ext1
-// wakes on ANY_HIGH. The unplugged level is still unconfirmed on hardware:
-// the sleep log prints the raw pin (pin2=%d, expect 0 unplugged, with
-// mains=0 on battery) precisely so the first matrix run confirms or refutes
-// it. If the hardware disagrees, flip CHARGE_DETECT_PLUG_PULLS_LOW and, if
-// needed, charge_status's inversion. No internal pull is added deliberately:
-// the level belongs to the charger IC's own network and a pull could fight it.
+// the level follows charge_status.cc, which is the authority — Tick compares
+// the pin against CHARGE_DETECT_CHARGING_LEVEL (0 = low means charging), so
+// attach = LOW and unplugged = HIGH, and ext1 wakes on ANY_LOW. (Arming the
+// level that already holds while sleeping would fire the wake source
+// immediately: ANY_HIGH on battery = instant boot-loop, not duty cycling.)
+// The sleep log prints the raw pin (pin2=%d) precisely so the first matrix
+// run confirms it: expect pin2=1 + mains=0 on battery, pin2=0 + mains=1 on
+// USB. No internal pull is added deliberately: the level belongs to the
+// charger IC's own network and a pull could fight it.
 // (Replaces the dead CHARGE_GPIO_AFFECT_SLEEP macro: mains-never-sleeps plus
 // USB-wakes-via-ext1 is the behaviour it described.)
 // 1 = plug-in pulls GPIO2 LOW (unplugged HIGH); 0 = plug-in drives HIGH.
 // Drives the ext1 wake mode registered before each deep sleep.
-#define CHARGE_DETECT_PLUG_PULLS_LOW 0
+#define CHARGE_DETECT_PLUG_PULLS_LOW 1
 
 // RTC (PCF8563T/5)
 #define RTC_INT_GPIO            GPIO_NUM_5

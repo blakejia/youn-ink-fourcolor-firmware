@@ -186,10 +186,10 @@ void ServerPairingTaskTrampoline(void*) {
     vTaskDelete(nullptr);
 }
 
-// Charger-insert deep-sleep wake (ext1). The level follows charge_status.cc's
-// convention (attach = HIGH, unplugged = LOW); the sleep log prints the raw
-// pin so the matrix confirms it. If the hardware disagrees, flip
-// CHARGE_DETECT_PLUG_PULLS_LOW in config.h and this follows.
+// Charger-insert deep-sleep wake (ext1). The level follows charge_status.cc,
+// which is the authority (attach = LOW, unplugged = HIGH); the sleep log
+// prints the raw pin so the matrix confirms it. If the hardware disagrees,
+// flip CHARGE_DETECT_PLUG_PULLS_LOW in config.h and this follows.
 void EnableChargerInsertWakeup() {
     // v6.0 deprecates esp_sleep_enable_ext1_wakeup in favour of the _io pair.
 #if CHARGE_DETECT_PLUG_PULLS_LOW
@@ -564,6 +564,9 @@ void Application::RunPowerCycle() {
     // The sync result is observed via page_sync_sync_ok() in
     // ServicePowerPolicy below; the backoff streak itself lives in RTC
     // memory (rf_fail_streak_*), because RAM is cleared on every wake.
+    // Mark the attempt first so the policy advances the streak at most once
+    // per real sync (timer re-arms without a sync must not ratchet it).
+    sync_attempted_ = true;
     page_sync_sync_once();
     notify_request_next();
     // Unconditional, even on an empty schedule: that call draws and records
@@ -605,16 +608,22 @@ void Application::ServicePowerPolicy() {
     // sleeps for the cap. Never pre-clamp to 0 here: 0 reads as "a page
     // changes right now" and floors at 60 s.
     in.seconds_until_next_page = page_sync_next_wake_s();
-
     rf_power_decision_t d = {};
     rf_power_decide(&in, &d);
     // Persist the ladder step for the NEXT wake now that this decision has
-    // consumed the read above: success resets to 0, failure climbs (capped;
-    // decide() itself caps the shift at 5, this just keeps the word sane).
-    if (page_sync_sync_ok()) {
-        rf_fail_streak_set(0);
-    } else {
-        rf_fail_streak_set(streak + 1 > 8 ? 8 : streak + 1);
+    // consumed the read above — but only if a sync was actually attempted
+    // since the last evaluation (RunPowerCycle sets the flag; timer re-arms
+    // on mains/grace/busy run no sync and must not ratchet the counter, or
+    // the first battery sleep would jump straight to the cap). Success
+    // resets to 0, failure climbs (capped; decide() itself caps the shift
+    // at 5, this just keeps the word sane).
+    if (sync_attempted_) {
+        sync_attempted_ = false;
+        if (page_sync_sync_ok()) {
+            rf_fail_streak_set(0);
+        } else {
+            rf_fail_streak_set(streak + 1 > 8 ? 8 : streak + 1);
+        }
     }
 
     if (!d.sleep) {
@@ -625,8 +634,8 @@ void Application::ServicePowerPolicy() {
     if (d.invalidate_panel) {
         rf_panel_record_invalidate();
     }
-    // pin2 is the raw CHARGE_DETECT_GPIO level: expect 0 while unplugged
-    // (attach drives HIGH per charge_status.cc), and mains must read 0 on
+    // pin2 is the raw CHARGE_DETECT_GPIO level: expect 1 while unplugged
+    // (attach drives LOW per charge_status.cc), and mains must read 0 on
     // battery. If the matrix disagrees, the fix is CHARGE_DETECT_PLUG_PULLS_LOW
     // plus, if needed, charge_status's inversion — no pull is added here
     // deliberately (the level belongs to the charger IC's own network).
@@ -641,7 +650,7 @@ void Application::ServicePowerPolicy() {
     esp_sleep_enable_timer_wakeup((uint64_t)d.wake_s * 1000000ULL);
     esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_BUTTON_GPIO, 0);
     // Sleeping on mains is unreachable (decide() holds awake there), so the
-    // charger pin reads low here and ANY_HIGH fires on plug-in. See config.h.
+    // charger pin reads high here and ANY_LOW fires on plug-in. See config.h.
     EnableChargerInsertWakeup();
     esp_deep_sleep_start();
 }
