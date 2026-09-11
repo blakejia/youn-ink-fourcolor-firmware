@@ -841,7 +841,21 @@ void Application::ServerPairingTaskEntry(void* arg) {
 bool Application::CanEnterSleepMode() const {
     // Only a paired, idle device may sleep; on top of this SleepManager checks
     // the busy sources, holds and the activity deadline.
-    return GetLifecycleState() == kLifecycleSyncIdle;
+    // A paired device that cannot reach the network must still be allowed to
+    // sleep: a cycle that has been attempted and failed is the duty cycle's own
+    // signal to retry on the next timer, whereas spinning awake at the busy
+    // cadence flattens the battery. Provisioning and pairing stay excluded —
+    // those flows need the user and the screen. Two consequences, both
+    // intended: mains is unaffected (decide() short-circuits on mains before
+    // it ever reads busy), and an interactive boot that cannot reach WiFi
+    // now also sleeps once the grace expires — which is right for a battery
+    // device, and any button activity re-stamps the grace so using it keeps
+    // it awake.
+    if (GetLifecycleState() == kLifecycleSyncIdle) return true;
+    // last_cycle_ms_ < 0 below means no cycle ran yet this boot (the -1
+    // sentinel); a real stamp is esp_timer ms and always >= 0 here.
+    return GetLifecycleState() == kLifecycleWifiConnecting &&
+           last_cycle_ms_ >= 0 && !sync_result_ok_;
 }
 
 void Application::EnterManualSleep() {
