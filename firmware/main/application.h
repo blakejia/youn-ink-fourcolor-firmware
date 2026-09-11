@@ -89,6 +89,11 @@ private:
     // real sync attempt — timer re-arms (mains/grace/busy) must not ratchet
     // it. Per-boot RAM by design; only the counter outlives sleep.
     bool sync_attempted_ = false;
+    // Snapshot of the last page_sync_sync_once() outcome, written only by
+    // RunPowerCycle alongside sync_attempted_. The policy reads this — not a
+    // fresh page_sync_sync_ok() — so a timer-side evaluation cannot observe
+    // a half-finished cycle's state.
+    bool sync_result_ok_ = false;
 
     void RearmPowerTimer(uint32_t delay_ms);
     void EnterManualSleep();

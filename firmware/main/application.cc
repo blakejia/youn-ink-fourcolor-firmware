@@ -561,13 +561,22 @@ void Application::RunPowerCycle() {
     // once per quiet wake). Each stage takes and releases the module locks
     // in turn — state -> display order holds, never nested — so there is no
     // lock-order risk across the sequence.
-    // The sync result is observed via page_sync_sync_ok() in
-    // ServicePowerPolicy below; the backoff streak itself lives in RTC
-    // memory (rf_fail_streak_*), because RAM is cleared on every wake.
-    // Mark the attempt first so the policy advances the streak at most once
-    // per real sync (timer re-arms without a sync must not ratchet it).
+    // The cycle must not be interruptible by its own re-arm timer: the timer
+    // callback is ServicePowerPolicy, and a mid-cycle evaluation could see
+    // stale sync state with an idle panel/audio and decide to sleep — cutting
+    // WiFi and the audio rail before anything is painted, forever repeating
+    // on every wake. Stop the timer here; the cycle's own final
+    // ServicePowerPolicy() call re-arms it, so there is no gap. This also
+    // makes the attempt-flag check-then-clear below single-threaded.
+    if (sleep_timer_ != nullptr) {
+        esp_timer_stop(sleep_timer_);
+    }
+    // The backoff streak lives in RTC memory (rf_fail_streak_*) because RAM
+    // is cleared on every wake. Mark the attempt and snapshot its outcome
+    // here so the policy consumes this cycle's result — never a re-read that
+    // could observe a half-finished cycle.
     sync_attempted_ = true;
-    page_sync_sync_once();
+    sync_result_ok_ = page_sync_sync_once();
     notify_request_next();
     // Unconditional, even on an empty schedule: that call draws and records
     // the empty hint, which is what makes the canvas's display-ownership
@@ -614,12 +623,14 @@ void Application::ServicePowerPolicy() {
     // consumed the read above — but only if a sync was actually attempted
     // since the last evaluation (RunPowerCycle sets the flag; timer re-arms
     // on mains/grace/busy run no sync and must not ratchet the counter, or
-    // the first battery sleep would jump straight to the cap). Success
-    // resets to 0, failure climbs (capped; decide() itself caps the shift
-    // at 5, this just keeps the word sane).
+    // the first battery sleep would jump straight to the cap). The outcome
+    // comes from this cycle's snapshot, never a re-read: a timer-side
+    // evaluation mid-cycle could otherwise observe stale sync state.
+    // Success resets to 0, failure climbs (capped; decide() itself caps the
+    // shift at 5, this just keeps the word sane).
     if (sync_attempted_) {
         sync_attempted_ = false;
-        if (page_sync_sync_ok()) {
+        if (sync_result_ok_) {
             rf_fail_streak_set(0);
         } else {
             rf_fail_streak_set(streak + 1 > 8 ? 8 : streak + 1);
