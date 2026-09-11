@@ -227,8 +227,8 @@ void Application::Initialize(bool quiet) {
     }
     // Store before Board::GetInstance(): the board ctor reads IsQuietBoot()
     // to decide the panel bring-up.
-    quiet_boot_ = effective_quiet;
-    if (quiet_boot_) {
+    quiet_boot_.store(effective_quiet, std::memory_order_release);
+    if (effective_quiet) {
         // Timer-wake duty cycle, not user activity: backdate the idle clock
         // past the grace window so the policy computes the duty-cycle wake
         // instead of holding the device inside the interactive grace window.
@@ -247,7 +247,7 @@ void Application::Initialize(bool quiet) {
     }
 
     // A timer wake never plays UI sounds; the codec stays powered down.
-    if (!quiet_boot_) {
+    if (!quiet_boot_.load(std::memory_order_acquire)) {
         audio_service_.Initialize(codec);
         audio_service_.Start();
     }
@@ -263,7 +263,7 @@ void Application::Initialize(bool quiet) {
     // The UI manager owns the provisioning/pairing pages and the settings
     // tree; a duty-cycle wake builds none of it (and the board ctor already
     // skipped the panel bring-up behind IsQuietBoot()).
-    if (quiet_boot_) {
+    if (quiet_boot_.load(std::memory_order_acquire)) {
         ESP_LOGI(kTag, "Quiet boot: UI manager skipped, panel bring-up skipped");
     } else {
         BuildRawDrawUi(static_cast<CustomLcdDisplay*>(display));
@@ -349,6 +349,16 @@ void Application::Initialize(bool quiet) {
     // Start network (non-blocking, WiFi connects asynchronously)
     board.RequestNetwork();
 
+    // Quiet backstop (F22): a quiet boot is provisioned+paired by
+    // construction, so nothing else is in flight — if WiFi never connects,
+    // no timer would ever arm and the device would stay awake on battery
+    // forever. This guarantees one cycle (failed sync → backoff ladder →
+    // sleep); the connected path's 3 s arm replaces it when WiFi comes up,
+    // and the dispatcher's never-ran check prevents a second cycle.
+    if (quiet_boot_.load(std::memory_order_acquire)) {
+        RearmPowerTimer(30000);
+    }
+
     SetDeviceState(kDeviceStateIdle);
 }
 
@@ -419,6 +429,53 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
         if (rawdraw_ui_manager_) {
             rawdraw_ui_manager_->RequestActivePageRefresh();
         }
+    }
+}
+
+void Application::RequestPromotion() {
+    // Interactive boots already have a UI; promotion is quiet-only and
+    // one-shot per boot. Safe from any task — the main loop consumes it.
+    if (!quiet_boot_.load(std::memory_order_acquire) ||
+        promoted_.load(std::memory_order_acquire)) {
+        return;
+    }
+    promote_requested_.store(true, std::memory_order_release);
+}
+
+void Application::ServicePromotion() {
+    if (!promote_requested_.load(std::memory_order_acquire)) {
+        return;
+    }
+    // Whoever owns UI construction is whoever runs this: the main loop
+    // (app_main task, via Run()). Building the manager from the WiFi or
+    // esp_timer task would race UpdateStatusBarForUi on the same unique_ptr.
+    if (!quiet_boot_.load(std::memory_order_acquire) ||
+        promoted_.load(std::memory_order_acquire) ||
+        rawdraw_ui_manager_ != nullptr) {
+        promote_requested_.store(false, std::memory_order_release);
+        return;
+    }
+    auto* lcd = static_cast<CustomLcdDisplay*>(Board::GetInstance().GetDisplay());
+    if (lcd == nullptr) {
+        return;  // retry on the next main-loop tick
+    }
+    // Mirror cold-boot order: panel up first, then the UI, then the status
+    // bar. BringUpPanel is idempotent; promoted_ keeps the build one-shot.
+    lcd->BringUpPanel();
+    BuildRawDrawUi(lcd);
+    UpdateStatusBarForUi();
+    promoted_.store(true, std::memory_order_release);
+    promote_requested_.store(false, std::memory_order_release);
+    ESP_LOGI(kTag, "Boot path: promoted to interactive");
+    // A promotion via the config path (F21) arrives with the AP already up
+    // but nothing on screen: re-render the provisioning page now that the
+    // UI exists.
+    if (WifiManager::GetInstance().IsConfigMode()) {
+        auto& wifi = WifiManager::GetInstance();
+        RegisterProvisioningStateCallback();
+        rawdraw_ui_manager_->ShowWifiConfigPage(wifi.GetApSsid(),
+                                                wifi.GetApPassword(),
+                                                wifi.GetApWebUrl());
     }
 }
 
@@ -554,6 +611,10 @@ void Application::NoteButtonActivity() {
     Board::GetInstance().FlashActivityLed();
     if (rawdraw_ui_manager_) {
         rawdraw_ui_manager_->RequestActivePageRefresh();
+    } else {
+        // Someone is in front of the device: a quiet boot must gain its UI
+        // and panel (F20). Request only — the main loop owns construction.
+        RequestPromotion();
     }
     // The policy's idle clock starts here: until now no interaction ever
     // reset the sleep timer, so a device mid-use could doze off.
@@ -563,6 +624,11 @@ void Application::NoteButtonActivity() {
 void Application::EnterWifiConfigMode() {
     wifi_connected_.store(false, std::memory_order_release);
     ESP_LOGI(kTag, "Entering WiFi config mode by long press");
+    // The config page is rendered by the UI manager and AP mode blocks
+    // sleeping: on a quiet boot ask the main loop to promote first, or the
+    // AP comes up with a blank panel that drains until dead (F21). The
+    // promotion re-renders the page once the UI exists.
+    RequestPromotion();
     WifiManager::GetInstance().StartConfigAp();
     if (rawdraw_ui_manager_ && WifiManager::GetInstance().IsConfigMode()) {
         auto& wifi = WifiManager::GetInstance();
@@ -720,6 +786,12 @@ void Application::ServicePowerPolicy() {
     }
 
     if (!d.sleep) {
+        // Held awake on mains: this boot will never sleep again, so a quiet
+        // boot must gain its UI and panel now — otherwise the device sits
+        // awake with no screen and no way back except a power cycle (F20).
+        if (in.mains) {
+            RequestPromotion();
+        }
         ESP_LOGI(kTag, "Stay awake (%u ms)", d.stay_awake_ms);
         RearmPowerTimer(d.stay_awake_ms);
         return;
@@ -800,7 +872,11 @@ void Application::EnterManualSleep() {
 }
 
 void Application::Run() {
+    // Reached on both paths (main.cc calls this unconditionally after
+    // Initialize), in the app_main task — which is why ServicePromotion can
+    // own UI construction here: no other task touches the manager pointer.
     while (true) {
+        ServicePromotion();
         if (rawdraw_ui_manager_) {
             rawdraw_ui_manager_->PumpClockRefresh();
         }

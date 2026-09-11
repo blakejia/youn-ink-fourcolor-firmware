@@ -32,7 +32,7 @@ public:
     void Initialize(bool quiet);
     // True on a timer-wake duty-cycle boot. Set before Board::GetInstance()
     // so the board ctor can skip the panel bring-up.
-    bool IsQuietBoot() const { return quiet_boot_; }
+    bool IsQuietBoot() const { return quiet_boot_.load(std::memory_order_acquire); }
     void Run();
 
     DeviceState GetDeviceState() const { return state_.load(std::memory_order_acquire); }
@@ -85,8 +85,9 @@ private:
     std::unique_ptr<ui::RawDrawUiManager> rawdraw_ui_manager_;
     esp_timer_handle_t sleep_timer_ = nullptr;
     // Timer-wake duty cycle (provisioned AND paired only); the board ctor
-    // reads this via IsQuietBoot() to skip the panel bring-up.
-    bool quiet_boot_ = false;
+    // reads this via IsQuietBoot() to skip the panel bring-up. Atomic: set
+    // once in Initialize, read from the WiFi/esp_timer tasks afterwards.
+    std::atomic<bool> quiet_boot_{false};
     // esp_timer ms of the last button activity; the policy's idle clock reads
     // this. Zero at boot (fresh boots land inside the grace window, which is
     // what keeps BOOT wakes awake); negative = quiet wake, grace suppressed.
@@ -102,6 +103,12 @@ private:
     // the timer: an arm from that task mid-cycle would fire mid-cycle, which
     // the cycle's entry-stop cannot cover.
     std::atomic<bool> cycle_in_progress_{false};
+    // Quiet→interactive promotion latch. Requested from the policy (mains),
+    // button activity, or config-AP entry — all outside the main-loop task,
+    // which alone owns UI construction (Run() consumes the request).
+    // promoted_ makes it one-shot per boot; both atomics, no lock needed.
+    std::atomic<bool> promote_requested_{false};
+    std::atomic<bool> promoted_{false};
     // (The sync-failure backoff streak is NOT here: it lives in RTC memory
     // via rf_fail_streak_*, because RAM is cleared on every deep-sleep wake.)
     // Set by RunPowerCycle immediately before page_sync_sync_once(); consumed
@@ -121,6 +128,11 @@ private:
     void OnPowerTimer();
     // Build the UI manager and register the settings page (interactive only).
     void BuildRawDrawUi(CustomLcdDisplay* lcd);
+    // Ask the main loop to promote a quiet boot (build UI + bring up panel).
+    // Quiet-only and idempotent; safe from any task.
+    void RequestPromotion();
+    // Main-loop side: consume a pending promotion. Owns UI construction.
+    void ServicePromotion();
     void EnterManualSleep();
     void NoteButtonActivity();
     void EnterWifiConfigMode();
