@@ -926,10 +926,10 @@ so browsing cannot fight the schedule."
 **Files:**
 - Modify: `firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.cc`
 - Modify: `firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.h`
-- Modify: `firmware/main/boards/zectrix-s3-epaper-4.2/zectrix-s3-epaper-4.2.cc`（`CreateDisplay` 加参数）
+- Modify: `firmware/main/boards/zectrix-s3-epaper-4.2/zectrix-s3-epaper-4.2.cc`（`InitializeLcdDisplay` 加参数）
 
 **Interfaces:**
-- Produces: `CustomLcdDisplay::BringUpPanel()`（幂等：`EPD_Init()` + `EPD_Clear()` + 首帧 `EPD_Display()` + `prev_buffer_synced = true` + `rf_panel_watch_refresh()`）。
+- Produces: `CustomLcdDisplay::BringUpPanel()`（幂等：`EPD_Init()` + `EPD_Clear()` + 首帧 `EPD_Display()` + `prev_buffer_synced = true`）。
 - 构造函数不再做面板上电动作，只分配 framebuffer/mutex/refresh task。
 
 - [ ] **Step 1: 记录当前行为（作为对照基线，不是测试）**
@@ -969,7 +969,7 @@ void CustomLcdDisplay::BringUpPanel() {
 
 头文件加 `void BringUpPanel();` 与 `bool panel_brought_up_ = false;`。
 
-板级 `CreateDisplay(...)` 增加参数 `bool bring_up_panel`，在 `new CustomLcdDisplay(...)` 之后按参数调用 `display_->BringUpPanel()`；**冷启动与交互路径传 `true`，quiet 路径传 `false`**。
+板级的 `InitializeLcdDisplay(...)`（`zectrix-s3-epaper-4.2.cc:334`，只被 `Initialize()` 第 73 行调用；计划文本里的 `CreateDisplay` 是我写错的名字）增加参数 `bool bring_up_panel = true`，在 `new CustomLcdDisplay(...)` 之后按参数调用 `display_->BringUpPanel()`；**冷启动与交互路径用默认值 `true`，quiet 路径传 `false`**。
 
 - [ ] **Step 3: 构建确认通过**
 
@@ -1030,13 +1030,13 @@ reset path is unchanged; only the quiet wake can now skip it entirely."
 
 - [ ] **Step 3: 板级按 quiet 建屏**
 
-`zectrix-s3-epaper-4.2.cc` 的 `CreateDisplay(...)` 调用改为 `CreateDisplay(..., /*bring_up_panel=*/!quiet)`。
+`zectrix-s3-epaper-4.2.cc` 的 `InitializeLcdDisplay(...)` 调用改为 `InitializeLcdDisplay(/*bring_up_panel=*/!quiet)`。
 
 - [ ] **Step 4: 构建 + 真机确认 quiet 路径**
 
 Run: `source ~/data/esp-idf-v6.0/export.sh && cd firmware && KEY=$(grep -oP '^MASTER_KEY=\K.*' ../server/.env) && rm -rf build && idf.py -DDEVICE_MASTER_KEY="$KEY" build`
 烧录后拔电、等一次定时唤醒，抓日志：
-Expected: 出现 `Boot path: quiet (wakeup cause=1)`，且**没有** `EPD bring-up`、没有 `RawDrawUiManager: RawDraw UI Manager initialized`；从启动到 `WiFi connected` 明显短于交互路径（对照日志时间戳）。
+Expected: 出现 `Boot path: quiet (wakeup cause=1)`，且**没有** `CustomLcdDisplay: EPD busy wait` 那组 5/10/15 秒告警、没有 `RawDrawUiManager: RawDraw UI Manager initialized`；从启动到 `WiFi connected` 明显短于交互路径（对照日志时间戳）。注意：`custom_lcd_display.cc` 内部 `#undef` 了 `ESP_LOGI`，所以**不能**用 `EPD bring-up` 之类 INFO 标记作为判据（Task 5 实现时发现）。
 
 - [ ] **Step 5: 提交**
 
@@ -1136,6 +1136,8 @@ void Application::ServicePowerPolicy() {
 - [ ] **Step 3: 唤醒时的同步顺序与通知**
 
 `Application::Run()`（或一个 `RunQuietCycleOnce()`，由 quiet 启动路径调用一次）按顺序：`page_sync_sync_once()` → 缓存结果并更新 `fail_streak`（成功清零）→ `notify_request_next()` → `page_sync_paint_if_changed()` → `ServicePowerPolicy()`。
+
+`page_sync_paint_if_changed()` **无条件调用**（即使排期为空）——空排期时它负责把"未配置画板页"提示画上去并记录，这正是 `page_sync_start()` 声称拥有屏幕的依据（Task 4 review 的结论）。
 
 `rf_rails_audio(1)` 在需要放音或进入交互模式时调用；quiet 循环不放音则保持关闭。
 
