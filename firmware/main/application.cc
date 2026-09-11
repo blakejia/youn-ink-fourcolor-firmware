@@ -210,7 +210,31 @@ Application::~Application() {
     }
 }
 
-void Application::Initialize() {
+void Application::Initialize(bool quiet) {
+    // Quiet is honoured only on a provisioned AND paired device: the
+    // provisioning and pairing pages are rendered by the UI manager, so a
+    // quiet boot there would strand the user in a flow with no screen.
+    bool effective_quiet = quiet;
+    if (effective_quiet) {
+        const bool provisioned = !SsidManager::GetInstance().GetSsidList().empty();
+        char tok[65] = {0};
+        const bool paired = server_pairing_get_token(tok, sizeof(tok));
+        if (!provisioned || !paired) {
+            ESP_LOGI(kTag, "Quiet boot needs provisioning+pairing (provisioned=%d paired=%d), staying interactive",
+                     (int)provisioned, (int)paired);
+            effective_quiet = false;
+        }
+    }
+    // Store before Board::GetInstance(): the board ctor reads IsQuietBoot()
+    // to decide the panel bring-up.
+    quiet_boot_ = effective_quiet;
+    if (quiet_boot_) {
+        // Timer-wake duty cycle, not user activity: backdate the idle clock
+        // past the grace window so the policy computes the duty-cycle wake
+        // instead of holding the device inside the interactive grace window.
+        NoteQuietWake();
+    }
+
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
     TransitionLifecycle(kLifecycleBoot, "init");
@@ -222,8 +246,11 @@ void Application::Initialize() {
         return;
     }
 
-    audio_service_.Initialize(codec);
-    audio_service_.Start();
+    // A timer wake never plays UI sounds; the codec stays powered down.
+    if (!quiet_boot_) {
+        audio_service_.Initialize(codec);
+        audio_service_.Start();
+    }
 
     Display* display = board.GetDisplay();
     if (display == nullptr) {
@@ -233,7 +260,99 @@ void Application::Initialize() {
     }
 
 
-    auto* lcd = static_cast<CustomLcdDisplay*>(display);
+    // The UI manager owns the provisioning/pairing pages and the settings
+    // tree; a duty-cycle wake builds none of it (and the board ctor already
+    // skipped the panel bring-up behind IsQuietBoot()).
+    if (quiet_boot_) {
+        ESP_LOGI(kTag, "Quiet boot: UI manager skipped, panel bring-up skipped");
+    } else {
+        BuildRawDrawUi(static_cast<CustomLcdDisplay*>(display));
+    }
+
+    // Set up WiFi status callback to update StatusBar
+    board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
+        switch (event) {
+            case NetworkEvent::Connected:
+                ESP_LOGI(kTag, "WiFi connected: %s", data.c_str());
+                wifi_connected_.store(true, std::memory_order_release);
+                StartSntpClockSyncOnce();
+                StartServerPairingOnce();
+                // 已配对且配对任务不再运行（如重新配网后）时补一次 SyncIdle：
+                // Connected 此前没有任何跃迁，而 provisioned/ConfigModeExit 会把
+                // lifecycle 设成 WifiConnecting，且配对任务被 s_pairing_started
+                // 永久去重 → 永卡 WifiConnecting，自动休眠永久失效。
+                if (s_pairing_done.load()) {
+                    char tok[8] = {0};
+                    if (server_pairing_get_token(tok, sizeof(tok))) {
+                        Application::GetInstance().TransitionLifecycle(
+                            kLifecycleSyncIdle, "wifi reconnected, paired");
+                    }
+                }
+                UpdateStatusBarForUi();
+                // First cycle promptly after WiFi comes up — but as a timer,
+                // never inline: the cycle holds an HTTP sync plus a 15-25 s
+                // paint and would stall the WiFi event task, so it runs in
+                // the esp_timer task via the dispatcher below. Skip the arm
+                // while a cycle is already running: the cycle's entry-stop
+                // cannot cover an arm from this task mid-cycle, and the
+                // running cycle's terminal policy call re-arms anyway.
+                if (!cycle_in_progress_.load(std::memory_order_acquire)) {
+                    RearmPowerTimer(3000);
+                }
+                break;
+            case NetworkEvent::Disconnected:
+                ESP_LOGI(kTag, "WiFi disconnected");
+                wifi_connected_.store(false, std::memory_order_release);
+                UpdateStatusBarForUi();
+                break;
+            case NetworkEvent::Connecting:
+            case NetworkEvent::Scanning:
+                wifi_connected_.store(false, std::memory_order_release);
+                Application::GetInstance().TransitionLifecycle(
+                    kLifecycleWifiConnecting, "STA connecting");
+                UpdateStatusBarForUi();
+                break;
+            case NetworkEvent::WifiConfigModeEnter:
+                ESP_LOGI(kTag, "WiFi config mode entered: %s", data.c_str());
+                wifi_connected_.store(false, std::memory_order_release);
+                Application::GetInstance().TransitionLifecycle(
+                    kLifecycleApProvision, "config AP entered");
+                // 开机/无 base_url 路径也要注册回调，否则 ap_client_connected/
+                // provisioning/provisioned/error 全部无人接收（屏与状态机不动）。
+                RegisterProvisioningStateCallback();
+                if (rawdraw_ui_manager_) {
+                    auto& wifi = WifiManager::GetInstance();
+                    rawdraw_ui_manager_->ShowWifiConfigPage(wifi.GetApSsid(),
+                                                            wifi.GetApPassword(),
+                                                            wifi.GetApWebUrl());
+                }
+                UpdateStatusBarForUi();
+                break;
+            case NetworkEvent::WifiConfigModeExit:
+                wifi_connected_.store(WifiManager::GetInstance().IsConnected(),
+                                      std::memory_order_release);
+                Application::GetInstance().TransitionLifecycle(
+                    kLifecycleWifiConnecting, "config AP exited");
+                UpdateStatusBarForUi();
+                break;
+            case NetworkEvent::ModemDetecting:
+            case NetworkEvent::ModemErrorNoSim:
+            case NetworkEvent::ModemErrorRegDenied:
+            case NetworkEvent::ModemErrorInitFailed:
+            case NetworkEvent::ModemErrorTimeout:
+                wifi_connected_.store(false, std::memory_order_release);
+                UpdateStatusBarForUi();
+                break;
+        }
+    });
+
+    // Start network (non-blocking, WiFi connects asynchronously)
+    board.RequestNetwork();
+
+    SetDeviceState(kDeviceStateIdle);
+}
+
+void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
     rawdraw_ui_manager_ = std::make_unique<ui::RawDrawUiManager>();
     rawdraw_ui_manager_->Init(lcd, [lcd](const rawdraw::Rect&, bool urgent) {
         // Every UI-side repaint (page switch, dirty rect, clock) funnels through
@@ -296,86 +415,11 @@ void Application::Initialize() {
     ESP_LOGI(kTag, "Rawdraw gallery UI initialized");
     if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
         ESP_LOGI(kTag, "Wake from deep sleep: flash activity LED and refresh UI");
-        board.FlashActivityLed();
+        Board::GetInstance().FlashActivityLed();
         if (rawdraw_ui_manager_) {
             rawdraw_ui_manager_->RequestActivePageRefresh();
         }
     }
-
-    // Set up WiFi status callback to update StatusBar
-    board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
-        switch (event) {
-            case NetworkEvent::Connected:
-                ESP_LOGI(kTag, "WiFi connected: %s", data.c_str());
-                wifi_connected_.store(true, std::memory_order_release);
-                StartSntpClockSyncOnce();
-                StartServerPairingOnce();
-                // 已配对且配对任务不再运行（如重新配网后）时补一次 SyncIdle：
-                // Connected 此前没有任何跃迁，而 provisioned/ConfigModeExit 会把
-                // lifecycle 设成 WifiConnecting，且配对任务被 s_pairing_started
-                // 永久去重 → 永卡 WifiConnecting，自动休眠永久失效。
-                if (s_pairing_done.load()) {
-                    char tok[8] = {0};
-                    if (server_pairing_get_token(tok, sizeof(tok))) {
-                        Application::GetInstance().TransitionLifecycle(
-                            kLifecycleSyncIdle, "wifi reconnected, paired");
-                    }
-                }
-                UpdateStatusBarForUi();
-                // First policy evaluation promptly after WiFi comes up; the
-                // decision rearms the timer itself from here on.
-                RearmPowerTimer(3000);
-                break;
-            case NetworkEvent::Disconnected:
-                ESP_LOGI(kTag, "WiFi disconnected");
-                wifi_connected_.store(false, std::memory_order_release);
-                UpdateStatusBarForUi();
-                break;
-            case NetworkEvent::Connecting:
-            case NetworkEvent::Scanning:
-                wifi_connected_.store(false, std::memory_order_release);
-                Application::GetInstance().TransitionLifecycle(
-                    kLifecycleWifiConnecting, "STA connecting");
-                UpdateStatusBarForUi();
-                break;
-            case NetworkEvent::WifiConfigModeEnter:
-                ESP_LOGI(kTag, "WiFi config mode entered: %s", data.c_str());
-                wifi_connected_.store(false, std::memory_order_release);
-                Application::GetInstance().TransitionLifecycle(
-                    kLifecycleApProvision, "config AP entered");
-                // 开机/无 base_url 路径也要注册回调，否则 ap_client_connected/
-                // provisioning/provisioned/error 全部无人接收（屏与状态机不动）。
-                RegisterProvisioningStateCallback();
-                if (rawdraw_ui_manager_) {
-                    auto& wifi = WifiManager::GetInstance();
-                    rawdraw_ui_manager_->ShowWifiConfigPage(wifi.GetApSsid(),
-                                                            wifi.GetApPassword(),
-                                                            wifi.GetApWebUrl());
-                }
-                UpdateStatusBarForUi();
-                break;
-            case NetworkEvent::WifiConfigModeExit:
-                wifi_connected_.store(WifiManager::GetInstance().IsConnected(),
-                                      std::memory_order_release);
-                Application::GetInstance().TransitionLifecycle(
-                    kLifecycleWifiConnecting, "config AP exited");
-                UpdateStatusBarForUi();
-                break;
-            case NetworkEvent::ModemDetecting:
-            case NetworkEvent::ModemErrorNoSim:
-            case NetworkEvent::ModemErrorRegDenied:
-            case NetworkEvent::ModemErrorInitFailed:
-            case NetworkEvent::ModemErrorTimeout:
-                wifi_connected_.store(false, std::memory_order_release);
-                UpdateStatusBarForUi();
-                break;
-        }
-    });
-
-    // Start network (non-blocking, WiFi connects asynchronously)
-    board.RequestNetwork();
-
-    SetDeviceState(kDeviceStateIdle);
 }
 
 void Application::OnUpClick() {
@@ -535,7 +579,7 @@ void Application::RearmPowerTimer(uint32_t delay_ms) {
     if (sleep_timer_ == nullptr) {
         esp_timer_create_args_t args = {};
         args.callback = [](void* arg) {
-            static_cast<Application*>(arg)->ServicePowerPolicy();
+            static_cast<Application*>(arg)->OnPowerTimer();
         };
         args.arg = this;
         args.dispatch_method = ESP_TIMER_TASK;
@@ -556,21 +600,58 @@ void Application::NoteQuietWake() {
     last_activity_ms_ = -1;
 }
 
+void Application::OnPowerTimer() {
+    // The timer fires for two reasons: (a) the first evaluation after WiFi
+    // comes up, which must run the one-shot sync/paint cycle — until this
+    // boot's cycle has run there is nothing to evaluate; (b) stay-awake
+    // re-arms (mains/grace/busy), which only need a policy re-check —
+    // re-running the HTTP sync plus a 15-25 s paint every 15/30/60 s would
+    // restore the chatter this redesign removes. So: cycle when one is due
+    // — never yet run this boot, or the server's poll interval has elapsed
+    // (a device left awake on mains must still rotate its canvas) — and a
+    // bare policy check otherwise.
+    if (cycle_in_progress_.load(std::memory_order_acquire)) {
+        // A WiFi reconnect armed this tick mid-cycle despite the guard in
+        // the connected path; the running cycle's terminal policy call
+        // re-arms, so just defer this tick past it.
+        RearmPowerTimer(3000);
+        return;
+    }
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    const uint32_t poll_s = page_sync_poll_s();
+    const bool never_ran = (last_cycle_ms_ < 0);
+    const bool interval_elapsed =
+        !never_ran && poll_s > 0 &&
+        (uint64_t)(now_ms - last_cycle_ms_) >= (uint64_t)poll_s * 1000u;
+    if (never_ran || interval_elapsed) {
+        RunPowerCycle();
+    } else {
+        ServicePowerPolicy();
+    }
+}
+
 void Application::RunPowerCycle() {
     // The one-shot duty-cycle step both boot paths share (Task 6 calls this
     // once per quiet wake). Each stage takes and releases the module locks
     // in turn — state -> display order holds, never nested — so there is no
     // lock-order risk across the sequence.
-    // The cycle must not be interruptible by its own re-arm timer: the timer
-    // callback is ServicePowerPolicy, and a mid-cycle evaluation could see
-    // stale sync state with an idle panel/audio and decide to sleep — cutting
-    // WiFi and the audio rail before anything is painted, forever repeating
-    // on every wake. Stop the timer here; the cycle's own final
-    // ServicePowerPolicy() call re-arms it, so there is no gap. This also
-    // makes the attempt-flag check-then-clear below single-threaded.
+    // The cycle must not be interruptible by its own re-arm timer: a mid-cycle
+    // evaluation could see stale sync state with an idle panel/audio and
+    // decide to sleep — cutting WiFi and the audio rail before anything is
+    // painted, forever repeating on every wake. Stop the timer here; the
+    // cycle's own final ServicePowerPolicy() call re-arms it, so there is no
+    // gap. This also makes the attempt-flag check-then-clear below
+    // single-threaded. (The dispatcher and the WiFi connected path carry a
+    // cycle_in_progress_ guard on top, for arms that land mid-cycle anyway.)
     if (sleep_timer_ != nullptr) {
         esp_timer_stop(sleep_timer_);
     }
+    // Visible to the WiFi connected path (different task): while this is set
+    // it must not arm the timer, and the dispatcher above defers instead of
+    // evaluating. Cleared after the terminal policy call returns (the sleep
+    // path never returns, but RAM dies with it, so no stale set survives).
+    cycle_in_progress_.store(true, std::memory_order_release);
+    last_cycle_ms_ = esp_timer_get_time() / 1000;
     // The backoff streak lives in RTC memory (rf_fail_streak_*) because RAM
     // is cleared on every wake. Mark the attempt and snapshot its outcome
     // here so the policy consumes this cycle's result — never a re-read that
@@ -583,6 +664,7 @@ void Application::RunPowerCycle() {
     // claim honest.
     page_sync_paint_if_changed();
     ServicePowerPolicy();
+    cycle_in_progress_.store(false, std::memory_order_release);
 }
 
 void Application::ServicePowerPolicy() {

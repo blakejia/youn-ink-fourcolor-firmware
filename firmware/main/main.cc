@@ -10,6 +10,7 @@
 #include <freertos/task.h>
 
 #include "application.h"
+#include "shim_power.h"
 #include "system_info.h"
 
 #define TAG "main"
@@ -35,9 +36,10 @@ static void LogNvsStats() {
 
 extern "C" void app_main(void)
 {
-    // Some soft/external reset paths leave the Wi-Fi RF state dirty until the
-    // next hardware-equivalent reset. For those reset reasons only, perform a
-    // brief deep-sleep round-trip once to come back with clean radio state.
+    // True when this boot is the return trip of the soft-reset bounce below:
+    // it wakes via the 500 ms timer, but it is a restarted interactive boot,
+    // never a duty-cycle wake.
+    bool is_bounce_return = false;
     {
         const auto reason = esp_reset_reason();
         ESP_LOGI(TAG, "Boot reset reason=%d bounced=%d", reason, s_sw_reset_bounced ? 1 : 0);
@@ -53,6 +55,7 @@ extern "C" void app_main(void)
             esp_sleep_enable_timer_wakeup(500000ULL);  // 500 ms
             esp_deep_sleep_start();
         }
+        is_bounce_return = s_sw_reset_bounced;
         s_sw_reset_bounced = false;
     }  // clear for next time
 
@@ -66,7 +69,13 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(ret);
     LogNvsStats();
 
+    // A timer wake is a duty-cycle wake: nothing on the panel changes unless a
+    // page boundary passed, so skip the UI, provisioning and panel bring-up.
+    const int wake_cause = rf_wakeup_cause();
+    const bool quiet_boot = (wake_cause == 1) && !is_bounce_return;
+    ESP_LOGI(TAG, "Boot path: %s (wakeup cause=%d)", quiet_boot ? "quiet" : "interactive",
+             wake_cause);
     auto& app = Application::GetInstance();
-    app.Initialize();
+    app.Initialize(quiet_boot);
     app.Run();  // This function runs the main event loop and never returns
 }
