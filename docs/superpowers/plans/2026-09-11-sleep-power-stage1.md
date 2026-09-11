@@ -1024,9 +1024,11 @@ reset path is unchanged; only the quiet wake can now skip it entirely."
 
 - [ ] **Step 2: Application 侧分流**
 
-`Application::Initialize(bool quiet)` 存储 `quiet_boot_ = quiet`，并在 quiet 时跳过：`rawdraw_ui_manager_` 创建与 Settings 注册、`audio_service_.Initialize/Start`、配网检查（`NEEDS_PROVISION` 分支保持：没有凭据时即便 quiet 也要走配网，否则永远连不上）。
+`Application::Initialize(bool quiet)` 存储 `quiet_boot_ = quiet`，并在 quiet 时跳过：`rawdraw_ui_manager_` 创建与 Settings 注册、`audio_service_.Initialize/Start`，并把 `false` 传给 `InitializeLcdDisplay`（面板不做 bring-up）。
 
-交互路径与现状完全一致。qui​​et 路径仍需：`WifiManager` 启动、`server_pairing` 任务、`StartSntpClockSyncOnce`、`page_sync` 初始化。
+**quiet 只在"已配网且已配对"时才生效**：`SsidManager` 有凭据且 `server_pairing_get_token()` 非空。否则强制回落到交互路径并打一行日志——配网页与配对页都靠 `rawdraw_ui_manager_` 渲染，quiet 路径下用户看不到 AP 名/密码/配网地址，设备会静默卡死在一个没有界面的配网流程里。
+
+两条路径都要跑**同一个一次性周期**（顺序见 Task 7）：`page_sync_sync_once()` → `notify_request_next()` → `page_sync_paint_if_changed()` → `ServicePowerPolicy()`。`quiet` 只影响三件事：是否建 UI/音频、面板是否 bring-up、以及启动后是进入交互宽限还是直接按占空比算下一次唤醒。交互路径同样需要这一步——原来画板首次绘制是轮询任务的第一个 tick 做的，循环删掉之后没人画了。
 
 - [ ] **Step 3: 板级按 quiet 建屏**
 
