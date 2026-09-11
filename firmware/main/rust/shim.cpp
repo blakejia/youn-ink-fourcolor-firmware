@@ -183,7 +183,7 @@ extern "C" int rf_http_get(const char *url, const char *token, char *buf, int *l
 
 extern "C" int rf_http_post_json(const char *url, const char *token, const char *body,
                                  char *buf, int *len, int timeout_ms) {
-    return http_wrapper_post_json(url, token, body, buf, len, timeout_ms);
+    return http_wrapper_post_json(url, token, body, nullptr, 0, buf, len, timeout_ms);
 }
 
 // ─────────────────────────── pairing helpers ───────────────────────────

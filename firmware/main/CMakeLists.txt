@@ -56,7 +56,6 @@ set(SOURCES
     "common/photo_storage.cc"
     "common/photo_downloader.cc"
     "common/storage_manager.cc"
-    "common/nvs_state.cc"
     "common/bluetooth_manager.cc"
     "common/ble_gatt_service.cc"
     "common/ble_image_receiver.cc"

@@ -230,7 +230,7 @@ static bool do_pair_start(const char *device_id, char *code_out, int code_out_le
 
     char resp[512];
     int resp_len = sizeof(resp);
-    int status = http_wrapper_post_json_with_headers(
+    int status = http_wrapper_post_json(
         url, NULL, body, extra, 4, resp, &resp_len, kHttpTimeoutMs);
     if (status < 0) {
         ESP_LOGE(kTag, "pair-start 网络错误");
@@ -281,7 +281,7 @@ static int do_pair_claim(const char *device_id, const char *code,
     char resp[512];
     int resp_len = sizeof(resp);
 
-    int status = http_wrapper_post_json(url, NULL, body, resp, &resp_len, kHttpTimeoutMs);
+    int status = http_wrapper_post_json(url, NULL, body, nullptr, 0, resp, &resp_len, kHttpTimeoutMs);
     if (status != 200 && status != 401) {
         ESP_LOGW(kTag, "pair-claim HTTP %d（可能网络错误）", status);
         return status;

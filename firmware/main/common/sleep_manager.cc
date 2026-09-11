@@ -1,10 +1,8 @@
 #include "sleep_manager.h"
 
 #include <atomic>
-#include <mutex>
 
 #include <esp_timer.h>
-#include <esp_sleep.h>
 
 #include "application.h"
 
@@ -17,11 +15,7 @@ int64_t NowMs() {
 class SleepManagerImpl {
 public:
     std::atomic<uint32_t> busy_mask{0};
-    std::atomic<int> hold_count{0};
     std::atomic<int64_t> deadline_ms{0};
-
-    std::mutex hook_mutex;
-    std::function<bool()> pre_sleep_hook;
 };
 
 static SleepManagerImpl g_sm;
@@ -50,35 +44,12 @@ void SleepManager::Kick(uint32_t delay_ms, const char* /*reason*/) {
     }
 }
 
-void SleepManager::Hold(const char* /*reason*/) {
-    g_sm.hold_count.fetch_add(1, std::memory_order_acq_rel);
-}
-
-void SleepManager::Release(const char* /*reason*/) {
-    int cur = g_sm.hold_count.load(std::memory_order_acquire);
-    while (true) {
-        if (cur <= 0) {
-            g_sm.hold_count.store(0, std::memory_order_release);
-            return;
-        }
-        if (g_sm.hold_count.compare_exchange_weak(cur, cur - 1,
-                                                  std::memory_order_acq_rel,
-                                                  std::memory_order_acquire)) {
-            return;
-        }
-    }
-}
-
 bool SleepManager::CanSleepNow() const {
     if (!Application::GetInstance().CanEnterSleepMode()) {
         return false;
     }
 
     if (g_sm.busy_mask.load(std::memory_order_acquire) != 0) {
-        return false;
-    }
-
-    if (g_sm.hold_count.load(std::memory_order_acquire) > 0) {
         return false;
     }
 
@@ -89,49 +60,4 @@ bool SleepManager::CanSleepNow() const {
     }
 
     return true;
-}
-
-bool SleepManager::PrepareForLightSleep() {
-    if (!CanSleepNow()) {
-        return false;
-    }
-
-    std::function<bool()> hook;
-    {
-        std::lock_guard<std::mutex> lock(g_sm.hook_mutex);
-        hook = g_sm.pre_sleep_hook;
-    }
-    if (hook) {
-        if (!hook()) {
-            return false;
-        }
-    }
-    return true;
-}
-
-int64_t SleepManager::ScheduleTimerWakeup(int64_t fallback_delay_ms) {
-    if (fallback_delay_ms <= 0) {
-        return 0;
-    }
-
-    const int64_t wake_ms = fallback_delay_ms <= 0 ? 1000 : fallback_delay_ms;
-    esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(wake_ms) * 1000ULL);
-    return wake_ms;
-}
-
-void SleepManager::SetPreSleepHook(std::function<bool()> hook) {
-    std::lock_guard<std::mutex> lock(g_sm.hook_mutex);
-    g_sm.pre_sleep_hook = std::move(hook);
-}
-
-uint32_t SleepManager::GetBusyMask() const {
-    return g_sm.busy_mask.load(std::memory_order_acquire);
-}
-
-int SleepManager::GetHoldCount() const {
-    return g_sm.hold_count.load(std::memory_order_acquire);
-}
-
-int64_t SleepManager::GetDeadlineMs() const {
-    return g_sm.deadline_ms.load(std::memory_order_acquire);
 }

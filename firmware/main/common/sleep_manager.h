@@ -1,19 +1,18 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
 
-// Busy sources must include at least NET/AUDIO/DISPLAY/UI/NVS/TODO.
+// Busy sources. Only the two that actually vote: the panel reports Display
+// while a refresh is pending or in flight (CustomLcdDisplay::UpdateDisplayBusyLocked),
+// the audio service reports Audio while a stream is open. Both reach the sleep
+// decision through CanSleepNow() -> `busy` in rf_power_decide.
 enum class SleepBusySrc : uint32_t {
-    Net     = 1u << 0,
-    Audio   = 1u << 1,
-    Display = 1u << 2,
-    Ui      = 1u << 3,
-    Nvs     = 1u << 4,
-    Todo    = 1u << 5,
-    Protocol = 1u << 6,
+    Audio   = 1u << 0,
+    Display = 1u << 1,
 };
 
+// The "may I sleep" mechanism only — the policy lives in power.rs
+// (rf_power_decide), which is where the decision is unit-tested.
 class SleepManager {
 public:
     static SleepManager& GetInstance();
@@ -24,64 +23,18 @@ public:
     // Sleep delay deadline: extend to max(now + delay_ms).
     void Kick(uint32_t delay_ms, const char* reason = nullptr);
 
-    // Hold/Release: link-level blocking (press-to-talk, wake key chains, etc.)
-    void Hold(const char* reason = nullptr);
-    void Release(const char* reason = nullptr);
-
-    // Gate: busy == 0 && hold == 0 && now >= deadline
+    // Gate: busy == 0 && now >= deadline (plus Application::CanEnterSleepMode).
     bool CanSleepNow() const;
-
-    // Called right before light sleep. No business logic here.
-    // Returns false if sleep should be aborted.
-    bool PrepareForLightSleep();
-
-    // Configure timer wakeup using the shorter of fallback_delay_ms and the
-    // next pending todo reminder wake point.
-    int64_t ScheduleTimerWakeup(int64_t fallback_delay_ms);
-
-    // Optional hook for pre-sleep actions (e.g., wifi stop).
-    // Return false to abort sleep.
-    void SetPreSleepHook(std::function<bool()> hook);
-
-    // Debug/inspection helpers
-    uint32_t GetBusyMask() const;
-    int GetHoldCount() const;
-    int64_t GetDeadlineMs() const;
 
 private:
     SleepManager() = default;
 };
 
-// C-style wrappers (requested sm_* API)
+// C-style wrappers
 inline void sm_set_busy(SleepBusySrc src, bool busy) {
     SleepManager::GetInstance().SetBusy(src, busy);
 }
 
 inline void sm_kick(uint32_t delay_ms, const char* reason = nullptr) {
     SleepManager::GetInstance().Kick(delay_ms, reason);
-}
-
-inline void sm_hold(const char* reason = nullptr) {
-    SleepManager::GetInstance().Hold(reason);
-}
-
-inline void sm_release(const char* reason = nullptr) {
-    SleepManager::GetInstance().Release(reason);
-}
-
-// Alias for a typo in requirements (sg_release).
-inline void sg_release(const char* reason = nullptr) {
-    sm_release(reason);
-}
-
-inline bool sm_can_sleep_now() {
-    return SleepManager::GetInstance().CanSleepNow();
-}
-
-inline bool sm_prepare_for_light_sleep() {
-    return SleepManager::GetInstance().PrepareForLightSleep();
-}
-
-inline int64_t sm_schedule_timer_wakeup(int64_t fallback_delay_ms) {
-    return SleepManager::GetInstance().ScheduleTimerWakeup(fallback_delay_ms);
 }
