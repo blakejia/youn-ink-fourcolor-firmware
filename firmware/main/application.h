@@ -82,8 +82,8 @@ private:
     // what keeps BOOT wakes awake); negative = quiet wake, grace suppressed.
     // A member, not a timer-local static, so it survives across callbacks.
     int64_t last_activity_ms_ = 0;
-    // Consecutive page_sync_sync_once() failures; feeds the policy backoff.
-    uint32_t fail_streak_ = 0;
+    // (The sync-failure backoff streak is NOT here: it lives in RTC memory
+    // via rf_fail_streak_*, because RAM is cleared on every deep-sleep wake.)
 
     void RearmPowerTimer(uint32_t delay_ms);
     void EnterManualSleep();

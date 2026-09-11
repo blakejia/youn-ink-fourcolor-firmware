@@ -87,6 +87,9 @@ unsafe extern "C" {
     pub fn rf_panel_record_get(out: *mut u8);
     pub fn rf_panel_mark_pending(md5: *const c_char, index: c_int);
     pub fn rf_panel_record_invalidate();
+    /// Consecutive sync failures, persisted in RTC memory on device.
+    pub fn rf_fail_streak_get() -> u32;
+    pub fn rf_fail_streak_set(streak: u32);
     /// 0 = other, 1 = timer, 2 = ext0(BOOT), 3 = ext1(charger insert).
     pub fn rf_wakeup_cause() -> c_int;
     /// Audio + amp rail. Nonzero = on.
@@ -245,6 +248,7 @@ pub(crate) mod host {
         FB.lock().unwrap_or_else(|e| e.into_inner()).take();
         ALLOCS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *FAIL_STREAK.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         AUDIO_ON.store(true, std::sync::atomic::Ordering::SeqCst);
         guard
     }
@@ -255,6 +259,8 @@ pub(crate) mod host {
     /// so readers must key the hint on the index (-1) only, never on the md5.
     static PANEL_REC: Mutex<Option<(u32, u8, Vec<u8>, i32)>> = Mutex::new(None);
     // rf_panel_record_get writes 48 bytes; see rf_panel_record_t.
+    /// Consecutive schedule-sync failures (mirrors the device RTC word).
+    static FAIL_STREAK: Mutex<u32> = Mutex::new(0);
     static AUDIO_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     /// Same value as RF_PANEL_MAGIC in shim_power.h; the stub must mirror the
     /// device record exactly (magic@0, valid@4, md5@8, index@44).
@@ -299,6 +305,16 @@ pub(crate) mod host {
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_panel_record_invalidate() {
         *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_fail_streak_get() -> u32 {
+        *FAIL_STREAK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_fail_streak_set(streak: u32) {
+        *FAIL_STREAK.lock().unwrap_or_else(|e| e.into_inner()) = streak;
     }
 
     #[unsafe(no_mangle)]

@@ -340,6 +340,21 @@ extern "C" void rf_panel_record_invalidate(void) {
     portEXIT_CRITICAL(&g_panel_mux);
 }
 
+// Consecutive schedule-sync failures feeding the power-policy backoff. RTC
+// memory: every duty-cycle sleep is a reboot, so a RAM counter would reset on
+// each wake and the backoff ladder (60, 120, 240, …) could never climb —
+// the device would boot ~720 times a day against a dead server instead of
+// ~24. Lost on power-on (zeroed), which is the correct fresh start.
+RTC_DATA_ATTR static uint32_t g_fail_streak;
+
+extern "C" uint32_t rf_fail_streak_get(void) {
+    return g_fail_streak;
+}
+
+extern "C" void rf_fail_streak_set(uint32_t streak) {
+    g_fail_streak = streak;
+}
+
 extern "C" int rf_wakeup_cause(void) {
     // esp_sleep_get_wakeup_cause() is deprecated in v6.0; the replacement
     // returns a bitmap whose bit index is the esp_sleep_wakeup_cause_t value.

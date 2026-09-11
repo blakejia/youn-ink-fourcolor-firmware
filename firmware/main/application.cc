@@ -186,10 +186,10 @@ void ServerPairingTaskTrampoline(void*) {
     vTaskDelete(nullptr);
 }
 
-// Charger-insert deep-sleep wake (ext1). The unplugged level of
-// CHARGE_DETECT_GPIO is an assumption, not a measured fact: see
-// CHARGE_DETECT_PLUG_PULLS_LOW in config.h — if the matrix shows the idle
-// level is LOW, flip the constant and this follows.
+// Charger-insert deep-sleep wake (ext1). The level follows charge_status.cc's
+// convention (attach = HIGH, unplugged = LOW); the sleep log prints the raw
+// pin so the matrix confirms it. If the hardware disagrees, flip
+// CHARGE_DETECT_PLUG_PULLS_LOW in config.h and this follows.
 void EnableChargerInsertWakeup() {
     // v6.0 deprecates esp_sleep_enable_ext1_wakeup in favour of the _io pair.
 #if CHARGE_DETECT_PLUG_PULLS_LOW
@@ -561,12 +561,10 @@ void Application::RunPowerCycle() {
     // once per quiet wake). Each stage takes and releases the module locks
     // in turn — state -> display order holds, never nested — so there is no
     // lock-order risk across the sequence.
-    const bool ok = page_sync_sync_once();
-    if (ok) {
-        fail_streak_ = 0;
-    } else {
-        ++fail_streak_;
-    }
+    // The sync result is observed via page_sync_sync_ok() in
+    // ServicePowerPolicy below; the backoff streak itself lives in RTC
+    // memory (rf_fail_streak_*), because RAM is cleared on every wake.
+    page_sync_sync_once();
     notify_request_next();
     // Unconditional, even on an empty schedule: that call draws and records
     // the empty hint, which is what makes the canvas's display-ownership
@@ -597,7 +595,12 @@ void Application::ServicePowerPolicy() {
     in.max_sleep_s = (uint32_t)nvs.GetInt("max_sleep_min", 60) * 60u;
     in.poll_s = page_sync_poll_s();
     in.sleep_poll_s = page_sync_sleep_poll_s();
-    in.fail_streak = fail_streak_;
+    // RTC-persisted across deep sleep (RAM is cleared on every wake, so a
+    // member counter could never climb the ladder). Read BEFORE the decision
+    // so the first failure sleeps 60 s (streak 0), then 120, 240, …; the
+    // store below advances it only after this read.
+    const uint32_t streak = rf_fail_streak_get();
+    in.fail_streak = streak;
     // -1 means unknown/empty schedule; decide() maps negatives to None and
     // sleeps for the cap. Never pre-clamp to 0 here: 0 reads as "a page
     // changes right now" and floors at 60 s.
@@ -605,6 +608,14 @@ void Application::ServicePowerPolicy() {
 
     rf_power_decision_t d = {};
     rf_power_decide(&in, &d);
+    // Persist the ladder step for the NEXT wake now that this decision has
+    // consumed the read above: success resets to 0, failure climbs (capped;
+    // decide() itself caps the shift at 5, this just keeps the word sane).
+    if (page_sync_sync_ok()) {
+        rf_fail_streak_set(0);
+    } else {
+        rf_fail_streak_set(streak + 1 > 8 ? 8 : streak + 1);
+    }
 
     if (!d.sleep) {
         ESP_LOGI(kTag, "Stay awake (%u ms)", d.stay_awake_ms);
@@ -614,8 +625,13 @@ void Application::ServicePowerPolicy() {
     if (d.invalidate_panel) {
         rf_panel_record_invalidate();
     }
-    ESP_LOGI(kTag, "Deep sleep %u s (mains=%d sync_ok=%d)", d.wake_s,
-             (int)in.mains, (int)in.sync_ok);
+    // pin2 is the raw CHARGE_DETECT_GPIO level: expect 0 while unplugged
+    // (attach drives HIGH per charge_status.cc), and mains must read 0 on
+    // battery. If the matrix disagrees, the fix is CHARGE_DETECT_PLUG_PULLS_LOW
+    // plus, if needed, charge_status's inversion — no pull is added here
+    // deliberately (the level belongs to the charger IC's own network).
+    ESP_LOGI(kTag, "Deep sleep %u s (mains=%d sync_ok=%d pin2=%d)", d.wake_s,
+             (int)in.mains, (int)in.sync_ok, gpio_get_level(CHARGE_DETECT_GPIO));
     TransitionLifecycle(kLifecycleSleep, "power policy");
     wifi_connected_.store(false, std::memory_order_release);
     // Amp off before audio power off (silent), then radio off.
@@ -625,7 +641,7 @@ void Application::ServicePowerPolicy() {
     esp_sleep_enable_timer_wakeup((uint64_t)d.wake_s * 1000000ULL);
     esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_BUTTON_GPIO, 0);
     // Sleeping on mains is unreachable (decide() holds awake there), so the
-    // charger pin is high here and ANY_LOW fires on plug-in. See config.h.
+    // charger pin reads low here and ANY_HIGH fires on plug-in. See config.h.
     EnableChargerInsertWakeup();
     esp_deep_sleep_start();
 }
@@ -673,7 +689,8 @@ void Application::EnterManualSleep() {
     vTaskDelay(pdMS_TO_TICKS(300));
     esp_sleep_enable_ext0_wakeup(static_cast<gpio_num_t>(BOOT_BUTTON_GPIO), 0);
     // Charger-insert wake like the policy path — but only while actually
-    // unplugged: asleep-on-mains with ANY_LOW armed would wake instantly.
+    // unplugged: asleep-on-mains with the charger level armed would wake
+    // instantly.
     if (!Board::GetInstance().IsPowerPresent()) {
         EnableChargerInsertWakeup();
     }

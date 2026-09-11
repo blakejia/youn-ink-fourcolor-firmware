@@ -34,6 +34,13 @@ void rf_panel_record_invalidate(void);
 /* 0 = 其它, 1 = timer 唤醒, 2 = ext0(BOOT), 3 = ext1(充电插入) */
 int  rf_wakeup_cause(void);
 
+
+/* Consecutive schedule-sync failures, persisted in RTC memory across deep
+ * sleep (RAM is cleared on every wake, so a plain counter could never climb
+ * the backoff ladder). The policy reads it before deciding and stores the
+ * update right after: success stores 0, failure stores min(streak + 1, 8). */
+uint32_t rf_fail_streak_get(void);
+void rf_fail_streak_set(uint32_t streak);
 void rf_rails_audio(int on);   /* 音频 + 功放 */
 
 #ifdef __cplusplus
