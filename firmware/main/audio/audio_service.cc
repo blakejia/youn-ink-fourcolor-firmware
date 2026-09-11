@@ -1,8 +1,9 @@
 #include "audio_service.h"
+
+#include "common/sleep_manager.h"
 #include <esp_log.h>
 #include <cstring>
 
-#include "common/sleep_manager.h"
 #include "processors/no_audio_processor.h"
 
 #define TAG "AudioService"

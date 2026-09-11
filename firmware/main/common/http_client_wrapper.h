@@ -29,8 +29,8 @@ typedef struct {
  *
  * @param url       Full URL
  * @param token     Bearer token (NULL = public endpoint)
- * @param out_buf   Response body buffer
- * @param out_len   [in] buffer size / [out] actual response length
+ * @param out_buf   Response body buffer (must hold *out_len bytes)
+ * @param out_len   [in] buffer capacity including the NUL / [out] payload length
  * @param timeout_ms timeout in milliseconds
  * @return HTTP status code, -1 for network/connection error
  */
@@ -43,8 +43,8 @@ int http_wrapper_get(const char *url, const char *token,
  * @param url        Full URL
  * @param token      Bearer token (NULL = public endpoint)
  * @param json_body  JSON request body string
- * @param out_buf    Response body buffer
- * @param out_len    [in] buffer size / [out] actual response length
+ * @param out_buf    Response body buffer (must hold *out_len bytes)
+ * @param out_len    [in] buffer capacity including the NUL / [out] payload length
  * @param timeout_ms timeout in milliseconds
  * @return HTTP status code, -1 for network/connection error
  */
@@ -61,7 +61,7 @@ int http_wrapper_post_json(const char *url, const char *token,
  * @param extra_headers Array of extra header key-value pairs (may be NULL)
  * @param extra_count   Number of extra headers (0 if extra_headers is NULL)
  * @param out_buf       Response body buffer
- * @param out_len       [in] buffer size / [out] actual response length
+ * @param out_len       [in] buffer capacity including the NUL / [out] payload length
  * @param timeout_ms    timeout in milliseconds
  * @return HTTP status code, -1 for network/connection error
  */

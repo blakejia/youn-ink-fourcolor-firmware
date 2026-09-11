@@ -20,6 +20,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "common/server_pairing.h"
+#include "common/sleep_manager.h"
 #include "ssid_manager.h"
 #include "page_sync.h"
 #include "notify.h"
@@ -33,9 +34,9 @@ constexpr char kSyncNamespace[] = "sync";
 constexpr char kSyncIntervalKey[] = "sync_interval";
 
 
-constexpr int kSettingsWifiIndex = 5;
-constexpr int kSettingsHttpServerIndex = 6;
-constexpr int kSettingsLanIpIndex = 7;
+// Index space is the pushed item list, Section rows included:
+// 0 系统 / 1 重启 / 2 重置网络 / 3 网络 / 4 Wi-Fi / 5 省电模式 / 6 关于 / 7 固件
+constexpr int kSettingsWifiIndex = 4;
 
 
 
@@ -44,26 +45,6 @@ void UpdateWifiSettingsItem(rawdraw::SettingsRenderer* renderer, bool connected,
     if (!renderer) return;
     renderer->UpdateChecked(kSettingsWifiIndex, connected);
     renderer->UpdateItem(kSettingsWifiIndex, value ? value : (connected ? "已连接" : "未连接"));
-}
-
-void UpdateHttpServerSettingsItem(rawdraw::SettingsRenderer* renderer, bool running,
-                                  const std::string& ip_address = "") {
-    if (!renderer) return;
-    std::string value;
-    if (running && !ip_address.empty()) {
-        value = "http://" + ip_address;
-    } else if (!ip_address.empty()) {
-        value = ip_address;
-    } else {
-        value = running ? "已开启" : "已关闭";
-    }
-    renderer->UpdateChecked(kSettingsHttpServerIndex, running);
-    renderer->UpdateItem(kSettingsHttpServerIndex, value);
-}
-
-void UpdateLanIpSettingsItem(rawdraw::SettingsRenderer* renderer, const std::string& ip_address) {
-    if (!renderer) return;
-    renderer->UpdateItem(kSettingsLanIpIndex, ip_address.empty() ? "未获取" : ip_address);
 }
 
 void StartSntpClockSyncOnce() {
@@ -89,10 +70,6 @@ void StartSntpClockSyncOnce() {
     esp_sntp_init();
     s_started = true;
     ESP_LOGI(kTag, "SNTP started: tz=Asia/Shanghai servers=ntp.aliyun.com,cn.pool.ntp.org,pool.ntp.org");
-}
-
-bool IsLocalHttpServiceRunning(const ui::RawDrawUiManager* manager) {
-    return manager != nullptr && manager->IsHttpServerRunning();
 }
 
 std::atomic<bool> s_pairing_started{false};
@@ -245,10 +222,13 @@ void Application::Initialize() {
     auto* lcd = static_cast<CustomLcdDisplay*>(display);
     rawdraw_ui_manager_ = std::make_unique<ui::RawDrawUiManager>();
     rawdraw_ui_manager_->Init(lcd, [lcd](const rawdraw::Rect&, bool urgent) {
+        // Every UI-side repaint (page switch, dirty rect, clock) funnels through
+        // here; the canvas asks the display directly, so the label is enough to
+        // tell the two refresh sources apart in the log.
         if (urgent) {
-            lcd->RequestUrgentFullRefresh();
+            lcd->RequestUrgentFullRefresh("ui");
         } else {
-            lcd->RequestUrgentRefresh();
+            lcd->RequestUrgentRefresh("ui");
         }
     });
     if (auto* sr = rawdraw_ui_manager_->GetSettingsRenderer()) {
@@ -269,14 +249,9 @@ void Application::Initialize() {
                              auto& wifi = WifiManager::GetInstance();
                              if (wifi_connected_.load(std::memory_order_acquire) || wifi.IsConnected()) {
                                  ESP_LOGI(kTag, "Wi-Fi setting toggled OFF");
-                                 if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsLanHttpServerRunning()) {
-                                     rawdraw_ui_manager_->StopLanHttpServer();
-                                     UpdateHttpServerSettingsItem(sr, false);
-                                 }
                                  wifi.StopStation();
                                  wifi_connected_.store(false, std::memory_order_release);
                                  UpdateWifiSettingsItem(sr, false);
-                                 UpdateLanIpSettingsItem(sr, "");
                              } else {
                                  ESP_LOGI(kTag, "Wi-Fi setting toggled ON");
                                  UpdateWifiSettingsItem(sr, false, "连接中");
@@ -284,47 +259,6 @@ void Application::Initialize() {
                              }
                              UpdateStatusBarForUi();
                          }});
-        items.push_back({"局域网服务", "已关闭", nullptr, rawdraw::SettingsItemType::Checkbox, false,
-                         [this, sr]() {
-                             if (!rawdraw_ui_manager_) return;
-                             if (rawdraw_ui_manager_->IsLanHttpServerRunning()) {
-                                 ESP_LOGI(kTag, "LAN HTTP server toggled OFF");
-                                 rawdraw_ui_manager_->StopLanHttpServer();
-                                 UpdateHttpServerSettingsItem(sr, false);
-                                 UpdateStatusBarForUi();
-                                 if (wifi_connected_.load(std::memory_order_acquire) ||
-                                     WifiManager::GetInstance().IsConnected()) {
-                                     ArmSyncSleepTimer();
-                                 }
-                                 return;
-                             }
-
-                             auto& wifi = WifiManager::GetInstance();
-                             if (!wifi_connected_.load(std::memory_order_acquire) && !wifi.IsConnected()) {
-                                 ESP_LOGW(kTag, "LAN HTTP server requires WiFi connection");
-                                 UpdateHttpServerSettingsItem(sr, false, "需先连接WiFi");
-                                 UpdateStatusBarForUi();
-                                 return;
-                             }
-                             const std::string ip = wifi.GetIpAddress();
-                             if (ip.empty()) {
-                                 ESP_LOGW(kTag, "LAN HTTP server requires station IP");
-                                 UpdateHttpServerSettingsItem(sr, false, "等待IP");
-                                 UpdateStatusBarForUi();
-                                 return;
-                             }
-                             const bool started = rawdraw_ui_manager_->StartLanHttpServer(ip);
-                             ESP_LOGI(kTag, "LAN HTTP server toggled ON: started=%d url=http://%s/",
-                                      started ? 1 : 0, ip.c_str());
-                             if (started && sleep_timer_ != nullptr) {
-                                 esp_timer_stop(sleep_timer_);
-                                 ESP_LOGI(kTag, "Sync sleep timer paused while LAN HTTP server is running");
-                             }
-                             UpdateHttpServerSettingsItem(sr, started, started ? ip : "");
-                             UpdateLanIpSettingsItem(sr, started ? ip : WifiManager::GetInstance().GetIpAddress());
-                             UpdateStatusBarForUi();
-                         }});
-        items.push_back({"局域网IP", "未获取", nullptr, rawdraw::SettingsItemType::Normal, false});
         items.push_back({"省电模式", "手动进入", nullptr,
                          rawdraw::SettingsItemType::Action, false,
                          [this]() {
@@ -373,28 +307,12 @@ void Application::Initialize() {
                             kLifecycleSyncIdle, "wifi reconnected, paired");
                     }
                 }
-                if (rawdraw_ui_manager_ && !rawdraw_ui_manager_->IsLanHttpServerRunning()) {
-                    const std::string ip = data.empty() ? WifiManager::GetInstance().GetIpAddress() : data;
-                    if (!ip.empty()) {
-                        const bool started = rawdraw_ui_manager_->StartLanHttpServer(ip);
-                        ESP_LOGI(kTag, "LAN HTTP server auto-start after WiFi: started=%d url=http://%s/",
-                                 started ? 1 : 0, ip.c_str());
-                        if (auto* sr = rawdraw_ui_manager_->GetSettingsRenderer()) {
-                            UpdateHttpServerSettingsItem(sr, started, started ? ip : "");
-                            UpdateLanIpSettingsItem(sr, ip);
-                        }
-                    }
-                }
-
                 UpdateStatusBarForUi();
                 ArmSyncSleepTimer();
                 break;
             case NetworkEvent::Disconnected:
                 ESP_LOGI(kTag, "WiFi disconnected");
                 wifi_connected_.store(false, std::memory_order_release);
-                if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsLanHttpServerRunning()) {
-                    rawdraw_ui_manager_->StopLanHttpServer();
-                }
                 UpdateStatusBarForUi();
                 break;
             case NetworkEvent::Connecting:
@@ -459,6 +377,20 @@ void Application::OnUpClick() {
     }
     if (rawdraw_ui_manager_) {
         rawdraw_ui_manager_->HandleInput(rawdraw::ButtonEvent{rawdraw::ButtonEvent::kUpClick});
+    }
+}
+
+void Application::OnUpDoubleClick() {
+    ESP_LOGI(kTag, "UP double click");
+    Board::GetInstance().FlashActivityLed();
+    // The overlay is a UI affordance; while a notification or the canvas owns
+    // the panel it would be drawn over and lose its backing snapshot.
+    if (notify_is_active() || page_sync_is_displaying()) {
+        return;
+    }
+    if (rawdraw_ui_manager_) {
+        rawdraw_ui_manager_->HandleInput(
+            rawdraw::ButtonEvent{rawdraw::ButtonEvent::kUpDoubleClick});
     }
 }
 
@@ -566,9 +498,6 @@ void Application::NoteButtonActivity() {
 }
 
 void Application::EnterWifiConfigMode() {
-    if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsLanHttpServerRunning()) {
-        rawdraw_ui_manager_->StopLanHttpServer();
-    }
     wifi_connected_.store(false, std::memory_order_release);
     ESP_LOGI(kTag, "Entering WiFi config mode by long press");
     WifiManager::GetInstance().StartConfigAp();
@@ -584,15 +513,6 @@ void Application::EnterWifiConfigMode() {
 }
 
 void Application::ArmSyncSleepTimer(int interval_minutes_override) {
-    if (IsLocalHttpServiceRunning(rawdraw_ui_manager_.get())) {
-        if (sleep_timer_ != nullptr) {
-            esp_timer_stop(sleep_timer_);
-        }
-        ESP_LOGI(kTag, "Sync sleep timer skipped while local HTTP transfer service is running");
-        return;
-    }
-
-
     Settings nvs(kSyncNamespace, false);
     const int interval_minutes = interval_minutes_override > 0
         ? interval_minutes_override
@@ -636,6 +556,12 @@ void Application::ServerPairingTaskEntry(void* arg) {
     ServerPairingTaskTrampoline(arg);
 }
 
+bool Application::CanEnterSleepMode() const {
+    // Only a paired, idle device may sleep; on top of this SleepManager checks
+    // the busy sources, holds and the activity deadline.
+    return GetLifecycleState() == kLifecycleSyncIdle;
+}
+
 void Application::EnterScheduledSleep() {
     // 只有 SYNC_IDLE 才允许休眠：配网/配对/连接中一律跳过。
     // （替代旧的 IsConfigMode 特判——状态机统一覆盖）
@@ -646,9 +572,22 @@ void Application::EnterScheduledSleep() {
         ArmSyncSleepTimer(1);
         return;
     }
-    if (IsLocalHttpServiceRunning(rawdraw_ui_manager_.get())) {
-        ESP_LOGI(kTag, "Scheduled sleep skipped: local HTTP transfer service is running");
-        ArmSyncSleepTimer();
+    // The busy bookkeeping was always fed (audio sets Audio, the panel sets
+    // Display on every queue/refresh) but nothing ever read it, so a deep sleep
+    // could start mid-refresh: a four-colour refresh takes >= 15 s and the panel
+    // latches garbage if the waveform is interrupted. Consult it.
+    if (!SleepManager::GetInstance().CanSleepNow()) {
+        ESP_LOGI(kTag, "Scheduled sleep deferred: busy=0x%x holds=%d deadline_in=%lldms",
+                 (unsigned)SleepManager::GetInstance().GetBusyMask(),
+                 SleepManager::GetInstance().GetHoldCount(),
+                 (long long)(SleepManager::GetInstance().GetDeadlineMs() -
+                             esp_timer_get_time() / 1000));
+        ArmSyncSleepTimer(1);
+        return;
+    }
+    if (notify_is_active()) {
+        ESP_LOGI(kTag, "Scheduled sleep deferred: notification on screen");
+        ArmSyncSleepTimer(1);
         return;
     }
 
@@ -665,9 +604,6 @@ void Application::EnterManualSleep() {
     ESP_LOGI(kTag, "Entering manual deep sleep; stopping local services and WiFi");
     if (sleep_timer_ != nullptr) {
         esp_timer_stop(sleep_timer_);
-    }
-    if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsHttpServerRunning()) {
-        rawdraw_ui_manager_->StopLanHttpServer();
     }
     wifi_connected_.store(false, std::memory_order_release);
     esp_wifi_disconnect();
@@ -742,10 +678,6 @@ void Application::StopSound() {
     audio_service_.ResetDecoder();
 }
 
-bool Application::CanEnterSleepMode() const {
-    return false;
-}
-
 void Application::UpdateStatusBarForUi() {
     auto& board = Board::GetInstance();
     int battery_level = -1;
@@ -755,22 +687,17 @@ void Application::UpdateStatusBarForUi() {
 
     if (rawdraw_ui_manager_) {
         const bool wifi_connected = wifi_connected_.load(std::memory_order_acquire);
-        const bool http_server_running = rawdraw_ui_manager_->IsHttpServerRunning();
+        // Was IsHttpServerRunning(), which is hardcoded false: the dot never lit
+        // even while the device was paired and polling.
+        const bool server_reachable = page_sync_server_reachable();
         ui::RawDrawStatusBarData data = rawdraw_ui_manager_->GetStatusBarData();
         data.page_title = ui::RawDrawUiManager::GetPageTitle(rawdraw_ui_manager_->GetCurrentPage());
         data.wifi_connected = wifi_connected;
-        data.server_connected = http_server_running;
+        data.server_connected = server_reachable;
         data.battery_level = battery_level;
         data.battery_charging = charging;
         rawdraw_ui_manager_->UpdateStatusBar(data);
         UpdateWifiSettingsItem(rawdraw_ui_manager_->GetSettingsRenderer(), wifi_connected);
-        const std::string lan_ip = wifi_connected ? WifiManager::GetInstance().GetIpAddress() : "";
-        UpdateLanIpSettingsItem(rawdraw_ui_manager_->GetSettingsRenderer(), lan_ip);
-        UpdateHttpServerSettingsItem(rawdraw_ui_manager_->GetSettingsRenderer(),
-                                     rawdraw_ui_manager_->IsLanHttpServerRunning(),
-                                     rawdraw_ui_manager_->IsLanHttpServerRunning()
-                                         ? lan_ip
-                                         : "");
         rawdraw_ui_manager_->RequestActivePageRefresh();
     }
     return;

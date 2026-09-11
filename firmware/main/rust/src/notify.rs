@@ -246,7 +246,8 @@ fn fetch_once() {
     let mut token = CBuf::<80>::new();
     unsafe { shim::rf_get_token(token.as_mut_ptr(), 80) };
 
-    let buf = unsafe { shim::rf_alloc(RESPONSE_BUF) };
+    // +1: the wrapper's capacity includes the terminator it appends.
+    let buf = unsafe { shim::rf_alloc(RESPONSE_BUF + 1) };
     // +1: http_wrapper_get NUL-terminates one byte past the reported length.
     let bitmap = unsafe { shim::rf_alloc(page_sync::PAGE_BITMAP_SIZE + 1) };
     if buf.is_null() || bitmap.is_null() {
@@ -263,13 +264,13 @@ fn fetch_once() {
         return;
     }
 
-    let mut len = RESPONSE_BUF as i32;
+    let mut len = (RESPONSE_BUF + 1) as i32;
     let status = unsafe {
         shim::rf_http_get(url.as_ptr(), token.as_ptr(), buf as *mut core::ffi::c_char, &mut len,
                           HTTP_TIMEOUT_MS)
     };
 
-    let len = (len.max(0) as usize).min(RESPONSE_BUF);
+    let len = (len.max(0) as usize).min(RESPONSE_BUF + 1);
     if !handle_next(status, unsafe { core::slice::from_raw_parts(buf, len) }, bitmap) {
         set_state(IDLE);
     }

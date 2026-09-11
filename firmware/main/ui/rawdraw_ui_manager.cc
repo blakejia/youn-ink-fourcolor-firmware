@@ -597,16 +597,6 @@ void RawDrawUiManager::ShowPairingCodePage(const std::string& code, int expires_
     // refreshed after pairing timeout) — force repaint regardless.
     RequestActivePageRefresh();
 }
-bool RawDrawUiManager::StartLanHttpServer(const std::string& ip_address) {
-    // LAN HTTP server is now handled by the server-side pairing flow
-    // (no local HTTP server needed for AP transfer).
-    return false;
-}
-
-void RawDrawUiManager::StopLanHttpServer() {
-    // No-op: LAN HTTP server removed
-}
-
 // ============================================================
 // Input handling
 // ============================================================

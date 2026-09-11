@@ -230,8 +230,21 @@ def release(board_type: str, config_filename: str = "config.json", *, filter_nam
             f.write("# Append by release.py\n")
             for append in sdkconfig_append:
                 f.write(f"{append}\n")
-        # Build with macro BOARD_NAME defined to name
-        if os.system(f"idf.py -DBOARD_NAME={name} -DBOARD_TYPE={board_type} build") != 0:
+        # Build with macro BOARD_NAME defined to name.
+        #
+        # DEVICE_MASTER_KEY must be forwarded: main/CMakeLists.txt injects it into
+        # the firmware (and into the Rust crates as an env var), and without it
+        # the build falls back to the REPLACE_ME placeholder, whose HMAC can
+        # never match the server — the released device could not pair.
+        master_key = os.environ.get("DEVICE_MASTER_KEY", "")
+        if not master_key:
+            print("[ERROR] DEVICE_MASTER_KEY is not set; refusing to build a "
+                  "firmware with the REPLACE_ME placeholder", file=sys.stderr)
+            sys.exit(1)
+        if os.system(
+            f'idf.py -DBOARD_NAME={name} -DBOARD_TYPE={board_type} '
+            f'-DDEVICE_MASTER_KEY="{master_key}" build'
+        ) != 0:
             print("build failed")
             sys.exit(1)
 

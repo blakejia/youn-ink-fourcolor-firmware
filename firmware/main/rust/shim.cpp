@@ -234,7 +234,7 @@ extern "C" void rf_fb_end(void) {
 extern "C" void rf_request_full_refresh(void) {
     CustomLcdDisplay *d = lcd();
     if (d != nullptr) {
-        d->RequestUrgentFullRefresh();
+        d->RequestUrgentFullRefresh("canvas");
     }
 }
 

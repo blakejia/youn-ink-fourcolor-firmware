@@ -24,7 +24,15 @@ use crate::shim::{self, CBuf};
 pub const PAGE_BITMAP_SIZE: usize = 30000;
 const MAX_PAGES: usize = 5;
 const MD5_LEN: usize = 32;
-const POLL_MS: u32 = 10_000;
+/// How often the task wakes to check rotation. Purely local (no radio): the
+/// network poll runs on the server's `poll_interval_minutes` on top of this, so
+/// a page turn still lands on time instead of at poll granularity.
+const TICK_MS: u32 = 10_000;
+/// Fallbacks when the server sends no policy: the old hardcoded 10 s poll was
+/// 60x the server's intent and kept the radio up all day.
+const DEFAULT_POLL_S: u32 = 600;
+const DEFAULT_SLEEP_POLL_S: u32 = 3600;
+const MAX_POLL_MINUTES: i64 = 1440;
 const SCHEDULE_TIMEOUT_MS: i32 = 10_000;
 const BITMAP_TIMEOUT_MS: i32 = 15_000;
 const SCHEDULE_BUF: usize = 8192;
@@ -34,6 +42,8 @@ const TASK_PRIORITY: u8 = 3;
 // ── screen ownership (lock-free: read under the display mutex) ──
 static DISPLAYING: AtomicBool = AtomicBool::new(false);
 static SUSPENDED: AtomicBool = AtomicBool::new(false);
+/// Whether the last schedule poll reached the server (status-bar indicator).
+static SERVER_REACHABLE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct Page {
@@ -60,6 +70,8 @@ struct Table {
     started_us: u64,
     empty_hint_shown: bool,
     running: bool,
+    /// Server policy (see [`Policy`]).
+    policy: Policy,
 }
 
 impl Table {
@@ -73,6 +85,7 @@ impl Table {
             started_us: 0,
             empty_hint_shown: false,
             running: false,
+            policy: Policy::DEFAULT,
         }
     }
 
@@ -138,9 +151,11 @@ fn fetch_schedule(buf: &mut [u8]) -> Option<usize> {
                           SCHEDULE_TIMEOUT_MS)
     };
     if status != 200 || len < 0 {
+        SERVER_REACHABLE.store(false, Ordering::Release);
         log_w!("PageSync", "schedule fetch failed (status={})", status);
         return None;
     }
+    SERVER_REACHABLE.store(true, Ordering::Release);
     Some(len as usize)
 }
 
@@ -161,7 +176,9 @@ fn download_bitmap(md5: &[u8; MD5_LEN], out: *mut u8) -> bool {
     let mut token = CBuf::<80>::new();
     unsafe { shim::rf_get_token(token.as_mut_ptr(), 80) };
 
-    let mut len = PAGE_BITMAP_SIZE as i32;
+    // Capacity includes the wrapper's terminator, so ask for one byte more than
+    // the payload; the wrapper caps the body at capacity - 1.
+    let mut len = (PAGE_BITMAP_SIZE + 1) as i32;
     let status = unsafe {
         shim::rf_http_get(url.as_ptr(), token.as_ptr(), out as *mut core::ffi::c_char, &mut len,
                           BITMAP_TIMEOUT_MS)
@@ -195,9 +212,57 @@ pub struct ParsedSchedule {
     pub md5: [u8; MD5_LEN],
     pub pages: [ParsedPage; MAX_PAGES],
     pub count: usize,
+    pub policy: Policy,
 }
 
 const EMPTY_PAGE: ParsedPage = ParsedPage { md5: [0; MD5_LEN], duration_s: 0 };
+
+/// The `policy` block of `/api/pages/schedule`, plus `screen_active`.
+///
+/// The server owns the schedule: poll cadence, the sleep window and whether the
+/// canvas should be on at all. The firmware used to hardcode both cadences.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Policy {
+    pub poll_s: u32,
+    pub sleep_poll_s: u32,
+    /// False while the server's sleep window is open.
+    pub screen_active: bool,
+}
+
+impl Policy {
+    const DEFAULT: Policy = Policy {
+        poll_s: DEFAULT_POLL_S,
+        sleep_poll_s: DEFAULT_SLEEP_POLL_S,
+        screen_active: true,
+    };
+}
+
+fn minutes_to_s(minutes: Option<i64>, fallback: u32) -> u32 {
+    match minutes {
+        Some(m) if m > 0 => (m.min(MAX_POLL_MINUTES) as u32) * 60,
+        _ => fallback,
+    }
+}
+
+/// Read the policy out of a schedule body. Pure, so it is unit-tested on the host.
+///
+/// Every field falls back to the previous default rather than failing: a server
+/// that stops sending policy must not stop the device from polling.
+pub fn parse_policy(body: &[u8]) -> Policy {
+    let poll_s = minutes_to_s(
+        json::path(body, &["policy", "poll_interval_minutes"]).and_then(|at| json::int_value(body, at)),
+        DEFAULT_POLL_S,
+    );
+    let sleep_poll_s = minutes_to_s(
+        json::path(body, &["policy", "sleep_poll_interval_minutes"])
+            .and_then(|at| json::int_value(body, at)),
+        DEFAULT_SLEEP_POLL_S,
+    );
+    let screen_active = json::member(body, 0, "screen_active")
+        .and_then(|at| json::bool_value(body, at))
+        .unwrap_or(true);
+    Policy { poll_s, sleep_poll_s, screen_active }
+}
 
 /// Parse `/api/pages/schedule`. Pure, so it is unit-tested on the host.
 ///
@@ -209,7 +274,8 @@ pub fn parse_schedule(body: &[u8]) -> Option<ParsedSchedule> {
         .and_then(md5_from)?;
     let pages_at = json::member(body, 0, "pages")?;
 
-    let mut out = ParsedSchedule { md5, pages: [EMPTY_PAGE; MAX_PAGES], count: 0 };
+    let mut out =
+        ParsedSchedule { md5, pages: [EMPTY_PAGE; MAX_PAGES], count: 0, policy: parse_policy(body) };
     json::for_each_item(body, pages_at, &mut |item| {
         if out.count >= MAX_PAGES {
             return false;
@@ -245,7 +311,9 @@ fn sync_once() {
         log_e!("PageSync", "schedule buffer alloc failed");
         return;
     }
-    let body = unsafe { core::slice::from_raw_parts_mut(raw, SCHEDULE_BUF) };
+    // Same one-byte-over-allocation as the notify response: the wrapper's
+    // capacity includes the terminator it appends.
+    let body = unsafe { core::slice::from_raw_parts_mut(raw, SCHEDULE_BUF + 1) };
     if let Some(len) = fetch_schedule(body) {
         sync_schedule(&body[..len]);
     }
@@ -259,6 +327,17 @@ fn sync_schedule(body: &[u8]) {
         return;
     };
     let new_md5 = parsed.md5;
+    let new_policy = parsed.policy;
+
+    let policy_changed = with_table(|t| {
+        let prev = t.policy;
+        t.policy = new_policy;
+        prev != new_policy
+    });
+    if policy_changed {
+        log_i!("PageSync", "policy: poll={}s sleep_poll={}s screen_active={}",
+            new_policy.poll_s, new_policy.sleep_poll_s, new_policy.screen_active);
+    }
 
     // 99% path: nothing changed.
     let unchanged = with_table(|t| t.have_schedule_md5 && t.schedule_md5 == new_md5);
@@ -397,6 +476,11 @@ pub fn is_displaying() -> bool {
     DISPLAYING.load(Ordering::Acquire)
 }
 
+/// Whether the last schedule poll reached the server.
+pub fn server_reachable() -> bool {
+    SERVER_REACHABLE.load(Ordering::Acquire)
+}
+
 /// Hand the screen to the UI/notification: the canvas stops drawing until
 /// [`resume_display`] or [`allow_display`].
 pub fn stop_display() {
@@ -477,11 +561,23 @@ pub fn start() {
 
 extern "C" fn task_entry(_arg: *mut c_void) {
     let mut first = true;
+    let mut last_poll_us: u64 = 0;
     loop {
         if !with_table(|t| t.running) {
             break;
         }
-        sync_once();
+
+        // The server owns the poll cadence (and slows it down inside its sleep
+        // window); the tick above only drives rotation and painting.
+        let (poll_us, screen_active) = with_table(|t| {
+            let interval = if t.policy.screen_active { t.policy.poll_s } else { t.policy.sleep_poll_s };
+            (interval as u64 * 1_000_000, t.policy.screen_active)
+        });
+        let now = now_us();
+        if last_poll_us == 0 || now.saturating_sub(last_poll_us) >= poll_us {
+            sync_once();
+            last_poll_us = now_us();
+        }
         if first {
             // Measured after the deepest path (schedule fetch + bitmap
             // downloads) has returned; a tight margin here means the stack
@@ -493,7 +589,15 @@ extern "C" fn task_entry(_arg: *mut c_void) {
 
         if SUSPENDED.load(Ordering::Acquire) {
             // Keep the data fresh but do not touch the panel: the UI owns it.
-            unsafe { shim::rf_delay_ms(POLL_MS) };
+            unsafe { shim::rf_delay_ms(TICK_MS) };
+            continue;
+        }
+
+        if !screen_active && !first {
+            // Sleep window: keep polling, but spend no panel cycles (a
+            // four-colour refresh is >= 15 s with the radio up). The first paint
+            // after boot still happens, so a wake press shows content.
+            unsafe { shim::rf_delay_ms(TICK_MS) };
             continue;
         }
 
@@ -519,7 +623,7 @@ extern "C" fn task_entry(_arg: *mut c_void) {
             }
         }
         first = false;
-        unsafe { shim::rf_delay_ms(POLL_MS) };
+        unsafe { shim::rf_delay_ms(TICK_MS) };
     }
     unsafe { shim::rf_task_exit() };
 }
@@ -541,6 +645,12 @@ pub extern "C" fn page_sync_start() {
 #[unsafe(no_mangle)]
 pub extern "C" fn page_sync_is_displaying() -> bool {
     is_displaying()
+}
+
+/// True when the last schedule poll reached the server (status bar indicator).
+#[unsafe(no_mangle)]
+pub extern "C" fn page_sync_server_reachable() -> bool {
+    server_reachable()
 }
 
 #[unsafe(no_mangle)]
@@ -622,6 +732,87 @@ mod tests {
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), &bitmap_body(0xb2));
         sync_once();
+    }
+
+    #[test]
+    fn policy_defaults_when_the_server_sends_none() {
+        let p = parse_policy(br#"{"schedule_md5":"x","pages":[]}"#);
+        assert_eq!(p, Policy::DEFAULT);
+        assert_eq!(p.poll_s, 600, "the old hardcoded 10 s poll was 60x the intent");
+        assert!(p.screen_active);
+    }
+
+    #[test]
+    fn policy_is_read_from_the_schedule_body() {
+        let body = br#"{"screen_active":false,"policy":{"poll_interval_minutes":10,
+            "sleep_poll_interval_minutes":60,"min_page_duration_minutes":10},
+            "schedule_md5":"x","pages":[]}"#;
+        let p = parse_policy(body);
+        assert_eq!(p.poll_s, 600);
+        assert_eq!(p.sleep_poll_s, 3600);
+        assert!(!p.screen_active);
+    }
+
+    #[test]
+    fn nonsense_policy_values_fall_back_instead_of_stopping_polling() {
+        for body in [
+            &br#"{"policy":{"poll_interval_minutes":0,"sleep_poll_interval_minutes":-5}}"#[..],
+            &br#"{"policy":{"poll_interval_minutes":"ten"}}"#[..],
+            &br#"{"policy":{}}"#[..],
+        ] {
+            let p = parse_policy(body);
+            assert_eq!(p.poll_s, 600, "zero/negative/text cadence keeps the default");
+            assert_eq!(p.sleep_poll_s, 3600);
+        }
+        // A huge value is clamped rather than overflowing the delay.
+        let p = parse_policy(br#"{"policy":{"poll_interval_minutes":99999999}}"#);
+        assert_eq!(p.poll_s, 1440 * 60);
+    }
+
+    #[test]
+    fn the_schedule_response_carries_the_policy_through() {
+        let body = format!(
+            r#"{{"schedule_md5":"{}","screen_active":true,
+                "policy":{{"poll_interval_minutes":5,"sleep_poll_interval_minutes":30}},
+                "pages":[]}}"#,
+            md5hex(0x11)
+        );
+        let parsed = parse_schedule(body.as_bytes()).expect("parse");
+        assert_eq!(parsed.policy.poll_s, 300);
+        assert_eq!(parsed.policy.sleep_poll_s, 1800);
+    }
+
+    #[test]
+    fn fetching_the_schedule_updates_the_applied_policy() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        let body = format!(
+            r#"{{"schedule_md5":"{}","screen_active":false,
+                 "policy":{{"poll_interval_minutes":10,"sleep_poll_interval_minutes":60}},
+                 "pages":[]}}"#,
+            md5hex(0x11)
+        );
+        shim::host::script_ok("/api/pages/schedule", body.as_bytes());
+
+        sync_once();
+
+        let (poll_s, sleep_poll_s, active) =
+            with_table(|t| (t.policy.poll_s, t.policy.sleep_poll_s, t.policy.screen_active));
+        assert_eq!((poll_s, sleep_poll_s, active), (600, 3600, false));
+        assert!(SERVER_REACHABLE.load(Ordering::Acquire), "a 200 marks the server reachable");
+    }
+
+    #[test]
+    fn a_failed_poll_marks_the_server_unreachable() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        SERVER_REACHABLE.store(true, Ordering::Release);
+        shim::host::script_get("/api/pages/schedule", 500, b"");
+
+        sync_once();
+
+        assert!(!SERVER_REACHABLE.load(Ordering::Acquire));
+        assert!(!server_reachable());
     }
 
     #[test]

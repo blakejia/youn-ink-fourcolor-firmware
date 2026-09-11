@@ -14,10 +14,10 @@
 #include "esp_lvgl_port.h"
 #endif
 #include "settings.h"
+#include "common/sleep_manager.h"
 #include "custom_lcd_display.h"
 #include "rawdraw/rawdraw.h"
 #include "rawdraw/framebuffer.h"
-#include "common/sleep_manager.h"
 
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(SourceHanSansSC_Medium_slim);
@@ -377,10 +377,12 @@ bool CustomLcdDisplay::IsRefreshPending() {
     return busy;
 }
 
-void CustomLcdDisplay::RequestUrgentRefresh() {
+void CustomLcdDisplay::RequestUrgentRefresh(const char* reason) {
     if (dirty_mutex) {
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
     }
+    last_refresh_reason_ = reason ? reason : "unspecified";
+    ESP_LOGI(TAG, "[REFRESH] request (urgent): reason=%s", last_refresh_reason_);
     urgent_refresh = true;
     refresh_in_progress = true;
     const uint32_t default_kick_ms = IsFourColorPanel() ? (uint32_t)sample_interval_ms : kDisplayKickMs;
@@ -396,10 +398,12 @@ void CustomLcdDisplay::RequestUrgentRefresh() {
     }
 }
 
-void CustomLcdDisplay::RequestUrgentFullRefresh() {
+void CustomLcdDisplay::RequestUrgentFullRefresh(const char* reason) {
     if (dirty_mutex) {
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
     }
+    last_refresh_reason_ = reason ? reason : "unspecified";
+    ESP_LOGI(TAG, "[REFRESH] request (urgent+full): reason=%s", last_refresh_reason_);
     urgent_refresh = true;
     force_full_refresh_ = true;
     refresh_in_progress = true;
@@ -633,7 +637,8 @@ void CustomLcdDisplay::refresh_task_loop() {
 
         if (should_full) {
             stat_full++;
-            ESP_LOGI(TAG, "[REFRESH] Performing FULL refresh");
+            ESP_LOGI(TAG, "[REFRESH] Performing FULL refresh: reason=%s urgent=%d force_full=%d",
+                     last_refresh_reason_, urgent ? 1 : 0, force_full ? 1 : 0);
             EPD_Init();
             EPD_Display();
 

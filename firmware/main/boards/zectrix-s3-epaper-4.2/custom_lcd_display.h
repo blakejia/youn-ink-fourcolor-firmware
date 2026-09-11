@@ -70,12 +70,13 @@ public:
     void EPD_DrawColorPixel(uint16_t x, uint16_t y,uint8_t color);
 
     // Immediate refresh without forcing a full e-paper update.
-    void RequestUrgentRefresh() override;
+    void RequestUrgentRefresh(const char* reason = nullptr) override;
     // Force a full e-paper refresh on the next immediate update.
-    void RequestUrgentFullRefresh() override;
+    void RequestUrgentFullRefresh(const char* reason = nullptr) override;
 
-    // Refresh state for sleep gating
-    bool IsRefreshPending();
+    // Refresh state for input locking / sleep gating
+    bool IsRefreshPending() override;
+
 
     // Notify when refresh transitions from busy to idle.
     void SetOnRefreshIdle(std::function<void()> cb);
@@ -160,6 +161,8 @@ private:
 
     bool prev_buffer_synced = false;  // 标志：prev_buffer 是否已与屏幕同步
     bool refresh_in_progress = false;
+    // Diagnostic label of the last refresh requester (string literal, not owned).
+    const char* last_refresh_reason_ = "none";
     bool refresh_busy_seen_ = false;
     uint32_t next_kick_ms_ = 0;
     std::function<void()> on_refresh_idle_;

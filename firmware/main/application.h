@@ -37,14 +37,15 @@ public:
     void PlaySound(const std::string_view& sound, int duration_ms);
     void MuteSound();
     void StopSound();
-    bool CanEnterSleepMode() const;
 
     AudioService& GetAudioService() { return audio_service_; }
     ui::RawDrawUiManager* GetRawDrawUiManager() { return rawdraw_ui_manager_.get(); }
     void UpdateStatusBarForUi();
     void UpdateWifiStatusForProvisioning(const std::string& state, int reason);
 
+    bool CanEnterSleepMode() const;
      void OnUpClick();
+    void OnUpDoubleClick();
     void OnDownClick();
     void OnUpLongPress();
     void OnDownLongPress();

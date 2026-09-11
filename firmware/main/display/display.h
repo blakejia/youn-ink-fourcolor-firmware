@@ -38,8 +38,15 @@ public:
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
-    virtual void RequestUrgentRefresh() {}
-    virtual void RequestUrgentFullRefresh() {}
+    // `reason` is only a diagnostic label for the [REFRESH] log line; pass a
+    // short literal so a panel cycle can be attributed to its requester.
+    virtual void RequestUrgentRefresh(const char* /*reason*/ = nullptr) {}
+    virtual void RequestUrgentFullRefresh(const char* /*reason*/ = nullptr) {}
+
+    // True while a panel refresh is queued or running (used by the UI to lock
+    // input until the panel is idle).
+    virtual bool IsRefreshPending() { return false; }
+
 
     // 获取 LVGL display 对象（用于 LVGL UI 模块）
 #ifdef HAVE_LVGL

@@ -32,6 +32,9 @@ void page_sync_prev(void);
  *  renderer that already holds the display mutex. */
 bool page_sync_is_displaying(void);
 
+/** True when the last schedule poll reached the server (status bar indicator). */
+bool page_sync_server_reachable(void);
+
 /**
  * Hand the panel to the UI/notification: the canvas stops drawing (but keeps
  * polling) until `page_sync_allow_display` or an internal resume.

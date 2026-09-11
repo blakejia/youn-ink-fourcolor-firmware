@@ -183,14 +183,6 @@ public:
      */
     bool IsQuickSwitchOpen() const { return quick_switch_open_; }
 
-    /**
-     * @brief LAN HTTP server (removed — Gallery/AP Transfer gone).
-     * These are no-ops returning false.
-     */
-    bool StartLanHttpServer(const std::string& ip_address);
-    void StopLanHttpServer();
-    bool IsLanHttpServerRunning() const { return false; }
-    bool IsHttpServerRunning() const { return false; }
 
     /**
      * @brief Render everything to the framebuffer

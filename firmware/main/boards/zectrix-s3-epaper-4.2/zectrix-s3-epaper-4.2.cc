@@ -169,7 +169,7 @@ public:
             return;
         }
         display_->ShowFactoryTestPage();
-        display_->RequestUrgentFullRefresh();
+        display_->RequestUrgentFullRefresh("factory-test");
         FactoryTestService::Instance().StartFlow();
     }
 
@@ -369,6 +369,16 @@ private:
             }
         });
 
+        // Double tap = quick-switch overlay. The button component emits
+        // DOUBLE_CLICK instead of SINGLE_CLICK for the second tap, so this does
+        // not also flip a page.
+        up_button_.OnDoubleClick([]() {
+            auto& app = Application::GetInstance();
+            if (app.GetRawDrawUiManager()) {
+                app.OnUpDoubleClick();
+            }
+        });
+
         up_button_.OnPressUp([]() {
             const int64_t started_at = s_up_press_down_ms.exchange(-1);
             const bool was_long_press = started_at >= 0 && (NowMs() - started_at) >= kNavLongPressMs;
@@ -478,7 +488,7 @@ private:
 
             DisplayLockGuard lock(display_);
             page->UpdateSnapshot(snapshot);
-            display_->RequestUrgentRefresh();
+            display_->RequestUrgentRefresh("factory-test");
         });
 
         factory_test.SetShutdownCallback([this]() {

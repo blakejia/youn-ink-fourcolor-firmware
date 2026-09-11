@@ -35,8 +35,10 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
         ESP_LOGE(kTag, "HTTP event error");
         break;
     case HTTP_EVENT_ON_DATA:
-        if (evt->data_len > 0 && ctx->buf && ctx->len < ctx->buf_size) {
-            int space = ctx->buf_size - ctx->len;
+        // -1 reserves the terminator: the payload may fill at most 容量-1 bytes,
+        // so the NUL written below can never land past the caller's buffer.
+        if (evt->data_len > 0 && ctx->buf && ctx->len < ctx->buf_size - 1) {
+            int space = ctx->buf_size - 1 - ctx->len;
             int copy_len = evt->data_len < space ? evt->data_len : space;
             memcpy(ctx->buf + ctx->len, evt->data, copy_len);
             ctx->len += copy_len;
@@ -101,6 +103,7 @@ int http_wrapper_get(const char *url, const char *token,
     }
 
     int status = esp_http_client_get_status_code(client);
+    // Always safe: ctx.len <= buf_size - 1 (see HTTP_EVENT_ON_DATA).
     out_buf[ctx.len] = '\0';
     *out_len = ctx.len;
     esp_http_client_cleanup(client);
@@ -149,6 +152,7 @@ int http_wrapper_post_json(const char *url, const char *token,
     }
 
     int status = esp_http_client_get_status_code(client);
+    // Always safe: ctx.len <= buf_size - 1 (see HTTP_EVENT_ON_DATA).
     out_buf[ctx.len] = '\0';
     *out_len = ctx.len;
     esp_http_client_cleanup(client);
@@ -208,6 +212,7 @@ int http_wrapper_post_json_with_headers(const char *url, const char *token,
     }
 
     int status = esp_http_client_get_status_code(client);
+    // Always safe: ctx.len <= buf_size - 1 (see HTTP_EVENT_ON_DATA).
     out_buf[ctx.len] = '\0';
     *out_len = ctx.len;
     esp_http_client_cleanup(client);

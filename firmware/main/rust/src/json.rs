@@ -147,6 +147,16 @@ pub fn str_value(s: &[u8], at: usize) -> Option<&[u8]> {
     (!content.contains(&b'\\')).then_some(content)
 }
 
+/// `true`/`false` at `at`.
+pub fn bool_value(s: &[u8], at: usize) -> Option<bool> {
+    let end = skip_value(s, at)?;
+    match s.get(at..end)? {
+        b"true" => Some(true),
+        b"false" => Some(false),
+        _ => None,
+    }
+}
+
 /// Integer value at `at` (no fractions, no exponent).
 pub fn int_value(s: &[u8], at: usize) -> Option<i64> {
     let end = skip_value(s, at)?;
