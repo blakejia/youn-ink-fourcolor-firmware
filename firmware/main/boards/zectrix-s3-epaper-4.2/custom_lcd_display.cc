@@ -296,6 +296,9 @@ void CustomLcdDisplay::BringUpPanel() {
     EPD_Display();
 #endif
     prev_buffer_synced = true;
+    if (IsFourColorPanel()) {
+        last_sample_tick = xTaskGetTickCount();
+    }
 }
 
 
