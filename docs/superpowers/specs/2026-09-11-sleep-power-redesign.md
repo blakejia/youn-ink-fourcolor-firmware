@@ -292,6 +292,8 @@ Stage 1 完成即应满足 D1-D4 的功能语义；Stage 2/3 是省电幅度优�
 
 ## 13. 剩余风险
 
+- **刷新归因的日志在本构建下不可见**（2026-09-11 实测发现）：`custom_lcd_display.cc` 顶部 `#undef ESP_LOGI` 并把 `ESP_LOGI` 重定义为空，因此该文件内所有 INFO 日志（包括为实现本设计的可观测性而加的 `[REFRESH] request/Performing … reason=`）都被编译掉。判据只能用 `ESP_LOGW`（`EPD busy wait`）与其它文件的 INFO。修法二选一（未做）：把这几条改为 `ESP_LOGW`，或移除该处的 `#undef` 并评估日志量。
+
 - **WiFi 建连时间主导能耗**。Stage 3 是缓解而非根治；若建连仍 >6 秒，需要另案（静态 IP 或改用更轻的传输）。
 - **EPD 轨断电的长期可靠性无数据支撑**，故放 Stage 2 并要求连续多轮验证。驱动每轮刷新都会 `EPD_Init()`，但面板电荷泵重新上电的时序未经验证。
 - **惰性初始化改动面最大**（构造顺序、`prev_buffer_synced` 初值、UI/framebuffer 建構顺序），quiet 路径若漏建某个依赖会在第一次绘屏时崩溃。真机第 2/3 条正是为了压这一块。

@@ -1206,15 +1206,24 @@ hub op=start name=devmon application=/home/pi/.espressif/python_env/idf6.0_py3.1
 
 - [ ] **Step 2: 跑真机矩阵**
 
-| # | 场景 | 判据（只用实际会打印的标记；`Boot path:` 与 wake cause 由 T6 提供） |
-|---|---|---|
-| 1 | 插电 ≥35 分钟 | 主机侧 `/dev/ttyACM0` 一直存在；设备日志**没有** `Deep sleep` 行；周期按服务端 cadence 重跑 |
+**实测记录（2026-09-11 22:55-22:57，插电态）**：启动日志已证 1 / 5a / 7 三条，判据与观测时间戳如下表「实测」列。
+
+> ⚠️ **`[REFRESH] reason=…` 在本构建下不会打印**：`custom_lcd_display.cc:45` 有
+> `#undef ESP_LOGI` + 重定义为空，该文件里**所有** INFO 日志（含本次重构前加的 4 条刷新归因标记）都被编译掉。
+> 因此判据改用面板路径上真正会输出的两类行：`CustomLcdDisplay: EPD busy wait`（ESP_LOGW，一轮面板刷新一个 5/10/15 秒簇）与
+> `RawDrawUiManager: Display refresh idle; input unlocked`（另一文件，正常打印）。
+> 这也意味着**早前那次"刷新归因"没有产出任何设备侧证据**——它想回答的"同一按键两轮全刷是谁触发的"至今未答。
+> 后续可选项（未做）：把那 4 条改成 `ESP_LOGW`，或去掉该文件的 `#undef`（会一并放出该文件其余 INFO，量需评估）。
+
+| # | 场景 | 判据（只用实际会打印的标记；`Boot path:` 与 wake cause 由 T6 提供） | 实测 |
+|---|---|---|---|
+| 1 | 插电 | 无 `Deep sleep` 行，反复 `Stay awake (60000 ms)`（60000 = mains 常量，即 mains=1） | ✅ 22:55:31 与 22:56:31 各一次 60s 重装，无休眠行 |
 | 2 | 拔电后静默周期（未到翻页点） | `Boot path: quiet (wakeup cause=1)`；本 boot 无 `[REFRESH]`；以 `Deep sleep N s (mains=0 sync_ok=1 pin2=1)` 结束 |
-| 3 | 到翻页点的唤醒 | **恰好一次** `[REFRESH] Performing FULL refresh: reason=canvas` |
+| 3 | 到翻页点的唤醒 | 该唤醒**恰好一个** `EPD busy wait` 簇，且紧随一次 `Display refresh idle` | — |
 | 4 | 插 USB（不按键） | 串口重新枚举；`Boot path: interactive (wakeup cause=3)`；随后的 sleep 行 `mains=1 pin2=0`（若相反，说明极性假设错，改 `CHARGE_DETECT_PLUG_PULLS_LOW`） |
-| 5 | 唤醒时存在待确认通知 | `Notify: notify "…" displaying`；按 UP 后 `Notify: ack ok`，服务端 `status=acked` |
+| 5 | 唤醒时存在待确认通知 | `Notify: notify "…" displaying`；按 UP 后 `Notify: ack ok`，服务端 `status=acked` | ✅ 前半（拉取+上屏）22:55:32；ack 待按键 |
 | 6 | 按 BOOT 唤醒 | `Boot path: interactive (wakeup cause=2)`；随后 `Stay awake (…)` 直到宽限过期 |
-| 7 | 冷启动（拔电重插） | `CustomLcdDisplay: EPD busy wait` 的 5/10/15 秒告警出现在首次刷新与 WiFi 活动**之前**，之后画面为白底再绘出画板页（证明 BringUpPanel 跑的是它自己的序列，而不是刷新循环的 FULL 路径） |
+| 7 | 冷启动（拔电重插） | `EPD busy wait` 簇出现在首次刷新与 WiFi 活动**之前**（证明跑的是 BringUpPanel 自己的序列，而非刷新循环的 FULL 路径） | ✅ t=5.7/10.7/15.7s 完成 bring-up 簇，t=20.3s 应用初始化、t=25.4s WiFi 连接、t=35.8s 才出现绘屏的那一轮簇；`Boot path: interactive (wakeup cause=0)` 与冷启动相符 |
 | 8 | quiet 启动后插电（T6 提升验证） | 插电后数秒内出现 `Boot path: promoted to interactive`，面板重新上电并渲染 UI；按键不再被吞 |
 | 9 | 断网兜底（可选） | 让设备连不上服务端/热点 → quiet 唤醒在一次失败同步后仍能 `Deep sleep`（而不是保持清醒耗电） |
 | — | Stage 2（不在本计划） | EPD 轨断电，第 8 条矩阵项保留以后用 |
