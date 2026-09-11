@@ -1229,7 +1229,26 @@ hub op=start name=devmon application=/home/pi/.espressif/python_env/idf6.0_py3.1
 
 **硬件观察（与固件无关，留给硬件记录）**：插电时充电指示灯始终不亮。灯的逻辑是 `full → 常亮 / charging → 闪 / 其余 → 灭`（`board_power_bsp.cc:43-60`，GPIO3 低有效），一直灭说明充电 IC 既未上报 charging 也未上报 full；而 `mains` 读数为 1（检测脚按"充电为低"判定）。用户确认电池已装、有电、拔线后设备照常运行。
 
-**另一个未解观察**：插电清醒期间偶尔出现无翻页的额外面板刷新簇（00:01:55 一例）。归因日志（`[REFRESH] reason=`）在本构建下被 `#undef ESP_LOGI` 编译掉，因此仍无法点名调用者；这只在清醒态出现，电池占空比路径未观察到。
+**双全刷已定位（2026-09-12 00:30，插桩观测 600 秒）**：当时记的"未解观察"已破案，且不是周期性行为。
+
+用临时插桩构建（去掉 `custom_lcd_display.cc:45` 的 `#undef ESP_LOGI`，标 not for commit，观测完已 `git checkout` 还原）连续抓 600 秒，全部刷新事件只有两条，都在启动期：
+
+```
+[ 22.8] [REFRESH] request (urgent+full): reason=ui
+[ 23.1] [REFRESH] request (urgent):      reason=ui
+[ 26.6] [REFRESH] request (urgent):      reason=ui
+[ 28.2] [STRATEGY] Diff analysis: bits=2779/240000 (1.16%)
+[ 28.2] [REFRESH] Performing FULL refresh: reason=ui     urgent=1 force_full=1   ← 全刷 #1
+[ 30.9] [REFRESH] request (urgent+full): reason=canvas
+[ 52.8] [STRATEGY] Diff analysis: bits=3864/240000 (1.61%)
+[ 52.8] [REFRESH] Performing FULL refresh: reason=canvas urgent=1 force_full=1   ← 全刷 #2
+```
+
+- **一次交互启动 = 两轮全刷**，相隔 24.6 秒（≈ 一次 EPD 全刷时长），调用者分别是 **UI**（状态栏/外壳绘制）与 **canvas**（`page_sync` 画第一页）。两者各自 `force_full`，没有任何机制把它们合并。
+- **之后 570 秒零刷新**：`Stat` 行在 t=577 与 t=592 都是 `refresh=2 (full=2, partial=0, urgent=2)`，数字不再增长。所以早前看到的"额外面板刷新簇"就是这一次启动模式被我截到中段，**不是周期行为**。
+- 节流本身在工作：`skip(throttle=36, nodiff=37)` —— 那三条紧挨着的 `reason=ui` 请求大多被节流吃掉了。
+- **代价与范围**：每次 `force_full` 全刷 ≈ 25 秒清醒期。这在**交互启动**（插电 / 按键唤醒）上代价是可见的两次闪屏与双倍面板磨损；**电池占空比路径不受影响**——quiet 唤醒不建 UI，只有 canvas 那一次（这正是实测清醒窗 16.0s 与 8.2s 的差别来源）。
+- 修法（**未做，需决定**）：让 UI 的启动绘制不 `force_full`，或把它推迟到 canvas 首帧之后合并成一次。属于行为变更，不由本次清理顺手带上。
 
 **实测记录（2026-09-11 22:55-22:57，插电态）**：启动日志已证 1 / 5a / 7 三条，判据与观测时间戳如下表「实测」列。
 
