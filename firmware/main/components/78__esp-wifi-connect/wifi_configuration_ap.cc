@@ -810,7 +810,12 @@ void WifiConfigurationAp::WifiEventHandler(void* arg, esp_event_base_t event_bas
     } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*) event_data;
         ESP_LOGE(TAG, "WiFi disconnected: reason=%d (SSID=%s)", event->reason, event->ssid);
-        if (self->on_provisioning_state_) self->on_provisioning_state_("error", event->reason);
+        // 只在配网连接尝试期间报错。ConnectToWifi 成功后会主动
+        // esp_wifi_disconnect() 交还 STA（让 StartStation 接管），
+        // 那次断开不是错误——否则刚显示「已连接」立刻被回滚成 Error。
+        if (self->is_connecting_ && self->on_provisioning_state_) {
+            self->on_provisioning_state_("error", event->reason);
+        }
         xEventGroupSetBits(self->event_group_, WIFI_FAIL_BIT);
     } else if (event_id == WIFI_EVENT_SCAN_DONE) {
         std::lock_guard<std::mutex> lock(self->mutex_);

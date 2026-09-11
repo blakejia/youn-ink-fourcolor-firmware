@@ -71,18 +71,21 @@ void show_bitmap(const uint8_t* bitmap) {
     page_sync_stop_display();  // 通知全屏期间标记画板不再主导屏幕
 }
 
-void dismiss_locked_state() {
+void clear_notify_state() {
     s_state = NotifyState::IDLE;
     s_notification_id[0] = '\0';
     if (s_timeout_timer) {
         xTimerStop(s_timeout_timer, 0);
     }
-    // 恢复画板当前页（自动轮换重置到当前页，替代原始内容快照）
+}
+
+void dismiss_locked_state() {
+    clear_notify_state();
+    // 取回屏幕所有权并重绘当前页；无页时重绘空页提示。
+    // 旧的 resume+prev+next 会做两次全屏刷新，且零页时 prev/next 空转、
+    // 空页提示不再重绘，屏幕永久停在通知位图。
     page_sync_resume_display();
-    if (page_sync_is_displaying()) {
-        page_sync_prev();
-        page_sync_next();
-    }
+    page_sync_redraw_current();
 }
 
 // 5min 超时：dismiss 涉及显示工作（xSemaphoreTake + page_sync 重绘），不能跑在
@@ -290,4 +293,11 @@ extern "C" void notify_dismiss(void) {
     if (s_state != NotifyState::NOTIFYING) return;
     dismiss_locked_state();
     ESP_LOGI(kTag, "notify dismissed");
+}
+
+extern "C" void notify_dismiss_quiet(void) {
+    if (s_state != NotifyState::NOTIFYING) return;
+    // 只清状态，不恢复画板显示：调用方（离开当前屏）随后自己接管屏幕。
+    clear_notify_state();
+    ESP_LOGI(kTag, "notify dismissed (screen left to caller)");
 }

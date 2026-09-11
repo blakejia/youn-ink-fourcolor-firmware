@@ -316,10 +316,12 @@ void WifiManager::StartConfigAp() {
         if (provisioning_state_callback_) provisioning_state_callback_(state, reason);
     });
 
-    config_ap_->Start();
+    // Start() 内部会同步回调 on_provisioning_state_("ap_started")，回调链
+    // 会读 GetApSsid()（需要 config_mode_active_）并再次获取 mutex_，
+    // 因此必须先置位、并放开锁再调用，否则同线程二次加锁自死锁。
     config_mode_active_ = true;
-
     mutex_.unlock();
+    config_ap_->Start();
     NotifyEvent(WifiEvent::ConfigModeEnter);
     mutex_.lock();
 }

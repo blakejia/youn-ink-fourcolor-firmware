@@ -28,6 +28,7 @@ static uint64_t s_current_page_started_us = 0;
 static bool s_manual_hold = false;   // 手动翻页后暂停自动轮换 30s
 static uint64_t s_manual_hold_until_us = 0;
 static bool s_displaying = false;    // 画板当前全屏显示中
+static bool s_suspended = false;     // 屏幕被 UI/通知占用，画板不得绘制
 static bool s_running = false;
 
 extern Display* create_board_display_placeholder();  // not used; resolved via board
@@ -166,19 +167,33 @@ static bool sync_once(void) {
         }
     }
 
+    bool all_ready = true;
+    for (int i = 0; i < new_count; i++) {
+        if (!new_pages[i].on_ram) {
+            all_ready = false;
+            break;
+        }
+    }
+
     free_pages();
     memcpy(s_pages, new_pages, sizeof(new_pages));
     s_page_count = new_count;
-    strncpy(s_schedule_md5, new_schedule_md5, sizeof(s_schedule_md5) - 1);
-    s_current_index = 0;
-    s_current_page_started_us = now_us();
-    ESP_LOGI(kTag, "schedule updated: %d pages, %d downloaded", s_page_count, downloaded);
+    if (all_ready) {
+        // 只有全部位图就绪才提交 schedule_md5。旧行为无条件提交，
+        // 一旦某页下载失败就会在下一轮命中 md5 早退而永不重试（该页永久空白）。
+        strncpy(s_schedule_md5, new_schedule_md5, sizeof(s_schedule_md5) - 1);
+        s_current_index = 0;
+        s_current_page_started_us = now_us();
+    }
+    ESP_LOGI(kTag, "schedule updated: %d pages, %d downloaded%s", s_page_count, downloaded,
+             all_ready ? "" : " (retrying missing bitmaps)");
     return true;
 }
 
 static void show_page(int index) {
     if (index < 0 || index >= s_page_count) return;
     if (!s_pages[index].on_ram || !s_pages[index].bitmap) return;
+    if (s_suspended) return;  // 屏幕被 UI/通知占用
     if (!s_display) {
         ESP_LOGW(kTag, "no display wired");
         return;
@@ -210,9 +225,10 @@ static void show_empty_hint(void) {
         ESP_LOGW(kTag, "no display wired for empty hint");
         return;
     }
+    if (s_suspended) return;  // 屏幕被 UI/通知占用
     auto* lcd = static_cast<CustomLcdDisplay*>(s_display);
-    xSemaphoreTake(lcd->GetMutex(), portMAX_DELAY);
-    lcd->EPD_Clear();
+    // DrawTexts 内部自行获取 dirty_mutex（非递归），此处不得再持有它——
+    // 否则同任务二次加锁会永久自锁并一直占着 dirty_mutex，冻死整机刷新。
     std::vector<Display::TextItem> texts;
     Display::TextItem title;
     title.content = "未配置画板页";
@@ -232,8 +248,7 @@ static void show_empty_hint(void) {
     texts.push_back(title);
     texts.push_back(sub1);
     texts.push_back(sub2);
-    lcd->DrawTexts(texts, true);
-    xSemaphoreGive(lcd->GetMutex());
+    lcd->DrawTexts(texts, true);  // clear=true 内部完成清屏 + 加锁
     lcd->RequestUrgentFullRefresh();
     s_displaying = true;
     ESP_LOGI(kTag, "show empty page hint (no pages configured)");
@@ -258,13 +273,43 @@ void page_sync_prev(void) {
 }
 
 bool page_sync_is_displaying(void) { return s_displaying; }
-void page_sync_stop_display(void) { s_displaying = false; }
-void page_sync_resume_display(void) { s_displaying = true; }
+
+void page_sync_stop_display(void) {
+    // UI/通知接管屏幕：挂起画板绘制，否则下一轮轮换会把 UI 页面盖回画布。
+    s_suspended = true;
+    s_displaying = false;
+}
+
+void page_sync_resume_display(void) {
+    s_suspended = false;
+    s_displaying = true;
+}
+
+void page_sync_redraw_current(void) {
+    if (s_page_count > 0) {
+        show_page(s_current_index);
+    } else {
+        show_empty_hint();
+        s_empty_hint_shown = true;
+    }
+}
+
+void page_sync_allow_display(void) {
+    if (!s_suspended) return;
+    s_suspended = false;
+    page_sync_redraw_current();
+}
 static void page_sync_task(void* arg) {
     ESP_LOGI(kTag, "page_sync task started");
     int tick = 0;
     while (s_running) {
         sync_once();
+        // 屏幕被 UI/通知占用：只保持数据同步，不绘制（否则会盖掉 UI 页面/通知）
+        if (s_suspended) {
+            tick++;
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
         // 无页时显示空页提示（不空白）
         if (s_page_count == 0) {
             if (!s_empty_hint_shown) {
@@ -298,6 +343,8 @@ static void page_sync_task(void* arg) {
 
 void page_sync_start(void) {
     if (s_running) return;
+    // 启动画板 = 画板接管屏幕（覆盖此前任何 UI 挂起）
+    s_suspended = false;
     s_running = true;
     if (xTaskCreatePinnedToCore(page_sync_task, "page_sync", 8192, nullptr, 3, nullptr, 1) != pdPASS) {
         ESP_LOGE(kTag, "failed to create page_sync task");

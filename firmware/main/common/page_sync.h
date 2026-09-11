@@ -34,11 +34,20 @@ void page_sync_prev(void);
 /** 画板当前是否在全屏显示（供按钮路由判断） */
 bool page_sync_is_displaying(void);
 
-/** 退出画板显示（恢复 UI 主导屏幕），画布内容仍缓存 */
+/**
+ * 交出屏幕所有权（挂起画板绘制），画布内容仍缓存。
+ * 挂起期间 page_sync 不再绘制，避免把 UI 页面/通知盖掉。
+ */
 void page_sync_stop_display(void);
 
-/** 重新进入画板显示（显示当前页） */
+/** 取回屏幕所有权并立即重绘当前页（通知关闭后调用） */
 void page_sync_resume_display(void);
+
+/** 允许画板再次接管屏幕（离开 Settings 等 UI 页面时调用），有页则立即重绘 */
+void page_sync_allow_display(void);
+
+/** 立即重绘当前页；无页时重绘空页提示 */
+void page_sync_redraw_current(void);
 
 #ifdef __cplusplus
 }

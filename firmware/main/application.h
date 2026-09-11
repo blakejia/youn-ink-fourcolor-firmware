@@ -63,7 +63,7 @@ private:
     std::unique_ptr<ui::RawDrawUiManager> rawdraw_ui_manager_;
     esp_timer_handle_t sleep_timer_ = nullptr;
 
-    void ArmSyncSleepTimer();
+    void ArmSyncSleepTimer(int interval_minutes_override = 0);
     void EnterScheduledSleep();
     void EnterManualSleep();
     void NoteButtonActivity();

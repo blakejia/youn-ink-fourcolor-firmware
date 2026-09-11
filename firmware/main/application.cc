@@ -96,13 +96,48 @@ bool IsLocalHttpServiceRunning(const ui::RawDrawUiManager* manager) {
 }
 
 std::atomic<bool> s_pairing_started{false};
+std::atomic<bool> s_pairing_done{false};
+
+/** 注册配网状态回调（配网页/配网态变化 → 屏与状态机）。
+ *  EnterWifiConfigMode 与开机/无 base_url 两条起 AP 路径共用，
+ *  否则开机路径起 AP 时回调为空，5 个 provisioning 事件全被丢弃。 */
+void RegisterProvisioningStateCallback() {
+    WifiManager::GetInstance().SetProvisioningStateCallback(
+        [](const std::string& state, int reason) {
+            auto& app = Application::GetInstance();
+            app.UpdateWifiStatusForProvisioning(state, reason);
+            if (state == "provisioned") {
+                app.TransitionLifecycle(kLifecycleWifiConnecting, "provisioned");
+            } else if (state == "error") {
+                app.TransitionLifecycle(
+                    kLifecycleApProvision,
+                    ("provision failed reason=" + std::to_string(reason)).c_str());
+            } else {
+                app.TransitionLifecycle(kLifecycleApProvision, state.c_str());
+            }
+        });
+}
 
 void ServerPairingTaskTrampoline(void*) {
     ServerPairStatus st = server_pairing_init();
     if (st == SERVER_PAIR_NEEDS_PROVISION) {
-        ESP_LOGW(kTag, "ServerPairing: no base_url — 请重新配网");
-        Application::GetInstance().TransitionLifecycle(
-            kLifecycleApProvision, "no base_url");
+        // 有 WiFi 凭据但缺 base_url：必须真起配网 AP。此前只置 ApProvision
+        // 而不起 AP，等于假状态：没有 AP 可连、屏上无提示，且 DOWN 长按
+        // 被「配网中忽略」永久吞掉（Settings 是唯一重置网络入口）。
+        ESP_LOGW(kTag, "ServerPairing: no base_url — 启动配网 AP");
+        auto& wifi = WifiManager::GetInstance();
+        RegisterProvisioningStateCallback();
+        wifi.StartConfigAp();  // 触发 ConfigModeEnter → ApProvision + 配网页
+        if (wifi.IsConfigMode()) {
+            if (auto* ui = Application::GetInstance().GetRawDrawUiManager()) {
+                ui->ShowWifiConfigPage(wifi.GetApSsid(), wifi.GetApPassword(),
+                                       wifi.GetApWebUrl());
+            }
+        } else {
+            ESP_LOGE(kTag, "ServerPairing: 配网 AP 启动失败");
+            Application::GetInstance().TransitionLifecycle(
+                kLifecycleError, "config AP start failed");
+        }
         vTaskDelete(nullptr);
         return;
     }
@@ -113,7 +148,16 @@ void ServerPairingTaskTrampoline(void*) {
             kLifecyclePairStart, "needs pairing");
         server_pairing_set_display_cb([](const char* code, int expires_in) {
             if (code == nullptr) {
-                return;  // 配对成功清除显示，SyncIdle 跃迁随后即到
+                if (expires_in < 0) {
+                    // 配对失败：上屏 WiFi 状态页显示错误（此前既不报错也无提示）
+                    ESP_LOGE(kTag, "ServerPairing: 配对失败，显示错误页");
+                    auto& app = Application::GetInstance();
+                    app.UpdateWifiStatusForProvisioning("error", expires_in);
+                    if (auto* ui = app.GetRawDrawUiManager()) {
+                        ui->ShowWifiConfigPage("", "", "");
+                    }
+                }
+                return;  // expires_in >= 0：配对成功清除显示，SyncIdle 跃迁随后即到
             }
             ESP_LOGI(kTag, "ServerPairing: 配对码 %s (有效 %d 秒)", code, expires_in);
             Application::GetInstance().TransitionLifecycle(
@@ -124,10 +168,25 @@ void ServerPairingTaskTrampoline(void*) {
             }
         });
         ESP_LOGI(kTag, "ServerPairing: device=%s 开始配对流程", dev_id);
-        if (!server_pairing_run()) {
+        // 有界重试：run() 单次失败不立刻放弃，但也不无限重试。
+        constexpr int kMaxPairAttempts = 3;
+        bool paired = false;
+        for (int attempt = 1; attempt <= kMaxPairAttempts; ++attempt) {
+            if (server_pairing_run()) {
+                paired = true;
+                break;
+            }
+            ESP_LOGE(kTag, "ServerPairing: 第 %d/%d 次配对失败", attempt, kMaxPairAttempts);
+            if (attempt < kMaxPairAttempts) {
+                vTaskDelay(pdMS_TO_TICKS(60000));
+            }
+        }
+        if (!paired) {
             ESP_LOGE(kTag, "ServerPairing: 配对失败（超时/网络不可达）");
             Application::GetInstance().TransitionLifecycle(
                 kLifecycleError, "pairing failed");
+            // 复位去重门，让后续 WiFi 重连事件还能再试一次
+            s_pairing_started.store(false);
             vTaskDelete(nullptr);
             return;
         }
@@ -143,6 +202,7 @@ void ServerPairingTaskTrampoline(void*) {
     page_sync_start();
     Application::GetInstance().TransitionLifecycle(
         kLifecycleSyncIdle, "paired, sync running");
+    s_pairing_done.store(true);
     ESP_LOGI(kTag, "PageSync: started");
     notify_init();
     vTaskDelete(nullptr);
@@ -302,6 +362,17 @@ void Application::Initialize() {
                 wifi_connected_.store(true, std::memory_order_release);
                 StartSntpClockSyncOnce();
                 StartServerPairingOnce();
+                // 已配对且配对任务不再运行（如重新配网后）时补一次 SyncIdle：
+                // Connected 此前没有任何跃迁，而 provisioned/ConfigModeExit 会把
+                // lifecycle 设成 WifiConnecting，且配对任务被 s_pairing_started
+                // 永久去重 → 永卡 WifiConnecting，自动休眠永久失效。
+                if (s_pairing_done.load()) {
+                    char tok[8] = {0};
+                    if (server_pairing_get_token(tok, sizeof(tok))) {
+                        Application::GetInstance().TransitionLifecycle(
+                            kLifecycleSyncIdle, "wifi reconnected, paired");
+                    }
+                }
                 if (rawdraw_ui_manager_ && !rawdraw_ui_manager_->IsLanHttpServerRunning()) {
                     const std::string ip = data.empty() ? WifiManager::GetInstance().GetIpAddress() : data;
                     if (!ip.empty()) {
@@ -338,6 +409,9 @@ void Application::Initialize() {
                 wifi_connected_.store(false, std::memory_order_release);
                 Application::GetInstance().TransitionLifecycle(
                     kLifecycleApProvision, "config AP entered");
+                // 开机/无 base_url 路径也要注册回调，否则 ap_client_connected/
+                // provisioning/provisioned/error 全部无人接收（屏与状态机不动）。
+                RegisterProvisioningStateCallback();
                 if (rawdraw_ui_manager_) {
                     auto& wifi = WifiManager::GetInstance();
                     rawdraw_ui_manager_->ShowWifiConfigPage(wifi.GetApSsid(),
@@ -408,7 +482,7 @@ void Application::OnDownClick() {
 void Application::OnUpLongPress() {
     ESP_LOGI(kTag, "UP long press");
     NoteButtonActivity();
-    // Settings 页 UP 长按返回上一个页面（修：之前原地切 Settings 不动）
+    // 只有 Settings 页响应：返回上一个页面（之前是原地切 Settings 不动）
     if (rawdraw_ui_manager_ &&
         rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::Settings) {
         const auto prev = rawdraw_ui_manager_->GetPreviousPage();
@@ -416,16 +490,23 @@ void Application::OnUpLongPress() {
             ESP_LOGI(kTag, "UP long press - leaving settings");
             rawdraw_ui_manager_->SwitchPage(prev);
         }
+        // 离开 Settings：把屏幕还给画板（此前进 Settings 时挂起过）
+        page_sync_allow_display();
     }
 }
 
 void Application::OnDownLongPress() {
     ESP_LOGI(kTag, "DOWN long press");
     NoteButtonActivity();
-    // 配网中屏蔽：误触离开配网屏会让用户找不到回来的路（AP 本身继续跑）
+    // 统一收口：配网中忽略；离开当前屏前作废孤儿弹窗（否则切屏后
+    // 通知还在后台收 UP/DOWN 当 agree/reject）。
+    // 用 quiet 版：notify_dismiss 会把画板画回屏幕，与随后的 SwitchPage 抢屏。
     if (GetLifecycleState() == kLifecycleApProvision) {
         ESP_LOGI(kTag, "DOWN long press ignored during provisioning");
         return;
+    }
+    if (notify_is_active()) {
+        notify_dismiss_quiet();
     }
     if (rawdraw_ui_manager_) {
         ESP_LOGI(kTag, "DOWN long press - entering settings");
@@ -462,18 +543,14 @@ void Application::OnBootLongPress() {
     NoteButtonActivity();
     if (WifiManager::GetInstance().IsConfigMode()) {
         ESP_LOGI(kTag, "BOOT long press - exiting WiFi config AP");
-        if (rawdraw_ui_manager_) {
-            rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Settings);
-        }
         WifiManager::GetInstance().StartStation();
+        OnDownLongPress();
         return;
     }
-    // 画板显示时 BOOT 长按退出画板，回到 Settings（短按已改为拉取通知）
+    // 画板显示时 BOOT 长按退出画板：复用 OnDownLongPress（含弹窗作废）
     if (page_sync_is_displaying()) {
         page_sync_stop_display();
-        if (rawdraw_ui_manager_) {
-            rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Settings);
-        }
+        OnDownLongPress();
         return;
     }
     if (rawdraw_ui_manager_) {
@@ -498,18 +575,7 @@ void Application::EnterWifiConfigMode() {
     if (rawdraw_ui_manager_ && WifiManager::GetInstance().IsConfigMode()) {
         auto& wifi = WifiManager::GetInstance();
         // Register provisioning state callback for screen updates
-        wifi.SetProvisioningStateCallback(
-            [this](const std::string& state, int reason) {
-                UpdateWifiStatusForProvisioning(state, reason);
-                if (state == "provisioned") {
-                    TransitionLifecycle(kLifecycleWifiConnecting, "provisioned");
-                } else if (state == "error") {
-                    TransitionLifecycle(kLifecycleApProvision,
-                        ("provision failed reason=" + std::to_string(reason)).c_str());
-                } else {
-                    TransitionLifecycle(kLifecycleApProvision, state.c_str());
-                }
-            });
+        RegisterProvisioningStateCallback();
         rawdraw_ui_manager_->ShowWifiConfigPage(wifi.GetApSsid(),
                                                 wifi.GetApPassword(),
                                                 wifi.GetApWebUrl());
@@ -517,7 +583,7 @@ void Application::EnterWifiConfigMode() {
     UpdateStatusBarForUi();
 }
 
-void Application::ArmSyncSleepTimer() {
+void Application::ArmSyncSleepTimer(int interval_minutes_override) {
     if (IsLocalHttpServiceRunning(rawdraw_ui_manager_.get())) {
         if (sleep_timer_ != nullptr) {
             esp_timer_stop(sleep_timer_);
@@ -528,7 +594,9 @@ void Application::ArmSyncSleepTimer() {
 
 
     Settings nvs(kSyncNamespace, false);
-    const int interval_minutes = nvs.GetInt(kSyncIntervalKey, 30);
+    const int interval_minutes = interval_minutes_override > 0
+        ? interval_minutes_override
+        : nvs.GetInt(kSyncIntervalKey, 30);
     if (interval_minutes <= 0) {
         ESP_LOGI(kTag, "Sync sleep interval: 关闭");
         return;
@@ -572,7 +640,10 @@ void Application::EnterScheduledSleep() {
     // 只有 SYNC_IDLE 才允许休眠：配网/配对/连接中一律跳过。
     // （替代旧的 IsConfigMode 特判——状态机统一覆盖）
     if (GetLifecycleState() != kLifecycleSyncIdle) {
-        ESP_LOGI(kTag, "Scheduled sleep skipped: lifecycle not SyncIdle");
+        // 必须重装：esp_timer_start_once 是一次性的，直接 return 会让定时器
+        // 永久失效——之后即使配对成功进入 SyncIdle 也不会再有任何休眠定时器。
+        ESP_LOGI(kTag, "Scheduled sleep skipped: lifecycle not SyncIdle, retry in 1 min");
+        ArmSyncSleepTimer(1);
         return;
     }
     if (IsLocalHttpServiceRunning(rawdraw_ui_manager_.get())) {
@@ -726,7 +797,12 @@ void Application::UpdateWifiStatusForProvisioning(const std::string& state, int 
     } else if (state == "provisioned") {
         status.state = rawdraw::WifiState::Connected;
         status.ssid = wifi.GetSsid();
-        status.server_uri = "http://" + wifi.GetIpAddress() + ":9002";
+        // 显示配网时填写的服务端地址。此前误用设备自身 IP，
+        // 屏上会显示成 http://<本机IP>:9002（与真实服务端无关）。
+        char base_url[128] = {0};
+        status.server_uri = server_pairing_get_base_url(base_url, sizeof(base_url))
+            ? std::string(base_url)
+            : std::string();
     } else if (state == "error") {
         status.state = rawdraw::WifiState::Error;
         status.error_code = reason;

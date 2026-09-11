@@ -390,6 +390,11 @@ void RawDrawUiManager::SwitchPage(RawDrawPageId page) {
         return;  // No change
     }
 
+    // UI 显式切页 = UI 接管屏幕。必须先挂起画板绘制：
+    // 否则 (a) 本函数下面的 Clear 之后 RenderAll 会因画板仍在显示而早退，
+    // 把白屏刷进 EPD；(b) 画板下一轮轮换会把 UI 页面盖回去。
+    page_sync_stop_display();
+
     ESP_LOGI(kTag, "Switching page: %s -> %s",
              GetPageTitle(current_page_), GetPageTitle(page));
 
@@ -490,6 +495,12 @@ void RawDrawUiManager::RefreshActivePage(bool urgent) {
     auto* fb = lcd_ ? lcd_->GetFramebuffer() : nullptr;
     if (!fb) return;
 
+    // 画板主导屏幕时不碰 framebuffer：下面的 Clear 会把画板擦白，而 RenderAll
+    // 会因 page_sync_is_displaying() 早退，最终只剩白屏。
+    if (page_sync_is_displaying()) {
+        return;
+    }
+
     auto* mutex = lcd_->GetMutex();
     if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
     rawdraw::Clear(fb, width_, height_);
@@ -504,6 +515,10 @@ void RawDrawUiManager::RefreshActivePage(bool urgent) {
 void RawDrawUiManager::RefreshActivePageRect(const rawdraw::Rect& rect, bool urgent) {
     auto* fb = lcd_ ? lcd_->GetFramebuffer() : nullptr;
     if (!fb) return;
+
+    if (page_sync_is_displaying()) {
+        return;  // 同上：画板主导屏幕时不擦屏
+    }
 
     auto* mutex = lcd_->GetMutex();
     if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);

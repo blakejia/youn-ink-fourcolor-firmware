@@ -49,6 +49,14 @@ void notify_post_ack(const char *decision);
  */
 void notify_dismiss(void);
 
+/**
+ * @brief 关闭通知展示但不动屏幕所有权（调用方随后自行接管屏幕）
+ *
+ * 用于「离开当前屏」路径：notify_dismiss 会把画板画回屏幕上，
+ * 与紧随其后的 SwitchPage 抢屏，导致 UI 页面被画板盖掉。
+ */
+void notify_dismiss_quiet(void);
+
 #ifdef __cplusplus
 }
 #endif
