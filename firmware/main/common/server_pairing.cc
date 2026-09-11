@@ -22,6 +22,7 @@
 #include <nvs.h>
 #include <ctime>
 #include "device_signature.h"
+#include "pairing.h"
 
 static const char *kTag = "Pairing";
 
@@ -34,19 +35,10 @@ static const char *kNvsDeviceId = "device_id";
 // Board type 常量（与 CMakeLists.txt BOARD_TYPE 一致）
 static const char *kBoardType = "zectrix-s3-epaper-4.2";
 
-// 配对超时：5 分钟（300 秒）
-static const int kPairingTimeoutSec = 300;
-// 轮询间隔：2 秒
-static const int kClaimPollIntervalMs = 2000;
 // HTTP 超时
 static const int kHttpTimeoutMs = 5000;
-// 401/429 后的退避（服务端 pair-start 限流 5 次/300s，立即重发会打成死循环）
-static const int kClaimErrorBackoffMs = 5000;
-// 连续 pair-start 失败上限：达到即 return false，交上层重试/报错
-// （旧实现 while(true) 只有 return true，Error 分支永远不可达）
-static const int kMaxPairStartFailures = 6;
-// 等待 SNTP 的时长与「时间可信」阈值（2020-09-13）
-static const int kClockWaitMs = 5000;
+// 「时间可信」阈值（2020-09-13）。时间未同步时签名时间戳会是 1970，服务端必然
+// 401 且每次失败都消耗一次 per-IP 配额 —— 所以 pairing.rs 决定先等时钟再发。
 static const int64_t kPlausibleUnixSeconds = 1600000000LL;
 
 // 显示回调
@@ -178,22 +170,6 @@ static bool wall_clock_ok(void)
 }
 
 /**
- * @brief 等待 SNTP 把系统时间调好；已同步立即返回 true。
- *
- * 未同步就发 pair-start 的话，签名时间戳是 1970，服务端 ±30s 窗口必然
- * 401，而且每次失败都消耗一次 per-IP 配额（5 次/300s）→ 打成 429 死循环。
- */
-static bool wait_for_wall_clock(void)
-{
-    if (wall_clock_ok()) {
-        return true;
-    }
-    ESP_LOGW(kTag, "系统时间未同步（SNTP 未就绪），等待 %d ms", kClockWaitMs);
-    vTaskDelay(pdMS_TO_TICKS(kClockWaitMs));
-    return wall_clock_ok();
-}
-
-/**
  * @brief 发起 pair-start 请求，返回配对码和过期时间
  * @return true=成功, false=网络错误
  */
@@ -315,99 +291,122 @@ bool server_pairing_run(void)
 
     ESP_LOGI(kTag, "开始配对, device_id=%s", device_id);
 
-    // 配对循环（5 分钟超时后重新 pair-start）
-    int64_t start_time = esp_timer_get_time();
+    // 协议策略（何时要码、何时轮询、何时退避、何时放弃、失败上限）在
+    // pairing.rs 里，由 cargo test 覆盖；这里只做机制。每轮把上一个动作的
+    // 结果喂给决策，再执行它给出的动作与等待时长 —— 常量因此也只有一个来源。
+    int64_t window_start_us = esp_timer_get_time();
     char code[16] = {0};
     int expires_in = 0;
-    int pair_start_failures = 0;
+    uint32_t failures = 0;
+    rf_pairing_outcome_t last = RF_PAIR_OUTCOME_NONE;
 
     while (true) {
-        int64_t elapsed_us = esp_timer_get_time() - start_time;
-        int elapsed_sec = (int)(elapsed_us / 1000000);
+        rf_pairing_inputs_t in = {};
+        in.has_code = (code[0] != '\0') ? 1 : 0;
+        in.clock_ok = wall_clock_ok() ? 1 : 0;
+        in.window_elapsed_s =
+            (uint32_t)((esp_timer_get_time() - window_start_us) / 1000000);
+        in.pair_start_failures = failures;
+        in.last = (uint8_t)last;
 
-        if (elapsed_sec >= kPairingTimeoutSec) {
-            ESP_LOGW(kTag, "配对超时 (%ds)，重新发起 pair-start", kPairingTimeoutSec);
-            start_time = esp_timer_get_time();
+        rf_pairing_decision_t d = {};
+        rf_pairing_decide(&in, &d);
+
+        if (d.drop_code) {
+            if (code[0] != '\0') {
+                ESP_LOGW(kTag, "配对码作废（超时或已失效），重新发起 pair-start");
+            }
             code[0] = '\0';
+            window_start_us = esp_timer_get_time();
+        }
+        if (d.delay_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(d.delay_ms));
         }
 
-        // 如果没有有效 code，发起 pair-start
-        if (code[0] == '\0') {
-            // 时钟未同步先不发：签名时间戳会是 1970，服务端必然 401
-            if (!wait_for_wall_clock()) {
-                if (++pair_start_failures >= kMaxPairStartFailures) {
-                    ESP_LOGE(kTag, "SNTP 长时间未同步，放弃本轮配对");
-                    if (s_display_cb) s_display_cb(nullptr, -1);
-                    return false;
-                }
-                continue;
+        switch (d.action) {
+        case RF_PAIR_ACTION_WAIT:
+            // 时钟仍不可信。这一次等待算一次失败，否则一台永远同步不上的
+            // 设备会无限等下去；上限由决策判定，这里只记账。
+            if (!wall_clock_ok()) {
+                failures++;
+            }
+            last = RF_PAIR_OUTCOME_CLOCK_WAITED;
+            continue;
+
+        case RF_PAIR_ACTION_PAIR_START:
+            if (last == RF_PAIR_OUTCOME_PAIR_START_FAILED) {
+                ESP_LOGE(kTag, "pair-start 失败，%u ms 后重试（已失败 %u 次）",
+                         (unsigned)d.delay_ms, (unsigned)failures);
             }
             ESP_LOGI(kTag, "发起 pair-start...");
             if (!do_pair_start(device_id, code, sizeof(code), &expires_in)) {
-                if (++pair_start_failures >= kMaxPairStartFailures) {
-                    // 必须真实退出：否则 Error 分支不可达，设备永远停在
-                    // PairStart，且首屏从未收到配对码——无码、无错误、无提示。
-                    ESP_LOGE(kTag, "pair-start 连续失败 %d 次，放弃本轮配对",
-                             pair_start_failures);
-                    if (s_display_cb) s_display_cb(nullptr, -1);
-                    return false;
-                }
-                ESP_LOGE(kTag, "pair-start 失败，5 秒后重试 (%d/%d)",
-                         pair_start_failures, kMaxPairStartFailures);
-                vTaskDelay(pdMS_TO_TICKS(5000));
+                failures++;
+                last = RF_PAIR_OUTCOME_PAIR_START_FAILED;
                 continue;
             }
-            pair_start_failures = 0;
+            failures = 0;
+            window_start_us = esp_timer_get_time();
             ESP_LOGI(kTag, "配对码: %s, 有效期: %ds", code, expires_in);
-
-            // 通知 UI 显示配对码
             if (s_display_cb) {
                 s_display_cb(code, expires_in);
             }
+            last = RF_PAIR_OUTCOME_PAIR_STARTED;
+            continue;
+
+        case RF_PAIR_ACTION_CLAIM: {
+            char token[80] = {0};
+            int status = do_pair_claim(device_id, code, token, sizeof(token));
+
+            if (status == 200 && token[0] != '\0') {
+                ESP_LOGI(kTag, "配对成功！写入 token");
+                if (!nvs_write_str(kNvsToken, token)) {
+                    // 落盘失败不能当成功：服务端已签发 token 并置 trust，
+                    // 设备却拿不到 → 之后 page_sync/notify 全 401，两侧状态分叉。
+                    last = RF_PAIR_OUTCOME_TOKEN_WRITE_FAILED;
+                } else {
+                    last = RF_PAIR_OUTCOME_CLAIM_GRANTED;
+                }
+                continue;
+            }
+            if (status == 200) {
+                // 200 且无 token = {"status":"pending"}，正常等待用户确认。
+                ESP_LOGD(kTag, "pair-claim pending：等待用户在服务端确认");
+                last = RF_PAIR_OUTCOME_CLAIM_PENDING;
+                continue;
+            }
+            if (status == 401 || status == 429) {
+                ESP_LOGW(kTag, "pair-claim %d: 换新码并退避重试", status);
+                last = RF_PAIR_OUTCOME_CLAIM_REJECTED;
+                continue;
+            }
+            ESP_LOGW(kTag, "pair-claim 网络错误 (status=%d)，退避重试", status);
+            last = RF_PAIR_OUTCOME_CLAIM_NETWORK_ERROR;
+            continue;
         }
 
-        // 轮询 pair-claim
-        char token[80] = {0};
-        int status = do_pair_claim(device_id, code, token, sizeof(token));
-
-        if (status == 200 && token[0] != '\0') {
-            // 配对成功，写入 NVS
-            ESP_LOGI(kTag, "配对成功！写入 token");
-            if (!nvs_write_str(kNvsToken, token)) {
-                // 落盘失败不能当成功：服务端已签发 token 并置 trust，
-                // 设备却拿不到 → 之后 page_sync/notify 全 401，两侧状态分叉。
-                ESP_LOGE(kTag, "token 写入 NVS 失败，本轮配对作废");
-                if (s_display_cb) s_display_cb(nullptr, -1);
-                return false;
-            }
-
-            // 清除显示
+        case RF_PAIR_ACTION_PAIRED:
             if (s_display_cb) {
                 s_display_cb(nullptr, 0);
             }
             return true;
-        }
 
-        if (status == 200) {
-            // 200 且无 token = 服务端返回 {"status":"pending"}，即正常等待
-            // 用户确认。旧日志误记成 WARNING「网络错误」。
-            ESP_LOGD(kTag, "pair-claim pending：等待用户在服务端确认");
-            vTaskDelay(pdMS_TO_TICKS(kClaimPollIntervalMs));
-            continue;
+        case RF_PAIR_ACTION_GIVE_UP:
+        default:
+            // 必须真实退出：旧实现 while(true) 只有 return true，Error 分支
+            // 永远不可达，设备永远停在 PairStart（无码、无错误、无提示）。
+            if (last == RF_PAIR_OUTCOME_TOKEN_WRITE_FAILED) {
+                ESP_LOGE(kTag, "token 写入 NVS 失败，本轮配对作废");
+            } else if (!wall_clock_ok()) {
+                ESP_LOGE(kTag, "SNTP 长时间未同步，放弃本轮配对");
+            } else {
+                ESP_LOGE(kTag, "pair-start 连续失败 %u 次，放弃本轮配对",
+                         (unsigned)failures);
+            }
+            if (s_display_cb) {
+                s_display_cb(nullptr, -1);
+            }
+            return false;
         }
-
-        if (status == 401 || status == 429) {
-            // 立即换码重发会被服务端 per-IP 限流（5 次/300s）打成死循环，退避。
-            ESP_LOGW(kTag, "pair-claim %d: 换新码并退避重试", status);
-            start_time = esp_timer_get_time();
-            code[0] = '\0';
-            vTaskDelay(pdMS_TO_TICKS(kClaimErrorBackoffMs));
-            continue;
-        }
-
-        // 网络错误 → 退避重试
-        ESP_LOGW(kTag, "pair-claim 网络错误 (status=%d)，退避重试", status);
-        vTaskDelay(pdMS_TO_TICKS(kClaimPollIntervalMs));
     }
 }
 

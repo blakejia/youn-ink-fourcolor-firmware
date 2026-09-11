@@ -21,6 +21,7 @@ pub mod json;
 pub mod log;
 pub mod notify;
 pub mod page_sync;
+pub mod pairing;
 pub mod power;
 pub mod shim;
 
