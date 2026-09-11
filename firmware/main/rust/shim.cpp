@@ -341,12 +341,13 @@ extern "C" void rf_panel_record_invalidate(void) {
 }
 
 extern "C" int rf_wakeup_cause(void) {
-    switch (esp_sleep_get_wakeup_cause()) {
-    case ESP_SLEEP_WAKEUP_TIMER: return 1;
-    case ESP_SLEEP_WAKEUP_EXT0:  return 2;
-    case ESP_SLEEP_WAKEUP_EXT1:  return 3;
-    default:                     return 0;
-    }
+    // esp_sleep_get_wakeup_cause() is deprecated in v6.0; the replacement
+    // returns a bitmap whose bit index is the esp_sleep_wakeup_cause_t value.
+    const uint32_t causes = esp_sleep_get_wakeup_causes();
+    if (causes & (1U << ESP_SLEEP_WAKEUP_TIMER)) return 1;
+    if (causes & (1U << ESP_SLEEP_WAKEUP_EXT0))  return 2;
+    if (causes & (1U << ESP_SLEEP_WAKEUP_EXT1))  return 3;
+    return 0;
 }
 
 extern "C" void rf_rails_audio(int on) {
