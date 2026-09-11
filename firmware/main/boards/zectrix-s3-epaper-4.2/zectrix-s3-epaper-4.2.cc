@@ -176,6 +176,8 @@ public:
     const char* GetNetworkStateIcon() override {
         return nullptr;
     }
+    /// True while a charger/USB is supplying the board.
+    bool IsPowerPresent() const override { return charge_status_.Get().power_present; }
 
     bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
         charge_status_.Tick(GetNowMs());

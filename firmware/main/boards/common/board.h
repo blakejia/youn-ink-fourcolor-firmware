@@ -79,6 +79,9 @@ public:
     // Cut or restore the audio/amp rail. Boards without audio power control
     // keep the no-op default.
     virtual void SetAudioRail(bool /*on*/) {}
+    // True while a charger/USB is supplying the board (Stage 1 power policy:
+    // mains never sleeps). Boards without charger detection keep false.
+    virtual bool IsPowerPresent() const { return false; }
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) { (void)callback; }
     virtual const char* GetNetworkStateIcon() = 0;
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);

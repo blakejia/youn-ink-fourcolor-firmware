@@ -2,6 +2,7 @@
 #define _APPLICATION_H_
 
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include <functional>
 #include <memory>
@@ -37,12 +38,10 @@ public:
     void PlaySound(const std::string_view& sound, int duration_ms);
     void MuteSound();
     void StopSound();
-
     AudioService& GetAudioService() { return audio_service_; }
     ui::RawDrawUiManager* GetRawDrawUiManager() { return rawdraw_ui_manager_.get(); }
     void UpdateStatusBarForUi();
     void UpdateWifiStatusForProvisioning(const std::string& state, int reason);
-
     bool CanEnterSleepMode() const;
      void OnUpClick();
     void OnUpDoubleClick();
@@ -52,6 +51,21 @@ public:
     void OnWifiConfigComboLongPress();
     void OnBootClick();
     void OnBootLongPress();
+
+    // One-shot duty-cycle step both boot paths share (Task 6 quiet path calls
+    // this once per wake): page_sync_sync_once() -> notify_request_next() ->
+    // page_sync_paint_if_changed() (unconditional) -> ServicePowerPolicy().
+    void RunPowerCycle();
+    // Timer-wake (quiet) boots are not user activity: backdate the idle clock
+    // so the policy computes the duty-cycle wake instead of holding the
+    // device inside the interactive grace window. (A fresh boot otherwise
+    // looks "recently active" because the idle clock starts at zero — which
+    // is exactly what gives BOOT wakes their grace.)
+    void NoteQuietWake();
+    // Evaluate the Rust power policy now: sleep until the server's next page
+    // change (bounded by the poll cap and sleep window), or rearm the timer
+    // for the stay-awake interval. Never sleeps on mains.
+    void ServicePowerPolicy();
 
 private:
     Application();
@@ -63,9 +77,15 @@ private:
     AudioService audio_service_;
     std::unique_ptr<ui::RawDrawUiManager> rawdraw_ui_manager_;
     esp_timer_handle_t sleep_timer_ = nullptr;
+    // esp_timer ms of the last button activity; the policy's idle clock reads
+    // this. Zero at boot (fresh boots land inside the grace window, which is
+    // what keeps BOOT wakes awake); negative = quiet wake, grace suppressed.
+    // A member, not a timer-local static, so it survives across callbacks.
+    int64_t last_activity_ms_ = 0;
+    // Consecutive page_sync_sync_once() failures; feeds the policy backoff.
+    uint32_t fail_streak_ = 0;
 
-    void ArmSyncSleepTimer(int interval_minutes_override = 0);
-    void EnterScheduledSleep();
+    void RearmPowerTimer(uint32_t delay_ms);
     void EnterManualSleep();
     void NoteButtonActivity();
     void EnterWifiConfigMode();

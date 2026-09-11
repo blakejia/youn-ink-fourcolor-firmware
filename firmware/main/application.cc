@@ -14,8 +14,10 @@
 #include <esp_sleep.h>
 #include <esp_sntp.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -24,15 +26,14 @@
 #include "ssid_manager.h"
 #include "page_sync.h"
 #include "notify.h"
+#include "power.h"
+#include "shim_power.h"
 
 #include <ctime>
 
 namespace {
-
 constexpr char kTag[] = "Application";
-constexpr char kSyncNamespace[] = "sync";
-constexpr char kSyncIntervalKey[] = "sync_interval";
-
+constexpr char kPowerNamespace[] = "power";
 
 // Index space is the pushed item list, Section rows included:
 // 0 系统 / 1 重启 / 2 重置网络 / 3 网络 / 4 Wi-Fi / 5 省电模式 / 6 关于 / 7 固件
@@ -184,6 +185,19 @@ void ServerPairingTaskTrampoline(void*) {
     notify_init();
     vTaskDelete(nullptr);
 }
+
+// Charger-insert deep-sleep wake (ext1). The unplugged level of
+// CHARGE_DETECT_GPIO is an assumption, not a measured fact: see
+// CHARGE_DETECT_PLUG_PULLS_LOW in config.h — if the matrix shows the idle
+// level is LOW, flip the constant and this follows.
+void EnableChargerInsertWakeup() {
+    // v6.0 deprecates esp_sleep_enable_ext1_wakeup in favour of the _io pair.
+#if CHARGE_DETECT_PLUG_PULLS_LOW
+    esp_sleep_enable_ext1_wakeup_io(1ULL << CHARGE_DETECT_GPIO, ESP_EXT1_WAKEUP_ANY_LOW);
+#else
+    esp_sleep_enable_ext1_wakeup_io(1ULL << CHARGE_DETECT_GPIO, ESP_EXT1_WAKEUP_ANY_HIGH);
+#endif
+}
 }  // namespace
 
 Application::Application() = default;
@@ -308,7 +322,9 @@ void Application::Initialize() {
                     }
                 }
                 UpdateStatusBarForUi();
-                ArmSyncSleepTimer();
+                // First policy evaluation promptly after WiFi comes up; the
+                // decision rearms the timer itself from here on.
+                RearmPowerTimer(3000);
                 break;
             case NetworkEvent::Disconnected:
                 ESP_LOGI(kTag, "WiFi disconnected");
@@ -495,6 +511,9 @@ void Application::NoteButtonActivity() {
     if (rawdraw_ui_manager_) {
         rawdraw_ui_manager_->RequestActivePageRefresh();
     }
+    // The policy's idle clock starts here: until now no interaction ever
+    // reset the sleep timer, so a device mid-use could doze off.
+    last_activity_ms_ = esp_timer_get_time() / 1000;
 }
 
 void Application::EnterWifiConfigMode() {
@@ -512,19 +531,11 @@ void Application::EnterWifiConfigMode() {
     UpdateStatusBarForUi();
 }
 
-void Application::ArmSyncSleepTimer(int interval_minutes_override) {
-    Settings nvs(kSyncNamespace, false);
-    const int interval_minutes = interval_minutes_override > 0
-        ? interval_minutes_override
-        : nvs.GetInt(kSyncIntervalKey, 30);
-    if (interval_minutes <= 0) {
-        ESP_LOGI(kTag, "Sync sleep interval: 关闭");
-        return;
-    }
+void Application::RearmPowerTimer(uint32_t delay_ms) {
     if (sleep_timer_ == nullptr) {
         esp_timer_create_args_t args = {};
         args.callback = [](void* arg) {
-            static_cast<Application*>(arg)->EnterScheduledSleep();
+            static_cast<Application*>(arg)->ServicePowerPolicy();
         };
         args.arg = this;
         args.dispatch_method = ESP_TIMER_TASK;
@@ -532,10 +543,91 @@ void Application::ArmSyncSleepTimer(int interval_minutes_override) {
         ESP_ERROR_CHECK(esp_timer_create(&args, &sleep_timer_));
     }
     esp_timer_stop(sleep_timer_);
-    const int64_t delay_us = static_cast<int64_t>(interval_minutes) * 60 * 1000 * 1000;
-    ESP_LOGI(kTag, "Sync sleep interval: %d minutes", interval_minutes);
-    ESP_LOGI(kTag, "Scheduling sleep after sync interval: %d minutes", interval_minutes);
-    ESP_ERROR_CHECK(esp_timer_start_once(sleep_timer_, delay_us));
+    if (delay_ms == 0) {
+        return;
+    }
+    ESP_LOGI(kTag, "Power policy re-armed in %u ms", delay_ms);
+    ESP_ERROR_CHECK(esp_timer_start_once(sleep_timer_, (int64_t)delay_ms * 1000));
+}
+
+void Application::NoteQuietWake() {
+    // Negative backdates the idle clock past any grace window; see
+    // ServicePowerPolicy's idle_ms computation.
+    last_activity_ms_ = -1;
+}
+
+void Application::RunPowerCycle() {
+    // The one-shot duty-cycle step both boot paths share (Task 6 calls this
+    // once per quiet wake). Each stage takes and releases the module locks
+    // in turn — state -> display order holds, never nested — so there is no
+    // lock-order risk across the sequence.
+    const bool ok = page_sync_sync_once();
+    if (ok) {
+        fail_streak_ = 0;
+    } else {
+        ++fail_streak_;
+    }
+    notify_request_next();
+    // Unconditional, even on an empty schedule: that call draws and records
+    // the empty hint, which is what makes the canvas's display-ownership
+    // claim honest.
+    page_sync_paint_if_changed();
+    ServicePowerPolicy();
+}
+
+void Application::ServicePowerPolicy() {
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    Settings nvs(kPowerNamespace, true);
+    rf_power_inputs_t in = {};
+    in.mains = Board::GetInstance().IsPowerPresent() ? 1 : 0;
+    in.notify_active = notify_is_active() ? 1 : 0;
+    // CanSleepNow folds in the lifecycle gate (SyncIdle only) plus the panel/
+    // audio busy bookkeeping, holds and deadlines — the three checks the old
+    // EnterScheduledSleep spelled out by hand.
+    in.busy = SleepManager::GetInstance().CanSleepNow() ? 0 : 1;
+    in.sync_ok = page_sync_sync_ok() ? 1 : 0;
+    in.screen_active = page_sync_screen_active() ? 1 : 0;
+    in.on_canvas = page_sync_is_displaying() ? 1 : 0;
+    // Negative last_activity_ms_ = quiet wake: backdate past any grace window
+    // so the duty-cycle wake is computed straight away.
+    in.idle_ms = (last_activity_ms_ < 0)
+        ? UINT64_MAX
+        : (uint64_t)(now_ms - last_activity_ms_);
+    in.grace_ms = (uint32_t)nvs.GetInt("idle_grace_min", 3) * 60000u;
+    in.max_sleep_s = (uint32_t)nvs.GetInt("max_sleep_min", 60) * 60u;
+    in.poll_s = page_sync_poll_s();
+    in.sleep_poll_s = page_sync_sleep_poll_s();
+    in.fail_streak = fail_streak_;
+    // -1 means unknown/empty schedule; decide() maps negatives to None and
+    // sleeps for the cap. Never pre-clamp to 0 here: 0 reads as "a page
+    // changes right now" and floors at 60 s.
+    in.seconds_until_next_page = page_sync_next_wake_s();
+
+    rf_power_decision_t d = {};
+    rf_power_decide(&in, &d);
+
+    if (!d.sleep) {
+        ESP_LOGI(kTag, "Stay awake (%u ms)", d.stay_awake_ms);
+        RearmPowerTimer(d.stay_awake_ms);
+        return;
+    }
+    if (d.invalidate_panel) {
+        rf_panel_record_invalidate();
+    }
+    ESP_LOGI(kTag, "Deep sleep %u s (mains=%d sync_ok=%d)", d.wake_s,
+             (int)in.mains, (int)in.sync_ok);
+    TransitionLifecycle(kLifecycleSleep, "power policy");
+    wifi_connected_.store(false, std::memory_order_release);
+    // Amp off before audio power off (silent), then radio off.
+    rf_rails_audio(0);
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    esp_sleep_enable_timer_wakeup((uint64_t)d.wake_s * 1000000ULL);
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_BUTTON_GPIO, 0);
+    // Sleeping on mains is unreachable (decide() holds awake there), so the
+    // charger pin is high here and ANY_LOW fires on plug-in. See config.h.
+    EnableChargerInsertWakeup();
+    esp_deep_sleep_start();
 }
 
 void Application::StartServerPairingOnce() {
@@ -562,55 +654,29 @@ bool Application::CanEnterSleepMode() const {
     return GetLifecycleState() == kLifecycleSyncIdle;
 }
 
-void Application::EnterScheduledSleep() {
-    // 只有 SYNC_IDLE 才允许休眠：配网/配对/连接中一律跳过。
-    // （替代旧的 IsConfigMode 特判——状态机统一覆盖）
-    if (!CanEnterSleepMode()) {
-        // 必须重装：esp_timer_start_once 是一次性的，直接 return 会让定时器
-        // 永久失效——之后即使配对成功进入 SyncIdle 也不会再有任何休眠定时器。
-        ESP_LOGI(kTag, "Scheduled sleep skipped: lifecycle not SyncIdle, retry in 1 min");
-        ArmSyncSleepTimer(1);
-        return;
-    }
-    // The busy bookkeeping was always fed (audio sets Audio, the panel sets
-    // Display on every queue/refresh) but nothing ever read it, so a deep sleep
-    // could start mid-refresh: a four-colour refresh takes >= 15 s and the panel
-    // latches garbage if the waveform is interrupted. Consult it.
-    if (!SleepManager::GetInstance().CanSleepNow()) {
-        ESP_LOGI(kTag, "Scheduled sleep deferred: busy=0x%x holds=%d deadline_in=%lldms",
-                 (unsigned)SleepManager::GetInstance().GetBusyMask(),
-                 SleepManager::GetInstance().GetHoldCount(),
-                 (long long)(SleepManager::GetInstance().GetDeadlineMs() -
-                             esp_timer_get_time() / 1000));
-        ArmSyncSleepTimer(1);
-        return;
-    }
-    if (notify_is_active()) {
-        ESP_LOGI(kTag, "Scheduled sleep deferred: notification on screen");
-        ArmSyncSleepTimer(1);
-        return;
-    }
-
-    ESP_LOGI(kTag, "Entering deep sleep after sync interval; BOOT wakes device");
-    TransitionLifecycle(kLifecycleSleep, "scheduled sleep");
-    wifi_connected_.store(false, std::memory_order_release);
-    esp_wifi_disconnect();
-    esp_wifi_stop();
-    esp_sleep_enable_ext0_wakeup(static_cast<gpio_num_t>(BOOT_BUTTON_GPIO), 0);
-    esp_deep_sleep_start();
-}
-
 void Application::EnterManualSleep() {
     ESP_LOGI(kTag, "Entering manual deep sleep; stopping local services and WiFi");
     if (sleep_timer_ != nullptr) {
         esp_timer_stop(sleep_timer_);
     }
+    // Settings owns the screen here, so an RTC panel record claiming the
+    // canvas is up would be a lie on the next wake: drop it, exactly as the
+    // policy does when sleeping off-canvas.
+    rf_panel_record_invalidate();
+    // Same teardown order as the policy path: amp off before audio power off
+    // (silent shutdown, no pop), then the radio.
+    rf_rails_audio(0);
     wifi_connected_.store(false, std::memory_order_release);
     esp_wifi_disconnect();
     esp_wifi_stop();
     UpdateStatusBarForUi();
     vTaskDelay(pdMS_TO_TICKS(300));
     esp_sleep_enable_ext0_wakeup(static_cast<gpio_num_t>(BOOT_BUTTON_GPIO), 0);
+    // Charger-insert wake like the policy path — but only while actually
+    // unplugged: asleep-on-mains with ANY_LOW armed would wake instantly.
+    if (!Board::GetInstance().IsPowerPresent()) {
+        EnableChargerInsertWakeup();
+    }
     esp_deep_sleep_start();
 }
 
