@@ -80,6 +80,10 @@ public:
 
     // Notify when refresh transitions from busy to idle.
     void SetOnRefreshIdle(std::function<void()> cb);
+    // Append another idle listener without replacing the one already set.
+    // (The sleep shim commits its RTC panel record from here; replacing the
+    // UI manager's input-unlock callback would lock navigation input forever.)
+    void AddOnRefreshIdle(std::function<void()> cb);
     void SetNextKickMs(uint32_t kick_ms);
     
 private:

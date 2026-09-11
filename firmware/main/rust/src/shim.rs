@@ -82,6 +82,15 @@ unsafe extern "C" {
     /// Paints the "no pages configured" screen from the C++ side (it needs
     /// `std::vector<TextItem>`, which is a display concern, not logic).
     pub fn rf_draw_empty_hint();
+    // ── sleep power (shim_power.h) ──
+    /// Copies the RTC panel record into `out` (a 48-byte `rf_panel_record_t`).
+    pub fn rf_panel_record_get(out: *mut u8);
+    pub fn rf_panel_mark_pending(md5: *const c_char, index: c_int);
+    pub fn rf_panel_record_invalidate();
+    /// 0 = other, 1 = timer, 2 = ext0(BOOT), 3 = ext1(charger insert).
+    pub fn rf_wakeup_cause() -> c_int;
+    /// Audio + amp rail. Nonzero = on.
+    pub fn rf_rails_audio(on: c_int);
 }
 
 /// `abort()`, used by the panic handler.
@@ -235,7 +244,52 @@ pub(crate) mod host {
         drop(c);
         FB.lock().unwrap_or_else(|e| e.into_inner()).take();
         ALLOCS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        AUDIO_ON.store(true, std::sync::atomic::Ordering::SeqCst);
         guard
+    }
+
+    static PANEL_REC: Mutex<Option<(String, i32)>> = Mutex::new(None);
+    // rf_panel_record_get writes 48 bytes; see rf_panel_record_t.
+    static AUDIO_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_panel_record_get(out: *mut u8) {
+        // 33-byte md5 slot + valid byte at offset 4, matching rf_panel_record_t.
+        let g = PANEL_REC.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            // sizeof(rf_panel_record_t) == 48; the caller's buffer is the struct,
+            // and zeroing only the md5 slot would leave index/pad bytes stale.
+            core::ptr::write_bytes(out, 0, 48);
+            match g.as_ref() {
+                Some((md5, _)) => {
+                    *out.add(4) = 1;
+                    core::ptr::copy_nonoverlapping(md5.as_ptr(), out.add(8), md5.len().min(32));
+                }
+                None => *out.add(4) = 0,
+            }
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_panel_mark_pending(md5: *const c_char, index: c_int) {
+        let md5 = cstr(md5);
+        *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = Some((md5, index));
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_panel_record_invalidate() {
+        *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_wakeup_cause() -> c_int {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_rails_audio(on: c_int) {
+        AUDIO_ON.store(on != 0, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Any request whose URL contains `suffix` gets `status` + `body`.

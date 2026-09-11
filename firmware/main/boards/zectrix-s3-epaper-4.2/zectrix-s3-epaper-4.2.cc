@@ -257,6 +257,19 @@ public:
         }
     }
 
+    void SetAudioRail(bool on) override {
+        if (power_ == nullptr) {
+            return;
+        }
+        if (on) {
+            power_->PowerAudioOn();
+            power_->PowerAmpOn();
+        } else {
+            power_->PowerAmpOff();
+            power_->PowerAudioOff();
+        }
+    }
+
 private:
     static int64_t GetNowMs() {
         return esp_timer_get_time() / 1000;

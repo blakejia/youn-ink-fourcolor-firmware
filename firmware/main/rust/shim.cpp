@@ -21,15 +21,19 @@
 #include <string.h>
 #include <time.h>
 
+#include <esp_attr.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
-#include <esp_mac.h>
-#include <esp_random.h>
-#include <esp_timer.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
-#include <freertos/task.h>
-#include <freertos/timers.h>
+ #include <esp_mac.h>
+ #include <esp_random.h>
+#include <esp_sleep.h>
+ #include <esp_timer.h>
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/semphr.h>
+ #include <freertos/task.h>
+ #include <freertos/timers.h>
+
+#include "shim_power.h"
 
 #include "board.h"
 #include "boards/zectrix-s3-epaper-4.2/custom_lcd_display.h"
@@ -76,6 +80,21 @@ void timer_trampoline(TimerHandle_t) {
 
 // Whether `rf_fb_begin` currently holds the display mutex.
 bool g_fb_taken = false;
+// Panel content survives deep sleep in RTC memory, so a wake that changes
+// nothing can skip a >= 15 s full refresh. RTC_DATA_ATTR is retained across
+// deep sleep and soft resets, lost on power-on (magic fails -> repaint).
+RTC_DATA_ATTR static rf_panel_record_t g_panel_rec;
+// md5 of the frame we asked for; committed only when the refresh goes idle, so
+// an interrupted refresh cannot be recorded as done.
+static char g_pending_md5[33];
+static int g_pending_index = -1;
+static bool g_pending_valid = false;
+// Guards g_panel_rec against g_pending_* on both writer sides (page-sync task
+// marks pending, the display refresh task commits) and the record reader. A
+// spinlock, not a mutex: the sections are a few byte copies, must not block,
+// and taking no other lock inside keeps it a leaf that cannot deadlock
+// against the display mutex.
+static portMUX_TYPE g_panel_mux = portMUX_INITIALIZER_UNLOCKED;
 
 } // namespace
 
@@ -199,6 +218,31 @@ extern "C" void rf_set_display(void *display) {
     // The display is resolved through Board on demand; this exists so the
     // firmware's existing `page_sync_set_display(...)` injection point stays.
     (void)display;
+    // Commit the pending md5 once the panel reports idle: this is what makes
+    // "skip the repaint next wake" safe. Registered here because this is the
+    // only Rust-side hook that runs after pairing (application.cc:
+    // page_sync_set_display -> page_sync_set_display -> set_display -> here).
+    // AddOnRefreshIdle chains instead of replacing: RawDrawUiManager::Init
+    // already owns the Set slot with its input-unlock callback.
+    static bool s_refresh_watch_registered = false;
+    if (!s_refresh_watch_registered) {
+        CustomLcdDisplay *d = lcd();
+        if (d != nullptr) {
+            d->AddOnRefreshIdle([]() {
+                portENTER_CRITICAL(&g_panel_mux);
+                if (g_pending_valid) {
+                    g_panel_rec.magic = RF_PANEL_MAGIC;
+                    g_panel_rec.valid = 1;
+                    memcpy(g_panel_rec.displayed_md5, g_pending_md5,
+                           sizeof(g_panel_rec.displayed_md5));
+                    g_panel_rec.displayed_index = g_pending_index;
+                    g_pending_valid = false;
+                }
+                portEXIT_CRITICAL(&g_panel_mux);
+            });
+            s_refresh_watch_registered = true;
+        }
+    }
 }
 
 extern "C" int rf_fb_len(void) {
@@ -265,6 +309,48 @@ extern "C" void rf_draw_empty_hint(void) {
     texts.push_back(sub1);
     texts.push_back(sub2);
     d->DrawTexts(texts, true);
+}
+
+// ─────────────────── panel record / wakeup / rails ───────────────────
+
+extern "C" void rf_panel_record_get(rf_panel_record_t *out) {
+    if (out == nullptr) return;
+    portENTER_CRITICAL(&g_panel_mux);
+    *out = g_panel_rec;
+    portEXIT_CRITICAL(&g_panel_mux);
+}
+
+extern "C" void rf_panel_mark_pending(const char *md5, int index) {
+    if (md5 == nullptr) return;
+    // Format outside the critical section; only the publish is locked.
+    char staged[33];
+    snprintf(staged, sizeof(staged), "%s", md5);
+    portENTER_CRITICAL(&g_panel_mux);
+    memcpy(g_pending_md5, staged, sizeof(g_pending_md5));
+    g_pending_index = index;
+    g_pending_valid = true;
+    portEXIT_CRITICAL(&g_panel_mux);
+}
+
+extern "C" void rf_panel_record_invalidate(void) {
+    portENTER_CRITICAL(&g_panel_mux);
+    g_panel_rec.valid = 0;
+    g_panel_rec.magic = 0;
+    g_pending_valid = false;
+    portEXIT_CRITICAL(&g_panel_mux);
+}
+
+extern "C" int rf_wakeup_cause(void) {
+    switch (esp_sleep_get_wakeup_cause()) {
+    case ESP_SLEEP_WAKEUP_TIMER: return 1;
+    case ESP_SLEEP_WAKEUP_EXT0:  return 2;
+    case ESP_SLEEP_WAKEUP_EXT1:  return 3;
+    default:                     return 0;
+    }
+}
+
+extern "C" void rf_rails_audio(int on) {
+    Board::GetInstance().SetAudioRail(on != 0);
 }
 
 // ───────────────────── device signature (public ABI) ─────────────────────

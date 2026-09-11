@@ -430,6 +430,25 @@ void CustomLcdDisplay::SetOnRefreshIdle(std::function<void()> cb) {
     }
 }
 
+void CustomLcdDisplay::AddOnRefreshIdle(std::function<void()> cb) {
+    if (!cb) {
+        return;
+    }
+    if (dirty_mutex) {
+        xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+    }
+    auto prev = std::move(on_refresh_idle_);
+    on_refresh_idle_ = [prev = std::move(prev), cb = std::move(cb)]() {
+        if (prev) {
+            prev();
+        }
+        cb();
+    };
+    if (dirty_mutex) {
+        xSemaphoreGive(dirty_mutex);
+    }
+}
+
 void CustomLcdDisplay::SetNextKickMs(uint32_t kick_ms) {
     if (dirty_mutex) {
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);

@@ -76,6 +76,9 @@ public:
     virtual bool IsFactoryTestMode() const { return false; }
     virtual void EnterFactoryTestFlow() {}
     virtual void FlashActivityLed() {}
+    // Cut or restore the audio/amp rail. Boards without audio power control
+    // keep the no-op default.
+    virtual void SetAudioRail(bool /*on*/) {}
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) { (void)callback; }
     virtual const char* GetNetworkStateIcon() = 0;
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
