@@ -252,21 +252,27 @@ pub(crate) mod host {
     static PANEL_REC: Mutex<Option<(String, i32)>> = Mutex::new(None);
     // rf_panel_record_get writes 48 bytes; see rf_panel_record_t.
     static AUDIO_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    /// Same value as RF_PANEL_MAGIC in shim_power.h; the stub must mirror the
+    /// device record exactly (magic@0, valid@4, md5@8, index@44).
+    const RF_PANEL_MAGIC: u32 = 0x50414E31;
 
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_panel_record_get(out: *mut u8) {
-        // 33-byte md5 slot + valid byte at offset 4, matching rf_panel_record_t.
+        // Mirrors shim.cpp: a null buffer is a no-op, and None means all-zero
+        // (magic 0 reads as invalid, exactly like power-on RTC memory).
+        if out.is_null() {
+            return;
+        }
         let g = PANEL_REC.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             // sizeof(rf_panel_record_t) == 48; the caller's buffer is the struct,
             // and zeroing only the md5 slot would leave index/pad bytes stale.
             core::ptr::write_bytes(out, 0, 48);
-            match g.as_ref() {
-                Some((md5, _)) => {
-                    *out.add(4) = 1;
-                    core::ptr::copy_nonoverlapping(md5.as_ptr(), out.add(8), md5.len().min(32));
-                }
-                None => *out.add(4) = 0,
+            if let Some((md5, index)) = g.as_ref() {
+                core::ptr::write_unaligned(out as *mut u32, RF_PANEL_MAGIC);
+                *out.add(4) = 1;
+                core::ptr::copy_nonoverlapping(md5.as_ptr(), out.add(8), md5.len().min(32));
+                core::ptr::write_unaligned(out.add(44) as *mut i32, *index);
             }
         }
     }
@@ -656,3 +662,4 @@ pub(crate) mod host {
         note("empty_hint");
     }
 }
+
