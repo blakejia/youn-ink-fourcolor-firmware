@@ -24,10 +24,9 @@ use crate::shim::{self, CBuf};
 pub const PAGE_BITMAP_SIZE: usize = 30000;
 const MAX_PAGES: usize = 5;
 const MD5_LEN: usize = 32;
-/// How often the task wakes to check rotation. Purely local (no radio): the
-/// network poll runs on the server's `poll_interval_minutes` on top of this, so
-/// a page turn still lands on time instead of at poll granularity.
-const TICK_MS: u32 = 10_000;
+/// Magic of `rf_panel_record_t` (see `shim_power.h`): gated together with the
+/// valid byte, so an all-zero record (power-on RTC memory) reads as unknown.
+const PANEL_MAGIC: u32 = 0x50414E31;
 /// Fallbacks when the server sends no policy: the old hardcoded 10 s poll was
 /// 60x the server's intent and kept the radio up all day.
 const DEFAULT_POLL_S: u32 = 600;
@@ -36,25 +35,26 @@ const MAX_POLL_MINUTES: i64 = 1440;
 const SCHEDULE_TIMEOUT_MS: i32 = 10_000;
 const BITMAP_TIMEOUT_MS: i32 = 15_000;
 const SCHEDULE_BUF: usize = 8192;
-const TASK_STACK_BYTES: u32 = 8192;
-const TASK_PRIORITY: u8 = 3;
+// (No poll loop, no task stack: the device is duty-cycled — each wake runs one
+// `sync_once`, then `paint_if_changed`.)
 
 // ── screen ownership (lock-free: read under the display mutex) ──
 static DISPLAYING: AtomicBool = AtomicBool::new(false);
 static SUSPENDED: AtomicBool = AtomicBool::new(false);
 /// Whether the last schedule poll reached the server (status-bar indicator).
 static SERVER_REACHABLE: AtomicBool = AtomicBool::new(false);
+/// Whether the last [`sync_once`] succeeded (the power wiring reads it).
+static LAST_SYNC_OK: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct Page {
     md5: [u8; MD5_LEN],
-    duration_s: u32,
     bitmap: *mut u8,
 }
 
 impl Page {
     const fn empty() -> Self {
-        Page { md5: [0; MD5_LEN], duration_s: 0, bitmap: core::ptr::null_mut() }
+        Page { md5: [0; MD5_LEN], bitmap: core::ptr::null_mut() }
     }
     fn is_ram(&self) -> bool {
         !self.bitmap.is_null()
@@ -66,10 +66,12 @@ struct Table {
     count: usize,
     schedule_md5: [u8; MD5_LEN],
     have_schedule_md5: bool,
-    current: usize,
-    started_us: u64,
-    empty_hint_shown: bool,
-    running: bool,
+    /// Index the server says should be showing now.
+    server_index: usize,
+    /// Set by manual paging; cleared by the next successful sync.
+    override_index: Option<usize>,
+    /// Seconds until the server's next page change (0 = unknown/empty).
+    next_wake_s: u32,
     /// Server policy (see [`Policy`]).
     policy: Policy,
 }
@@ -81,10 +83,9 @@ impl Table {
             count: 0,
             schedule_md5: [0; MD5_LEN],
             have_schedule_md5: false,
-            current: 0,
-            started_us: 0,
-            empty_hint_shown: false,
-            running: false,
+            server_index: 0,
+            override_index: None,
+            next_wake_s: 0,
             policy: Policy::DEFAULT,
         }
     }
@@ -123,11 +124,9 @@ pub(crate) fn reset_for_test() {
     });
     DISPLAYING.store(false, Ordering::Release);
     SUSPENDED.store(false, Ordering::Release);
+    LAST_SYNC_OK.store(false, Ordering::Release);
 }
 
-fn now_us() -> u64 {
-    unsafe { shim::rf_now_us() }
-}
 
 // ── fetching ───────────────────────────────────────────────────────────────
 
@@ -213,6 +212,10 @@ pub struct ParsedSchedule {
     pub pages: [ParsedPage; MAX_PAGES],
     pub count: usize,
     pub policy: Policy,
+    /// Index the server says should be showing now (0 when absent).
+    pub current_index: usize,
+    /// Seconds until the server's next page change (None when absent/empty).
+    pub seconds_until_next_page: Option<u32>,
 }
 
 const EMPTY_PAGE: ParsedPage = ParsedPage { md5: [0; MD5_LEN], duration_s: 0 };
@@ -274,8 +277,21 @@ pub fn parse_schedule(body: &[u8]) -> Option<ParsedSchedule> {
         .and_then(md5_from)?;
     let pages_at = json::member(body, 0, "pages")?;
 
-    let mut out =
-        ParsedSchedule { md5, pages: [EMPTY_PAGE; MAX_PAGES], count: 0, policy: parse_policy(body) };
+    let current_index = json::member(body, 0, "current_index")
+        .and_then(|at| json::int_value(body, at))
+        .map(|v| v.max(0) as usize)
+        .unwrap_or(0);
+    let seconds_until_next_page = json::member(body, 0, "seconds_until_next_page")
+        .and_then(|at| json::int_value(body, at))
+        .map(|v| v.max(0) as u32);
+    let mut out = ParsedSchedule {
+        md5,
+        pages: [EMPTY_PAGE; MAX_PAGES],
+        count: 0,
+        policy: parse_policy(body),
+        current_index,
+        seconds_until_next_page,
+    };
     json::for_each_item(body, pages_at, &mut |item| {
         if out.count >= MAX_PAGES {
             return false;
@@ -301,33 +317,44 @@ pub fn parse_schedule(body: &[u8]) -> Option<ParsedSchedule> {
     Some(out)
 }
 
-/// One poll: refresh the page table when the schedule changed.
-fn sync_once() {
+/// One sync: fetch the schedule, apply the server's position answer, download
+/// what is missing. True when a fresh schedule was applied (even if some
+/// bitmap is still missing — the uncommitted md5 forces a retry next wake).
+pub fn sync_once() -> bool {
     // PSRAM, not the stack: this buffer is as large as the whole task stack
     // (the C++ original kept it in a file-scope static for the same reason).
     // +1 because `http_wrapper_get` NUL-terminates one byte past the length.
     let raw = unsafe { shim::rf_alloc(SCHEDULE_BUF + 1) };
     if raw.is_null() {
         log_e!("PageSync", "schedule buffer alloc failed");
-        return;
+        LAST_SYNC_OK.store(false, Ordering::Release);
+        return false;
     }
     // Same one-byte-over-allocation as the notify response: the wrapper's
     // capacity includes the terminator it appends.
     let body = unsafe { core::slice::from_raw_parts_mut(raw, SCHEDULE_BUF + 1) };
-    if let Some(len) = fetch_schedule(body) {
-        sync_schedule(&body[..len]);
-    }
+    let ok = if let Some(len) = fetch_schedule(body) {
+        sync_schedule(&body[..len])
+    } else {
+        false
+    };
     unsafe { shim::rf_free(raw) };
+    LAST_SYNC_OK.store(ok, Ordering::Release);
+    ok
 }
 
-/// Apply a fetched `/api/pages/schedule` body.
-fn sync_schedule(body: &[u8]) {
+/// Apply a fetched `/api/pages/schedule` body. Returns false when the body
+/// does not parse; a partial bitmap set still returns true (the table holds
+/// what arrived, the md5 stays uncommitted, the next wake retries).
+fn sync_schedule(body: &[u8]) -> bool {
     let Some(parsed) = parse_schedule(body) else {
         log_w!("PageSync", "schedule json unusable (missing schedule_md5/pages)");
-        return;
+        return false;
     };
     let new_md5 = parsed.md5;
     let new_policy = parsed.policy;
+    let new_index = parsed.current_index;
+    let new_wake_s = parsed.seconds_until_next_page.unwrap_or(0);
 
     let policy_changed = with_table(|t| {
         let prev = t.policy;
@@ -339,17 +366,23 @@ fn sync_schedule(body: &[u8]) {
             new_policy.poll_s, new_policy.sleep_poll_s, new_policy.screen_active);
     }
 
-    // 99% path: nothing changed.
+    // 99% path: the bitmap set is unchanged — but the server's position still
+    // moved on, so the index/wake answer is picked up and any manual override
+    // is released even when nothing is re-downloaded.
     let unchanged = with_table(|t| t.have_schedule_md5 && t.schedule_md5 == new_md5);
     if unchanged {
-        return;
+        with_table(|t| {
+            t.server_index = new_index.min(t.count.saturating_sub(1));
+            t.next_wake_s = new_wake_s;
+            t.override_index = None;
+        });
+        return true;
     }
 
     let new_count = parsed.count;
     let mut new_pages = [Page::empty(); MAX_PAGES];
     for i in 0..new_count {
         new_pages[i].md5 = parsed.pages[i].md5;
-        new_pages[i].duration_s = parsed.pages[i].duration_s;
     }
 
     // Reuse cached bitmaps with the same md5, download the rest.
@@ -390,14 +423,15 @@ fn sync_schedule(body: &[u8]) {
         t.free_pages();
         t.pages = new_pages;
         t.count = new_count;
+        t.server_index = new_index.min(new_count.saturating_sub(1));
+        t.next_wake_s = new_wake_s;
+        t.override_index = None;
         if all_ready {
             // Only commit the schedule md5 once every bitmap is on RAM: the old
             // code stored it unconditionally, so a failed download was skipped
             // forever by the "unchanged" fast path.
             t.schedule_md5 = new_md5;
             t.have_schedule_md5 = true;
-            t.current = 0;
-            t.started_us = now_us();
         }
     });
 
@@ -406,44 +440,139 @@ fn sync_schedule(body: &[u8]) {
         downloaded,
         if all_ready { "" } else { " (retrying missing bitmaps)" }
     );
+    true
 }
 
 // ── drawing ────────────────────────────────────────────────────────────────
 
-fn show_page(index: usize) {
-    if SUSPENDED.load(Ordering::Acquire) {
-        return;
+/// The page that should be on the panel: the manual override when the user
+/// paged, otherwise the server's answer. None when no page is configured.
+fn target_index() -> Option<usize> {
+    with_table(|t| {
+        if t.count == 0 { return None; }
+        Some(t.override_index.unwrap_or(t.server_index).min(t.count - 1))
+    })
+}
+
+/// Make sure page `idx` has its bitmap in RAM, downloading it on demand.
+/// Null when out of range or unreachable (the next wake retries via the
+/// uncommitted schedule md5).
+fn ensure_bitmap(idx: usize, md5: &[u8; MD5_LEN]) -> *mut u8 {
+    let slot = with_table(|t| {
+        if idx < t.count { t.pages[idx].bitmap } else { core::ptr::null_mut() }
+    });
+    if !slot.is_null() {
+        return slot;
     }
-    // The blit runs with the state lock held (lock order: state -> display), so
-    // a concurrent `sync_once` cannot free the bitmap we are copying from.
-    let md5 = with_table(|t| {
-        if index >= t.count || !t.pages[index].is_ram() {
-            return None;
+    // +1 for the wrapper's terminator.
+    let raw = unsafe { shim::rf_alloc(PAGE_BITMAP_SIZE + 1) };
+    if raw.is_null() {
+        log_e!("PageSync", "bitmap alloc failed");
+        return core::ptr::null_mut();
+    }
+    if !download_bitmap(md5, raw) {
+        unsafe { shim::rf_free(raw) };
+        return core::ptr::null_mut();
+    }
+    with_table(|t| {
+        if idx < t.count && t.pages[idx].bitmap.is_null() {
+            t.pages[idx].bitmap = raw;
+            return raw;
         }
-        let page = t.pages[index];
+        // A concurrent sync filled (or dropped) the page meanwhile: keep the
+        // table's answer, never leak ours.
+        unsafe { shim::rf_free(raw) };
+        if idx < t.count { t.pages[idx].bitmap } else { core::ptr::null_mut() }
+    })
+}
+
+/// Copy page `idx` to the framebuffer and spend one full refresh. Shared tail
+/// of both paint paths; true when a refresh was actually spent.
+///
+/// The copy is verified under the state lock (lock order: state -> display),
+/// so a concurrent `sync_once` cannot free the bitmap mid-copy — a torn blit
+/// recorded as done would stick until the schedule changes, because the next
+/// wake would read the record and skip the repaint.
+fn blit_and_refresh(idx: usize, slot: *mut u8) -> bool {
+    let copied = with_table(|t| {
+        if slot.is_null() || idx >= t.count || t.pages[idx].bitmap != slot {
+            return false;
+        }
         let fb = unsafe { shim::rf_fb_begin() };
         let fb_len = unsafe { shim::rf_fb_len() } as usize;
         if !fb.is_null() && fb_len == PAGE_BITMAP_SIZE {
             // Same 2bpp MSB-first pixel order as the server's packer: plain copy.
-            unsafe { core::ptr::copy_nonoverlapping(page.bitmap, fb, PAGE_BITMAP_SIZE) };
+            unsafe { core::ptr::copy_nonoverlapping(slot, fb, PAGE_BITMAP_SIZE) };
         } else {
             log_e!("PageSync", "framebuffer size mismatch: fb_len={} want={}", fb_len, PAGE_BITMAP_SIZE);
         }
         unsafe { shim::rf_fb_end() };
-        let mut head = [0u8; 8];
-        head.copy_from_slice(&page.md5[..8]);
-        Some(head)
+        true
     });
-    let Some(md5) = md5 else { return };
-
+    if !copied {
+        return false;
+    }
     unsafe { shim::rf_request_full_refresh() };
     DISPLAYING.store(true, Ordering::Release);
+    true
+}
+
+/// Paint the target page only if the glass does not already show it.
+pub fn paint_if_changed() -> bool {
+    if SUSPENDED.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(idx) = target_index() else { return false; };
+    let md5 = with_table(|t| if idx < t.count { Some(t.pages[idx].md5) } else { None });
+    let Some(md5) = md5 else { return false; };
+    let mut rec = [0u8; 48];
+    unsafe { shim::rf_panel_record_get(rec.as_mut_ptr()) };
+    // Magic AND valid: an all-zero record (power-on RTC memory) is "no known
+    // content", never a match — the device only ever sets the two together.
+    let magic = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+    if magic == PANEL_MAGIC && rec[4] != 0 && rec[8..40] == md5 {
+        log_i!("PageSync", "glass already shows {:?}, skipping repaint",
+            core::str::from_utf8(&md5[..8]).unwrap_or("?"));
+        return false;
+    }
+    let slot = ensure_bitmap(idx, &md5);
+    if slot.is_null() {
+        return false;
+    }
+    if !blit_and_refresh(idx, slot) {
+        return false;
+    }
+    // Staged only after the copy landed: the device commits it when the
+    // refresh goes idle, which is what makes "skip the repaint next wake"
+    // safe against an interrupted refresh.
+    unsafe { shim::rf_panel_mark_pending(md5.as_ptr() as *const core::ffi::c_char, idx as i32) };
     let count = with_table(|t| t.count);
     log_i!("PageSync", "show page {}/{} md5={:?}",
-        index + 1,
+        idx + 1,
         count,
-        core::str::from_utf8(&md5).unwrap_or("?")
+        core::str::from_utf8(&md5[..8]).unwrap_or("?")
     );
+    true
+}
+
+/// Paint page `idx` unconditionally (manual paging or hand-back): the caller
+/// asked for it, so the RTC record is not consulted. False when suspended or
+/// when the bitmap is unavailable.
+fn paint_index(idx: usize) -> bool {
+    if SUSPENDED.load(Ordering::Acquire) {
+        return false;
+    }
+    let md5 = with_table(|t| if idx < t.count { Some(t.pages[idx].md5) } else { None });
+    let Some(md5) = md5 else { return false; };
+    let slot = ensure_bitmap(idx, &md5);
+    if slot.is_null() {
+        return false;
+    }
+    if !blit_and_refresh(idx, slot) {
+        return false;
+    }
+    unsafe { shim::rf_panel_mark_pending(md5.as_ptr() as *const core::ffi::c_char, idx as i32) };
+    true
 }
 
 fn show_empty_hint() {
@@ -457,12 +586,16 @@ fn show_empty_hint() {
 }
 
 fn show_current() {
-    let (count, current) = with_table(|t| (t.count, t.current));
-    if count > 0 {
-        show_page(current);
-    } else {
-        show_empty_hint();
-        with_table(|t| t.empty_hint_shown = true);
+    // Force-paint, never `paint_if_changed`: while the UI owned the panel it
+    // drew over the glass, so the RTC record may claim a page that is no
+    // longer visible.
+    match target_index() {
+        Some(idx) => {
+            paint_index(idx);
+        }
+        None => {
+            show_empty_hint();
+        }
     }
 }
 
@@ -500,7 +633,7 @@ pub fn redraw_current() {
 }
 
 /// Let the canvas take over again (leaving Settings). Repaints immediately so
-/// the user does not stare at the UI page for a whole rotation interval.
+/// the user does not stare at the UI page.
 pub fn allow_display() {
     if !SUSPENDED.swap(false, Ordering::AcqRel) {
         return;
@@ -508,137 +641,79 @@ pub fn allow_display() {
     show_current();
 }
 
+/// Manual page step (wraps): a local override the next successful sync clears,
+/// so browsing cannot fight the schedule.
 pub fn next() {
-    let moved = with_table(|t| {
+    let idx = with_table(|t| {
         if t.count == 0 {
             return None;
         }
-        t.current = (t.current + 1) % t.count;
-        t.started_us = now_us();
-        Some(t.current)
+        let cur = t.override_index.unwrap_or(t.server_index).min(t.count - 1);
+        let n = (cur + 1) % t.count;
+        t.override_index = Some(n);
+        Some(n)
     });
-    if let Some(index) = moved {
-        show_page(index);
+    if let Some(i) = idx {
+        paint_index(i);
     }
 }
 
 pub fn prev() {
-    let moved = with_table(|t| {
+    let idx = with_table(|t| {
         if t.count == 0 {
             return None;
         }
-        t.current = (t.current + t.count - 1) % t.count;
-        t.started_us = now_us();
-        Some(t.current)
+        let cur = t.override_index.unwrap_or(t.server_index).min(t.count - 1);
+        let n = (cur + t.count - 1) % t.count;
+        t.override_index = Some(n);
+        Some(n)
     });
-    if let Some(index) = moved {
-        show_page(index);
+    if let Some(i) = idx {
+        paint_index(i);
     }
 }
 
+/// Start the canvas. Duty-cycled: no task is created — each wake runs one
+/// [`sync_once`] plus [`paint_if_changed`] (see the power wiring). Starting
+/// only hands the screen back to the canvas. Idempotent.
 pub fn start() {
-    // Starting the canvas means the canvas owns the screen again.
     SUSPENDED.store(false, Ordering::Release);
-    let already = with_table(|t| t.running);
-    if already {
-        return;
-    }
-    with_table(|t| t.running = true);
-    let created = unsafe {
-        shim::rf_task_create(
-            task_entry,
-            c"page_sync".as_ptr(),
-            TASK_STACK_BYTES,
-            TASK_PRIORITY,
-            core::ptr::null_mut(),
-        )
-    };
-    if created != 0 {
-        log_e!("PageSync", "failed to create page_sync task");
-        with_table(|t| t.running = false);
-    }
+    DISPLAYING.store(true, Ordering::Release);
 }
 
-/// What one pass of the poll loop should do.
-///
-/// Pure so the cadence rules are host-tested; they are otherwise only visible
-/// as "the panel does/does not repaint" on real hardware.
-#[derive(Debug, PartialEq, Eq)]
-struct Tick {
-    /// Fetch the schedule now (its own cadence, owned by the server).
-    poll: bool,
-    /// Touch the panel now (rotation, first paint).
-    paint: bool,
-}
-
-fn plan_tick(now_us: u64, last_poll_us: u64, first: bool, suspended: bool, t: &Table) -> Tick {
-    let interval_s = if t.policy.screen_active { t.policy.poll_s } else { t.policy.sleep_poll_s };
-    let poll = last_poll_us == 0
-        || now_us.saturating_sub(last_poll_us) >= interval_s as u64 * 1_000_000;
-    let inside_sleep_window = !t.policy.screen_active && !first;
-    Tick { poll, paint: !suspended && !inside_sleep_window }
-}
-
-extern "C" fn task_entry(_arg: *mut c_void) {
-    let mut first = true;
-    let mut last_poll_us: u64 = 0;
-    loop {
-        if !with_table(|t| t.running) {
-            break;
-        }
-
-        // The server owns the poll cadence (slower inside its sleep window);
-        // the local tick only drives rotation and painting.
-        let suspended = SUSPENDED.load(Ordering::Acquire);
-        let tick = with_table(|t| plan_tick(now_us(), last_poll_us, first, suspended, t));
-        if tick.poll {
-            sync_once();
-            last_poll_us = now_us();
-        }
-        if first {
-            // Measured after the deepest path (schedule fetch + bitmap
-            // downloads) has returned; a tight margin here means the stack
-            // constants at the top of this file need revisiting.
-            log_i!("PageSync", "stack headroom {} bytes", unsafe {
-                shim::rf_task_stack_free()
-            });
-        }
-
-        if !tick.paint {
-            // Either the UI owns the panel, or the server's sleep window is
-            // open: keep the page table fresh, spend no panel cycles (a
-            // four-colour refresh is >= 15 s with the radio up). The first paint
-            // after boot still happens, so a wake press shows content.
-            unsafe { shim::rf_delay_ms(TICK_MS) };
-            continue;
-        }
-
-        let count = with_table(|t| t.count);
-        if count == 0 {
-            if !with_table(|t| t.empty_hint_shown) {
-                show_empty_hint();
-                with_table(|t| t.empty_hint_shown = true);
-            }
+/// Seconds until the server's next page change. -1 when unknown or when no
+/// page is configured — never 0, which the power wiring would read as
+/// "0 seconds remain" and floor to its minimum, starving the sleep cap.
+pub fn next_wake_s() -> i32 {
+    with_table(|t| {
+        if t.count == 0 || t.next_wake_s == 0 {
+            -1
         } else {
-            with_table(|t| t.empty_hint_shown = false);
-            let (elapsed, dur) = with_table(|t| {
-                (now_us().saturating_sub(t.started_us), t.pages[t.current].duration_s)
-            });
-            if dur > 0 && elapsed >= dur as u64 * 1_000_000 {
-                with_table(|t| {
-                    t.current = (t.current + 1) % t.count;
-                    t.started_us = now_us();
-                });
-                show_current();
-            } else if first {
-                show_current();
-            }
+            t.next_wake_s as i32
         }
-        first = false;
-        unsafe { shim::rf_delay_ms(TICK_MS) };
-    }
-    unsafe { shim::rf_task_exit() };
+    })
 }
+
+/// Whether the last [`sync_once`] succeeded.
+pub fn sync_ok() -> bool {
+    LAST_SYNC_OK.load(Ordering::Acquire)
+}
+
+/// `policy.poll_interval_minutes * 60`.
+pub fn poll_s() -> u32 {
+    with_table(|t| t.policy.poll_s)
+}
+
+/// `policy.sleep_poll_interval_minutes * 60`.
+pub fn sleep_poll_s() -> u32 {
+    with_table(|t| t.policy.sleep_poll_s)
+}
+
+/// False while the server's sleep window is open.
+pub fn screen_active() -> bool {
+    with_table(|t| t.policy.screen_active)
+}
+
 
 // ── C ABI ──────────────────────────────────────────────────────────────────
 
@@ -685,6 +760,48 @@ pub extern "C" fn page_sync_prev() {
     prev();
 }
 
+/// One sync: fetch + parse + download what is missing. True on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn page_sync_sync_once() -> bool {
+    sync_once()
+}
+
+/// Paint the target page only when the glass is out of date. True = painted.
+#[unsafe(no_mangle)]
+pub extern "C" fn page_sync_paint_if_changed() -> bool {
+    paint_if_changed()
+}
+
+/// Seconds until the server's next page change; -1 = unknown/empty schedule.
+#[unsafe(no_mangle)]
+pub extern "C" fn page_sync_next_wake_s() -> i32 {
+    next_wake_s()
+}
+
+/// Whether the last `page_sync_sync_once` succeeded.
+#[unsafe(no_mangle)]
+pub extern "C" fn page_sync_sync_ok() -> bool {
+    sync_ok()
+}
+
+/// `policy.poll_interval_minutes * 60`.
+#[unsafe(no_mangle)]
+pub extern "C" fn page_sync_poll_s() -> u32 {
+    poll_s()
+}
+
+/// `policy.sleep_poll_interval_minutes * 60`.
+#[unsafe(no_mangle)]
+pub extern "C" fn page_sync_sleep_poll_s() -> u32 {
+    sleep_poll_s()
+}
+
+/// False while the server's sleep window is open.
+#[unsafe(no_mangle)]
+pub extern "C" fn page_sync_screen_active() -> bool {
+    screen_active()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,59 +824,104 @@ mod tests {
         assert_eq!(parsed.pages[0].duration_s, 600);
     }
 
-    // ── poll cadence / sleep window ──
+    // ── one-shot sync + paint-if-changed (duty-cycled; no poll loop) ──
 
-    fn table_with(policy: Policy) -> Table {
-        let mut t = Table::new();
-        t.policy = policy;
-        t
+    fn scripted_schedule_with_position(index: usize, next_s: u32, entries: &[(u8, u32)]) {
+        let pages: Vec<String> = entries.iter()
+            .map(|(t, m)| format!(r#"{{"md5":"{}","duration_minutes":{}}}"#, md5hex(*t), m))
+            .collect();
+        let body = format!(
+            r#"{{"schedule_md5":"{}","current_index":{},"seconds_until_next_page":{},"screen_active":true,"policy":{{"poll_interval_minutes":10,"sleep_poll_interval_minutes":60}},"pages":[{}]}}"#,
+            md5hex(0x11), index, next_s, pages.join(","));
+        shim::host::script_ok("/api/pages/schedule", body.as_bytes());
     }
 
     #[test]
-    fn the_first_tick_always_polls_and_paints() {
-        let t = table_with(Policy::DEFAULT);
-        let tick = plan_tick(1_000_000, 0, true, false, &t);
-        assert!(tick.poll, "a cold start must fetch the schedule immediately");
-        assert!(tick.paint);
-
-        // Same on the very first tick inside the sleep window: a wake press
-        // should show content rather than a blank panel.
-        let t = table_with(Policy { screen_active: false, ..Policy::DEFAULT });
-        let tick = plan_tick(1_000_000, 0, true, false, &t);
-        assert!(tick.poll);
-        assert!(tick.paint);
+    fn paints_when_the_servers_page_differs_from_the_glass() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        scripted_schedule_with_position(1, 240, &[(0xa1, 10), (0xb2, 5)]);
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), &bitmap_body(0xb2));
+        assert!(sync_once());
+        assert!(paint_if_changed(), "nothing recorded on the glass yet -> paint");
+        assert_eq!(shim::host::fb()[0], 0xb2, "the server's current page is on the panel");
+        assert_eq!(shim::host::refreshes(), 1);
     }
 
     #[test]
-    fn polling_follows_the_servers_cadence_not_the_tick() {
-        let t = table_with(Policy::DEFAULT); // poll every 600 s
-        let startup = 1_000_000;
-        assert!(!plan_tick(startup + 5_000_000, startup, false, false, &t).poll, "5 s: no poll");
-        assert!(!plan_tick(startup + 599_000_000, startup, false, false, &t).poll, "599 s: no poll");
-        assert!(plan_tick(startup + 600_000_000, startup, false, false, &t).poll, "600 s: poll");
+    fn skips_the_repaint_when_the_glass_already_shows_it() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        scripted_schedule_with_position(0, 240, &[(0xa1, 10)]);
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        sync_once();
+        assert!(paint_if_changed());
+        assert_eq!(shim::host::refreshes(), 1);
+
+        // Simulate the wake that follows: same page, same glass.
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        sync_once();
+        assert!(!paint_if_changed(), "same md5 as the glass -> no panel cycle");
+        assert_eq!(shim::host::refreshes(), 1, "no extra refresh was spent");
     }
 
     #[test]
-    fn the_sleep_window_polls_slowly_and_stops_painting() {
-        let t = table_with(Policy { poll_s: 600, sleep_poll_s: 3600, screen_active: false });
-        let startup = 1_000_000;
-
-        let at_10min = plan_tick(startup + 600_000_000, startup, false, false, &t);
-        assert!(!at_10min.poll, "inside the window the cadence is the sleep one");
-        assert!(!at_10min.paint, "and the panel must be left alone");
-
-        let at_60min = plan_tick(startup + 3_600_000_000, startup, false, false, &t);
-        assert!(at_60min.poll);
-        assert!(!at_60min.paint, "polling does not imply repainting");
+    fn a_failed_sync_reports_failure_and_does_not_paint() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        shim::host::script_get("/api/pages/schedule", 500, b"");
+        assert!(!sync_once());
+        assert!(!paint_if_changed());
+        assert_eq!(shim::host::refreshes(), 0);
     }
 
     #[test]
-    fn a_suspended_canvas_polls_but_never_paints() {
-        let t = table_with(Policy::DEFAULT);
-        let startup = 1_000_000;
-        let tick = plan_tick(startup + 600_000_000, startup, false, true, &t);
-        assert!(tick.poll, "data stays fresh while the UI owns the screen");
-        assert!(!tick.paint, "but paint_page_sync must not fight the UI for it");
+    fn manual_paging_overrides_the_server_until_the_next_sync() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        scripted_schedule_with_position(0, 240, &[(0xa1, 10), (0xb2, 5)]);
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), &bitmap_body(0xb2));
+        assert!(sync_once());
+
+        next();  // local override -> page 2
+        assert_eq!(shim::host::fb()[0], 0xb2);
+
+        // A later sync re-imposes the server's index.
+        scripted_schedule_with_position(0, 240, &[(0xa1, 10), (0xb2, 5)]);
+        sync_once();
+        assert!(paint_if_changed(), "override cleared -> back to the server's page");
+        assert_eq!(shim::host::fb()[0], 0xa1);
+    }
+
+    #[test]
+    fn next_wake_is_reported_from_the_response() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        scripted_schedule_with_position(0, 240, &[(0xa1, 10)]);
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        sync_once();
+        assert_eq!(next_wake_s(), 240);
+        assert_eq!(poll_s(), 600);
+        assert_eq!(sleep_poll_s(), 3600);
+        assert!(screen_active());
+    }
+
+    #[test]
+    fn an_empty_schedule_reports_no_next_page() {
+        // -1 而不是 0：0 会被 power::decide 当成“还剩 0 秒”并夹到 60 秒下限，
+        // 空排期就永远睡不满 cap。
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        assert_eq!(next_wake_s(), -1);
     }
 
     // ── flows driven through the module, against the scripted shim ──
@@ -917,10 +1079,10 @@ mod tests {
 
         sync_once();
 
-        let (count, current, committed, md5) =
-            with_table(|t| (t.count, t.current, t.have_schedule_md5, t.schedule_md5));
+        let (count, server_index, committed, md5) =
+            with_table(|t| (t.count, t.server_index, t.have_schedule_md5, t.schedule_md5));
         assert_eq!(count, 2);
-        assert_eq!(current, 0, "a fresh schedule starts at the first page");
+        assert_eq!(server_index, 0, "no position in the response -> page 0");
         assert!(committed, "every bitmap arrived, so the md5 is committed");
         assert_eq!(&md5[..2], b"11");
         assert_eq!(page0_byte(), 0xa1, "page 0 holds its own bitmap");
@@ -982,29 +1144,23 @@ mod tests {
     }
 
     #[test]
-    fn rotation_blits_the_next_page_and_a_suspend_blocks_it() {
+    fn a_suspended_canvas_does_not_paint_even_when_the_target_changes() {
         let _g = shim::host::lock();
         reset_for_test();
         setup_two_pages();
         shim::host::set_fb();
 
-        next();
-        assert_eq!(shim::host::fb()[0], 0xb2, "page 1 is on the panel");
-        assert_eq!(shim::host::refreshes(), 1);
-
-        prev();
-        assert_eq!(shim::host::fb()[0], 0xa1, "back to page 0");
-        assert_eq!(shim::host::refreshes(), 2);
-
-        // Suspended = the UI owns the panel: rotation must not repaint.
+        // The UI owns the panel while the target moves: nothing may paint.
         stop_display();
         next();
-        assert_eq!(shim::host::refreshes(), 2, "no refresh while suspended");
-        assert_eq!(shim::host::fb()[0], 0xa1, "framebuffer untouched");
+        assert_eq!(shim::host::refreshes(), 0, "no refresh while suspended");
+        assert!(!paint_if_changed(), "suspended -> never paints, even for a new target");
+        assert_eq!(shim::host::refreshes(), 0);
 
+        // Handing the screen back force-paints the current target once.
         allow_display();
-        assert_eq!(shim::host::fb()[0], 0xb2, "resuming repaints the current page");
-        assert_eq!(shim::host::refreshes(), 3);
+        assert_eq!(shim::host::fb()[0], 0xb2, "the override target is on the panel");
+        assert_eq!(shim::host::refreshes(), 1);
     }
 
     #[test]
