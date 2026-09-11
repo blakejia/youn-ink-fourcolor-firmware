@@ -591,9 +591,8 @@ def create_app() -> FastAPI:
             raise HTTPException(400, "name required")
         if not isinstance(canvas_json, dict):
             raise HTTPException(400, "canvas_json must be an object")
-        if duration_minutes < settings.canvas_min_page_duration_minutes:
-            raise HTTPException(400,
-                f"duration_minutes must be >= min_page_duration_minutes={settings.canvas_min_page_duration_minutes}")
+        # policy 的最小页时长此前只在响应里出现，保存时没生效
+        duration_minutes = max(duration_minutes, settings.canvas_min_page_duration_minutes)
         try:
             bitmap = render_canvas_to_bitmap(canvas_json)
         except RenderError as e:
@@ -620,9 +619,12 @@ def create_app() -> FastAPI:
     async def get_schedule() -> dict:
         entries = pages_mod.build_schedule_from_disk()
         sched_md = pages_mod.compute_schedule_md(entries)
+        current_index, seconds_until_next_page = pages_mod.schedule_position(entries, time.time())
         return {
             "schedule_md5": sched_md,
             "server_time": datetime.now(ZoneInfo(settings.canvas_timezone)).isoformat(),
+            "current_index": current_index,
+            "seconds_until_next_page": seconds_until_next_page,
             "policy": {
                 "sleep_window": {
                     "start": settings.canvas_sleep_start,

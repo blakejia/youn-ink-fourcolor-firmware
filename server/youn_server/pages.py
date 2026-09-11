@@ -301,5 +301,25 @@ def build_schedule_from_disk() -> list[PageEntry]:
     return out
 
 
+def schedule_position(entries: list[PageEntry], now_ts: float) -> tuple[int, Optional[int]]:
+    """Which page should be showing at `now_ts`, and how long it has left.
+
+    The cycle repeats from the Unix epoch, so both the server and the device can
+    derive the same answer from any wall clock without storing state. Durations
+    are clamped to >= 1 minute: a zero-minute page would make the cycle zero.
+    """
+    durations = [max(e.duration_minutes, 1) * 60 for e in entries]
+    cycle_s = sum(durations)
+    if cycle_s <= 0:
+        return 0, None
+    pos_s = int(now_ts) % cycle_s
+    acc = 0
+    for i, d in enumerate(durations):
+        if pos_s < acc + d:
+            return i, acc + d - pos_s
+        acc += d
+    return len(durations) - 1, 60  # 不可达；兜底避免返回 None 之外的东西
+
+
 # Run once at import to heal any drift from earlier crashes.
 (settings.data_dir / "pages").mkdir(parents=True, exist_ok=True)

@@ -109,7 +109,7 @@ def test_delete_page_cleans_bitmap(client):
     assert r3.status_code == 404
 
 
-def test_min_duration_validation(client):
+def test_min_duration_clamped_on_save(client):
     body = {
         "name": "p4",
         "canvas_json": {"default": []},
@@ -117,8 +117,8 @@ def test_min_duration_validation(client):
         "order": 0,
     }
     r = client.post("/api/pages", json=body)
-    assert r.status_code == 400
-    assert "min_page_duration_minutes" in r.json()["detail"]
+    assert r.status_code == 200
+    assert r.json()["duration_minutes"] == 10
 
 
 def test_render_error_returns_400_with_path(client):
@@ -152,3 +152,51 @@ def test_policy_matches_config(client):
     assert policy["sleep_window"]["tz"] == "Asia/Shanghai"
     assert policy["poll_interval_minutes"] == 10
     assert policy["sleep_poll_interval_minutes"] == 60
+
+
+def _entries(durations):
+    return [
+        pages_mod.PageEntry(md5=f"{i:032x}", duration_minutes=d, order=i, name=f"p{i}")
+        for i, d in enumerate(durations)
+    ]
+
+
+def test_schedule_position_walks_the_cycle():
+    entries = _entries([10, 5])          # cycle = 15 min
+    cycle_start = 15 * 60               # 任意 15 分钟整数倍
+    assert pages_mod.schedule_position(entries, cycle_start + 0) == (0, 600)
+    assert pages_mod.schedule_position(entries, cycle_start + 599) == (0, 1)
+    assert pages_mod.schedule_position(entries, cycle_start + 600) == (1, 300)
+    assert pages_mod.schedule_position(entries, cycle_start + 899) == (1, 1)
+    assert pages_mod.schedule_position(entries, cycle_start + 900) == (0, 600)  # 绕回
+
+
+def test_schedule_position_single_page_and_empty():
+    assert pages_mod.schedule_position(_entries([10]), 600) == (0, 600)
+    assert pages_mod.schedule_position([], 12345) == (0, None)
+
+
+def test_schedule_position_clamps_zero_duration():
+    # 0 分钟页会让 cycle 为 0；必须夹到 1 分钟，否则除零
+    entries = _entries([0, 5])
+    assert pages_mod.schedule_position(entries, 0) == (0, 60)
+    assert pages_mod.schedule_position(entries, 60) == (1, 300)
+
+
+def test_schedule_response_carries_position_but_md5_ignores_it(client):
+    body = client.get("/api/pages/schedule").json()
+    assert "current_index" in body and "seconds_until_next_page" in body
+    # 位置字段不参与 schedule_md5，否则设备缓存会被时间推进无限击穿
+    md5_a = pages_mod.compute_schedule_md([pages_mod.PageEntry("a" * 32, 10, 0, "x")])
+    md5_b = pages_mod.compute_schedule_md([pages_mod.PageEntry("a" * 32, 10, 0, "x")])
+    assert md5_a == md5_b
+
+
+def test_create_page_clamps_duration_to_policy_minimum(client):
+    r = client.post("/api/pages", json={
+        "name": "clamped",
+        "canvas_json": {"default": [{"type": "div", "props": {"tw": "bg-white", "children": "x"}}]},
+        "duration_minutes": 0,
+    })
+    assert r.status_code in (200, 201)
+    assert r.json()["duration_minutes"] >= 10
