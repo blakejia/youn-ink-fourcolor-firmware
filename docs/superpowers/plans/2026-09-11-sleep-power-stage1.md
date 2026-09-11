@@ -640,12 +640,13 @@ extern "C" void rf_panel_record_invalidate(void) {
 }
 
 extern "C" int rf_wakeup_cause(void) {
-    switch (esp_sleep_get_wakeup_cause()) {
-    case ESP_SLEEP_WAKEUP_TIMER: return 1;
-    case ESP_SLEEP_WAKEUP_EXT0:  return 2;
-    case ESP_SLEEP_WAKEUP_EXT1:  return 3;
-    default:                     return 0;
-    }
+    // esp_sleep_get_wakeup_cause() is deprecated in v6.0; the replacement
+    // returns a bitmap whose bit index is the esp_sleep_wakeup_cause_t value.
+    const uint32_t causes = esp_sleep_get_wakeup_causes();
+    if (causes & (1U << ESP_SLEEP_WAKEUP_TIMER)) return 1;
+    if (causes & (1U << ESP_SLEEP_WAKEUP_EXT0))  return 2;
+    if (causes & (1U << ESP_SLEEP_WAKEUP_EXT1))  return 3;
+    return 0;
 }
 
 extern "C" void rf_rails_audio(int on) {
@@ -712,7 +713,7 @@ reports idle, so a refresh interrupted by power loss is not remembered as done."
   ```c
   bool     page_sync_sync_once(void);        /* 拉取+解析+按需下载；true = 成功 */
   bool     page_sync_paint_if_changed(void); /* true = 真的绘屏了 */
-  uint32_t page_sync_next_wake_s(void);      /* 上次响应推导，未夹取；0 = 未知 */
+  int32_t  page_sync_next_wake_s(void);      /* 距下次翻页秒数；-1 = 未知/空排期 */
   bool     page_sync_sync_ok(void);          /* 最近一次 sync_once 是否成功 */
   uint32_t page_sync_poll_s(void);           /* policy.poll_interval_minutes * 60 */
   uint32_t page_sync_sleep_poll_s(void);     /* policy.sleep_poll_interval_minutes * 60 */
@@ -809,6 +810,18 @@ reports idle, so a refresh interrupted by power loss is not remembered as done."
         assert_eq!(sleep_poll_s(), 3600);
         assert!(screen_active());
     }
+
+    #[test]
+    fn an_empty_schedule_reports_no_next_page() {
+        // -1 而不是 0：0 会被 power::decide 当成“还剩 0 秒”并夹到 60 秒下限，
+        // 空排期就永远睡不满 cap。
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        assert_eq!(next_wake_s(), -1);
+    }
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -882,7 +895,7 @@ C ABI 按 Interfaces 逐条导出；`page_sync_start()` 保留但只做 `DISPLAY
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `export PATH="$HOME/.cargo/bin:$PATH"; cd firmware/main/rust && cargo test`
-Expected: PASS，总数 ≥ 62（删 4 加 5，其余保持）
+Expected: PASS，总数 ≥ 63（删 4 加 6，其余保持）
 
 - [ ] **Step 5: 构建确认 C ABI 变化没打断 C++ 调用点**
 
@@ -1088,7 +1101,9 @@ void Application::ServicePowerPolicy() {
     in.poll_s         = page_sync_poll_s();
     in.sleep_poll_s   = page_sync_sleep_poll_s();
     in.fail_streak    = fail_streak;
-    in.seconds_until_next_page = (int32_t)page_sync_next_wake_s();
+    // -1 表示未知/空排期；power::decide 把负数映射成 None 并用 cap，绝不能用 0
+    // （0 会被当成“还剩 0 秒”而夹到 60 秒下限）。
+    in.seconds_until_next_page = page_sync_next_wake_s();
 
     rf_power_decision_t d = {};
     rf_power_decide(&in, &d);

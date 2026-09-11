@@ -99,6 +99,8 @@ cap = screen_active ? policy.poll_interval_minutes*60 : policy.sleep_poll_interv
 
 `seconds_until_next_page` 为 null（空排期）时 `next_wake_s = cap`。
 
+固件侧的交接约定：固件从 page_sync 取这个值时用 **-1 表示未知/空排期**，再由 `power::decide` 把负数映射成 `None`（用 cap）。不能用 0——0 会被当成“还剩 0 秒”而夹到 60 秒下限，空排期就永远睡不满 cap。
+
 同步失败（网络或服务端不可达）：不绘屏，退避 `60s → 120s → …` 翻倍，上限 `cap`；成功后重置退避。
 
 ### 4.5 一次 wake cycle 的顺序
