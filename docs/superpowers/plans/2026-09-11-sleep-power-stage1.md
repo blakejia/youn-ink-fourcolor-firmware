@@ -1335,3 +1335,8 @@ EPD rail) starts."
 **Type consistency**：`rf_power_inputs_t`/`rf_power_decision_t` 的字段名与顺序在 Task 2（Rust `CInputs`/`CDecision`、`include/power.h`）与 Task 7（C++ 填结构）三处一致；`rf_panel_record_t` 的 `valid` 偏移 4、`displayed_md5` 偏移 8 在 Task 3 的 C 定义、主机桩与 Task 4 的读取三处一致；`page_sync_*` 导出名在 Task 4 的 Interfaces 与 Task 7 的调用处一致。
 
 **已知的诚实缺口**：Task 5/6/7 的验证依赖真机按键，无法在主机上完成；Task 8 就是为此存在的。
+
+**两处可选收尾（2026-09-12 已完成）**
+
+1. **ext1 布防改显式 `if (!IsPowerPresent())`**（策略路径，`application.cc` 的 `EnterScheduledSleep`）。改动前它无条件布防，靠"`decide()` 在有 mains 时不睡"这条不变式保证不会带着充电电平入睡。行为按构造等价：拔电时条件为真、调用与改前逐字相同；插电时该路径不可达。**为此没有单独的运行时观测**——它只为去掉对那条不变式的隐式依赖（否则哪天策略允许 mains 睡，设备就会在已处的电平上瞬间唤醒并循环）。
+2. **F23 冗余用例删除**（`page_sync.rs`）。三条 F23 用例里，`failed_sync_with_the_hint_on_the_glass_paints_nothing` 与 `failed_sync_with_a_page_on_the_glass_paints_nothing` 走的是同一条路径：失败同步时 `paint_if_changed` 在 `LAST_SYNC_OK` 就返回，**从未读 RTC 记录**，所以"玻璃上是页还是提示"不是该路径的输入。留断言更强的那条，并在原位留注说明为什么只需要一条。`cargo test` 117 → 116（两条 F23 断言都保留：失败不画 + 成功空排期画提示）。

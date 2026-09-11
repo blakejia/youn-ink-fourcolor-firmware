@@ -986,20 +986,10 @@ mod tests {
         assert_eq!(shim::host::refreshes(), 0, "no panel cycle while backing off");
     }
 
-    // F23: same gate when the record already shows the hint — still no paint,
-    // and still no second cycle.
-    #[test]
-    fn failed_sync_with_the_hint_on_the_glass_paints_nothing() {
-        let _g = shim::host::lock();
-        reset_for_test();
-        shim::host::set_fb();
-        shim::host::stage_panel_record(0x50414E31, 1, b"", -1);
-        shim::host::script_get("/api/pages/schedule", 500, b"");
-        assert!(!sync_once());
-        assert!(!paint_if_changed(), "failed sync leaves the glass alone");
-        assert_eq!(shim::host::hint_draws(), 0);
-        assert_eq!(shim::host::refreshes(), 0);
-    }
+    // (There was a second copy of this asserting the same three things with the
+    // hint already on the glass. The gate returns before the RTC record is read
+    // — LAST_SYNC_OK is checked first — so the glass contents are not an input
+    // to this path at all; one test proves it.)
 
     // F23: a SUCCESSFUL sync with zero pages still draws and records the hint.
     #[test]

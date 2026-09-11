@@ -905,9 +905,14 @@ void Application::ServicePowerPolicy() {
     esp_wifi_stop();
     esp_sleep_enable_timer_wakeup((uint64_t)d.wake_s * 1000000ULL);
     esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_BUTTON_GPIO, 0);
-    // Sleeping on mains is unreachable (decide() holds awake there), so the
-    // charger pin reads high here and ANY_LOW fires on plug-in. See config.h.
-    EnableChargerInsertWakeup();
+    // Charger-insert wake, but only while actually unplugged. decide() holds the
+    // device awake on mains, so this branch is the only one reachable today and
+    // the guard changes nothing — it just stops that from being load-bearing:
+    // armed with the charger level while sitting on mains, the device would wake
+    // on the level it is already at and loop. See config.h for the polarity.
+    if (!Board::GetInstance().IsPowerPresent()) {
+        EnableChargerInsertWakeup();
+    }
     esp_deep_sleep_start();
 }
 
