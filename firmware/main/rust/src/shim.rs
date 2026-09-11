@@ -35,11 +35,6 @@ unsafe extern "C" {
         arg: *mut c_void,
     ) -> c_int;
     pub fn rf_task_exit() -> !;
-    pub fn rf_delay_ms(ms: u32);
-    /// Free bytes left on the *calling* task's stack (`uxTaskGetStackHighWaterMark`).
-    pub fn rf_task_stack_free() -> u32;
-    /// `esp_timer_get_time()`, i.e. microseconds since boot.
-    pub fn rf_now_us() -> u64;
     /// One-shot FreeRTOS timer; the callback runs in the timer daemon task.
     pub fn rf_timer_create_once(name: *const c_char, period_ms: u32, cb: extern "C" fn()) -> c_int;
     pub fn rf_timer_start();
@@ -200,7 +195,6 @@ pub(crate) mod host {
         refreshes: u32,
         hint_draws: u32,
         timers_started: u32,
-        now_us: u64,
     }
 
     static LOCK: Mutex<()> = Mutex::new(());
@@ -212,7 +206,6 @@ pub(crate) mod host {
         refreshes: 0,
         hint_draws: 0,
         timers_started: 0,
-        now_us: 0,
     });
     static FB: Mutex<Option<&'static mut [u8]>> = Mutex::new(None);
     /// Live allocations, so the HTTP stubs can prove they stay in bounds.
@@ -356,10 +349,6 @@ pub(crate) mod host {
 
     pub fn timers_started() -> u32 {
         counters(|c| c.timers_started)
-    }
-
-    pub fn set_now_us(t: u64) {
-        counters(|c| c.now_us = t);
     }
 
     pub fn tasks() -> Vec<String> {
@@ -545,19 +534,6 @@ pub(crate) mod host {
         // Task entries are never called by tests; they call the extracted bodies
         // instead. (Panicking here would abort: `extern "C"` cannot unwind.)
         panic!("rf_task_exit reached on the host")
-    }
-
-    #[unsafe(no_mangle)]
-    pub extern "C" fn rf_delay_ms(_ms: u32) {}
-
-    #[unsafe(no_mangle)]
-    pub extern "C" fn rf_task_stack_free() -> u32 {
-        4096
-    }
-
-    #[unsafe(no_mangle)]
-    pub extern "C" fn rf_now_us() -> u64 {
-        counters(|c| c.now_us)
     }
 
     #[unsafe(no_mangle)]

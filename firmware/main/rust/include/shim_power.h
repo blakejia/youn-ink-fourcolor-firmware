@@ -30,6 +30,11 @@ typedef struct {
 void rf_panel_record_get(rf_panel_record_t* out);
 void rf_panel_mark_pending(const char* md5, int index);
 void rf_panel_record_invalidate(void);
+/* Re-chain the commit-on-idle hook (shim.cpp) after RawDrawUiManager::Init
+ * replaced the refresh-idle slot on the promotion path. One call chains
+ * exactly one trampoline; promotion is one-shot and Init wiped the previous
+ * chain, so one re-chain leaves exactly one. */
+void rf_panel_commit_hook_register(void);
 
 /* 0 = 其它, 1 = timer 唤醒, 2 = ext0(BOOT), 3 = ext1(充电插入) */
 int  rf_wakeup_cause(void);

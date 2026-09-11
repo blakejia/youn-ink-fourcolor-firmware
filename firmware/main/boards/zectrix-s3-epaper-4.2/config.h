@@ -42,8 +42,11 @@
 // (Replaces the dead CHARGE_GPIO_AFFECT_SLEEP macro: mains-never-sleeps plus
 // USB-wakes-via-ext1 is the behaviour it described.)
 // 1 = plug-in pulls GPIO2 LOW (unplugged HIGH); 0 = plug-in drives HIGH.
-// Drives the ext1 wake mode registered before each deep sleep.
-#define CHARGE_DETECT_PLUG_PULLS_LOW 1
+// Drives the ext1 wake mode registered before each deep sleep. Derived from
+// CHARGE_DETECT_CHARGING_LEVEL above (plug pulls the pin toward the charging
+// level) so the two cannot drift: a mismatch would silently break plug-to-wake
+// and only surface on hardware.
+#define CHARGE_DETECT_PLUG_PULLS_LOW (1 - CHARGE_DETECT_CHARGING_LEVEL)
 
 // RTC (PCF8563T/5)
 #define RTC_INT_GPIO            GPIO_NUM_5

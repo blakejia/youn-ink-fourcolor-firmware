@@ -459,10 +459,30 @@ void Application::ServicePromotion() {
     if (lcd == nullptr) {
         return;  // retry on the next main-loop tick
     }
-    // Mirror cold-boot order: panel up first, then the UI, then the status
-    // bar. BringUpPanel is idempotent; promoted_ keeps the build one-shot.
+    // F24: hand the panel to the UI before building it. Both steps are
+    // needed, for different readers of the same ownership fact:
+    // - page_sync_stop_display() clears DISPLAYING so RawDrawUiManager::Init's
+    //   RenderAll is no longer suppressed (Init clears the framebuffer, then
+    //   RenderAll early-returns while the canvas owns the panel, and the
+    //   unguarded TriggerRefresh would flush the cleared white framebuffer).
+    // - rf_panel_record_invalidate() drops the RTC claim that the canvas page
+    //   is on the glass, since the glass is about to show a UI page instead
+    //   (the §4.3.5 divergence the sleep path guards with invalidate_panel:
+    //   without it the next wake's md5 compare matches and skips, leaving
+    //   the blank frame up). The canvas returns via page_sync_allow_display()
+    //   when the user leaves the UI.
+    // Mirror cold-boot order otherwise: panel up first, then the UI, then
+    // the status bar. BringUpPanel is idempotent; promoted_ keeps the build
+    // one-shot.
+    page_sync_stop_display();
+    rf_panel_record_invalidate();
     lcd->BringUpPanel();
     BuildRawDrawUi(lcd);
+    // F25: Init owns the SetOnRefreshIdle slot and replaces the shim's
+    // commit-on-idle chain registered from rf_set_display, so re-chain it
+    // now that the UI exists (one-shot promotion: the previous chain was
+    // wiped, so this leaves exactly one).
+    rf_panel_commit_hook_register();
     UpdateStatusBarForUi();
     promoted_.store(true, std::memory_order_release);
     promote_requested_.store(false, std::memory_order_release);

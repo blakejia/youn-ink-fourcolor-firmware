@@ -144,18 +144,6 @@ extern "C" void rf_task_exit(void) {
     vTaskDelete(nullptr);
 }
 
-extern "C" void rf_delay_ms(uint32_t ms) {
-    vTaskDelay(pdMS_TO_TICKS(ms));
-}
-
-extern "C" uint32_t rf_task_stack_free(void) {
-    return uxTaskGetStackHighWaterMark(nullptr);
-}
-
-extern "C" uint64_t rf_now_us(void) {
-    return (uint64_t)esp_timer_get_time();
-}
-
 extern "C" int rf_timer_create_once(const char *name, uint32_t period_ms, void (*cb)(void)) {
     if (g_timer != nullptr) {
         return 0;
@@ -214,6 +202,28 @@ extern "C" int rf_get_device_id(char *out, int out_len) {
 
 // ─────────────────────────────── display ───────────────────────────────
 
+extern "C" void rf_panel_commit_hook_register(void) {
+    // Re-chain the commit-on-idle hook after RawDrawUiManager::Init replaced
+    // the slot (promotion path). Exactly one chain per call: the caller must
+    // call this once per wipe (promotion is one-shot, and Init wiped the
+    // previous chain, so one re-chain leaves exactly one trampoline).
+    CustomLcdDisplay *d = lcd();
+    if (d != nullptr) {
+        d->AddOnRefreshIdle([]() {
+            portENTER_CRITICAL(&g_panel_mux);
+            if (g_pending_valid) {
+                g_panel_rec.magic = RF_PANEL_MAGIC;
+                g_panel_rec.valid = 1;
+                memcpy(g_panel_rec.displayed_md5, g_pending_md5,
+                       sizeof(g_panel_rec.displayed_md5));
+                g_panel_rec.displayed_index = g_pending_index;
+                g_pending_valid = false;
+            }
+            portEXIT_CRITICAL(&g_panel_mux);
+        });
+    }
+}
+
 extern "C" void rf_set_display(void *display) {
     // The display is resolved through Board on demand; this exists so the
     // firmware's existing `page_sync_set_display(...)` injection point stays.
@@ -228,18 +238,7 @@ extern "C" void rf_set_display(void *display) {
     if (!s_refresh_watch_registered) {
         CustomLcdDisplay *d = lcd();
         if (d != nullptr) {
-            d->AddOnRefreshIdle([]() {
-                portENTER_CRITICAL(&g_panel_mux);
-                if (g_pending_valid) {
-                    g_panel_rec.magic = RF_PANEL_MAGIC;
-                    g_panel_rec.valid = 1;
-                    memcpy(g_panel_rec.displayed_md5, g_pending_md5,
-                           sizeof(g_panel_rec.displayed_md5));
-                    g_panel_rec.displayed_index = g_pending_index;
-                    g_pending_valid = false;
-                }
-                portEXIT_CRITICAL(&g_panel_mux);
-            });
+            rf_panel_commit_hook_register();
             s_refresh_watch_registered = true;
         }
     }

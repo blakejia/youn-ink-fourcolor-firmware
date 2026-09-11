@@ -545,6 +545,16 @@ pub fn paint_if_changed() -> bool {
         return false;
     }
     let Some(idx) = target_index() else {
+        // Empty table after a FAILED sync means "schedule unknown", not "the
+        // server says there are no pages": every deep-sleep wake starts with
+        // an empty table, so painting the hint here would white-refresh over
+        // the last good page (15-25 s with the radio up) and spend a second
+        // full refresh restoring it on the next wake. Spec §13 requires
+        // keeping the image while backing off, so a failed sync leaves the
+        // glass alone. Gate on this module's own last-sync result.
+        if !LAST_SYNC_OK.load(Ordering::Acquire) {
+            return false;
+        }
         // Empty schedule: the hint is a recorded state (index -1), not an
         // unrecorded draw. Key on the index only: the md5 payload is 32 zero
         // bytes, which the shim stores as an empty string, so comparing md5
@@ -957,6 +967,55 @@ mod tests {
         assert_eq!(&md5[..], md5hex(0xa1).as_bytes(), "still page 0xa1's entry");
         assert_eq!(shim::host::refreshes(), refreshes, "no panel cycle on a failed sync");
     }
+    // F23: an empty table after a FAILED first sync means "schedule unknown",
+    // not "no pages" — the glass keeps the last good page, no hint, no cycle.
+    #[test]
+    fn failed_sync_with_a_page_on_the_glass_paints_nothing() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        // The RTC record says page 0 is on the glass (a previous boot's page).
+        shim::host::stage_panel_record(0x50414E31, 1, md5hex(0xa1).as_bytes(), 0);
+        // This wake never reaches the server: the table stays empty.
+        shim::host::script_get("/api/pages/schedule", 500, b"");
+        assert!(!sync_once());
+        assert!(!sync_ok());
+        assert_eq!(with_table(|t| t.count), 0);
+        assert!(!paint_if_changed(), "failed sync leaves the glass alone");
+        assert_eq!(shim::host::hint_draws(), 0, "no hint over the last good page");
+        assert_eq!(shim::host::refreshes(), 0, "no panel cycle while backing off");
+    }
+
+    // F23: same gate when the record already shows the hint — still no paint,
+    // and still no second cycle.
+    #[test]
+    fn failed_sync_with_the_hint_on_the_glass_paints_nothing() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        shim::host::stage_panel_record(0x50414E31, 1, b"", -1);
+        shim::host::script_get("/api/pages/schedule", 500, b"");
+        assert!(!sync_once());
+        assert!(!paint_if_changed(), "failed sync leaves the glass alone");
+        assert_eq!(shim::host::hint_draws(), 0);
+        assert_eq!(shim::host::refreshes(), 0);
+    }
+
+    // F23: a SUCCESSFUL sync with zero pages still draws and records the hint.
+    #[test]
+    fn successful_empty_sync_paints_and_records_the_hint() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        assert!(sync_once());
+        assert!(sync_ok());
+        assert!(paint_if_changed(), "successful empty sync shows the hint");
+        assert_eq!(shim::host::hint_draws(), 1);
+        assert_eq!(shim::host::refreshes(), 1);
+        assert!(!paint_if_changed(), "hint recorded as index -1 -> no panel cycle");
+        assert_eq!(shim::host::refreshes(), 1);
+    }
 
     #[test]
     fn manual_paging_overrides_the_server_until_the_next_sync() {
@@ -1154,7 +1213,6 @@ mod tests {
     fn sync_downloads_pages_and_commits_the_schedule() {
         let _g = shim::host::lock();
         reset_for_test();
-        shim::host::set_now_us(1_000_000);
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10), (0xb2, 5)]));
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), &bitmap_body(0xb2));
@@ -1180,7 +1238,6 @@ mod tests {
     fn unchanged_schedule_is_not_re_downloaded() {
         let _g = shim::host::lock();
         reset_for_test();
-        shim::host::set_now_us(1_000_000);
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
         sync_once();
