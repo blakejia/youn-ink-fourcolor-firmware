@@ -45,19 +45,22 @@
 计算（`pages.py` 新增纯函数 `schedule_position(entries, now_ts)`）：
 
 ```
-cycle_min = Σ max(e.duration_minutes, 1)
+cycle_s = Σ max(e.duration_minutes, 1) * 60
 若 entries 为空 → current_index = 0, seconds_until_next_page = null
-pos_min   = (int(now_ts) // 60) % cycle_min
-按 entries 顺序累加 duration，找到 pos_min 所在区间 → current_index
-seconds_until_next_page = (该区间结束分钟 - pos_min) * 60
+pos_s = int(now_ts) % cycle_s          ← 秒级，不是分钟级
+按 entries 顺序累加 duration，找到 pos_s 所在区间 → current_index
+seconds_until_next_page = 区间结束秒 - pos_s
 ```
 
-- 夹到 `≥1` 分钟是必需的：`duration_minutes` 目前保存时不校验，`0` 会让 `cycle_min` 为 0 而除零。
+- **秒级而非分钟级**（2026-09-11 修正）：字段名与用途都是秒。分钟量化会把剩余时间系统性放大到下一个整分钟（永远返回 60 的倍数，最坏晚 59 秒翻页）；秒级在剩余 ≥ 60 秒时精确，< 60 秒时被固件侧 60 秒下限兜住，最坏同为晚 59 秒但平均更准。
+- 求和前仍夹到 `≥ 1` 分钟：这是为了容忍盘上可能已存在的 0 分钟条目（保存路径本来就会拒绝，见 §3.2），保证本函数是全函数。
 - `schedule_md5` 仍只哈希 `(md5, duration, order)`，新字段不参与 → 设备的"排期未变"快路径与服务端既有测试都不受影响。
 
-### 3.2 保存时夹取时长
+### 3.2 保存校验：保持不动
 
-`POST /api/pages` 的 `duration_minutes` 按 `settings.canvas_min_page_duration_minutes`（默认 10）下限夹取。当前该 policy 字段只出现在响应里，保存时未生效。
+`POST /api/pages` **本来就会**用 `settings.canvas_min_page_duration_minutes` 下限校验，低于下限返回 400（`test_min_duration_validation` 覆盖）。本节原先写的是"改成静默夹取"——那个前提是错的（我误以为保存时没校验），静默修正用户输入比明确拒绝更糟，且会推翻一个既有且已测的契约。**保持 400 校验与原测试不变。**
+
+`schedule_position` 里的 `max(duration_minutes, 1)` 与保存校验不是一回事：它只负责让函数对盘上任何历史数据都成立，不改变写入行为。
 
 ## 4. 固件：电源状态与唤醒路径
 
@@ -232,7 +235,7 @@ uint32_t page_sync_next_wake_s(void);      // 上次响应推导的下次唤醒�
 - 单页、空排期（`seconds_until_next_page == null`）。
 - `duration_minutes = 0` 被夹到 1（循环非零）。
 - 新字段不影响 `schedule_md5`（同一排期加/不加新字段哈希一致）。
-- 保存时按 `min_page_duration_minutes` 夹取。
+- 既有 `test_min_duration_validation`（低于下限返回 400）保持不动，仍须通过。
 
 ### Rust 单测（`firmware/main/rust/src/`）
 

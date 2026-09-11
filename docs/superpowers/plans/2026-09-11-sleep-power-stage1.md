@@ -80,15 +80,9 @@ def test_schedule_response_carries_position_but_md5_ignores_it(client):
     assert md5_a == md5_b
 
 
-def test_create_page_clamps_duration_to_policy_minimum(client, operator_headers):
-    r = client.post("/api/pages", json={
-        "name": "clamped", "canvas_json": _MINIMAL_CANVAS, "duration_minutes": 0,
-    }, headers=operator_headers)
-    assert r.status_code in (200, 201)
-    assert r.json()["duration_minutes"] >= 10
 ```
 
-（`operator_headers`、`_MINIMAL_CANVAS` 若不在该文件中，照抄同文件既有用例里的写法；不要新造 fixture。）
+（不需要新增保存校验的用例：既有 `test_min_duration_validation` 已经覆盖"低于下限返回 400"，且本任务**不改**这个契约——见 Step 3 的说明。若该文件里没有可复用的鉴权/画布 fixture，照抄同文件既有用例的写法，不要新造 fixture。）
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -139,17 +133,12 @@ def schedule_position(entries: list[PageEntry], now_ts: float) -> tuple[int, Opt
 
 `app.py` 顶层若无 `import time` 则补上。
 
-`create_page` 中 `duration_minutes = int(body.get("duration_minutes", 10))` 之后加：
-
-```python
-        # policy 的最小页时长此前只在响应里出现，保存时没生效
-        duration_minutes = max(duration_minutes, settings.canvas_min_page_duration_minutes)
-```
+`create_page` **不动**：它本来就有下限校验并返回 400（`test_min_duration_validation`）。原先计划里"改成静默夹取"的前提是错的，按 spec §3.2 的修正保留原契约——静默修正用户输入比明确拒绝更糟。`schedule_position` 内的 `max(duration_minutes, 1)` 仅用于对盘上历史数据保持全函数，与本条无关。
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd server && ./.venv/bin/python -m pytest tests -q`
-Expected: PASS，总数 ≥ 74（原 69 + 新增 5）
+Expected: PASS，总数 ≥ 73（原 69 + 新增 4）
 
 - [ ] **Step 5: 提交**
 
@@ -1207,7 +1196,7 @@ EPD rail) starts."
 | Spec 节 | 任务 |
 |---|---|
 | §3.1 两个新字段 + 纯函数 | Task 1 |
-| §3.2 保存夹取 | Task 1 |
+| §3.2 保存校验保持不动 | Task 1（不改代码，只保证既有 400 用例仍过） |
 | §4.1 quiet/interactive 拆分 | Task 6 |
 | §4.2 三种电源形态 | Task 7（kMains/kInteractive/kDutyCycle 由 `power::decide` 表达） |
 | §4.3 允许入睡条件（含第 5 条作废记录） | Task 2（`decide`）+ Task 7（接线） |
