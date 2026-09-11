@@ -1,12 +1,14 @@
 [package]
-name = "device_signature"
+name = "rust_firmware"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Pair-start device signature (HMAC-SHA256 over MAC|timestamp|nonce)"
+description = "Rust implementations of the NOTE4C firmware's leaf modules"
 
-# Only a staticlib: ESP-IDF's linker does the final link, so cargo never needs
-# a linker for the target (which is why this works without the esp-rs GCC).
+# One staticlib for the whole firmware: separate Rust archives would each bundle
+# `#[panic_handler]`, `core` and `compiler_builtins`, and those collide at link.
+# ESP-IDF does the final link, so cargo never needs a linker for the target
+# (which is why this works without the esp-rs GCC).
 # The extra `rlib` is what lets `cargo test` link the crate without a target.
 [lib]
 crate-type = ["staticlib", "rlib"]

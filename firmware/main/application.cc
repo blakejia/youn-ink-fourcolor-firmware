@@ -21,8 +21,8 @@
 #include <freertos/task.h>
 #include "common/server_pairing.h"
 #include "ssid_manager.h"
-#include "common/page_sync.h"
-#include "common/notify.h"
+#include "page_sync.h"
+#include "notify.h"
 
 #include <ctime>
 

@@ -8,7 +8,7 @@
 #include "boards/zectrix-s3-epaper-4.2/custom_lcd_display.h"
 #include "rawdraw/style.h"
 #include "rawdraw/rawdraw.h"
-#include "common/page_sync.h"
+#include "page_sync.h"
 #include "rawdraw/theme.h"
 #include "rawdraw/clock.h"
 #include "rawdraw/layout_utils.h"

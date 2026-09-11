@@ -8,7 +8,7 @@
 //!
 //! `mac` is raw bytes here; on the device it comes from `esp_read_mac`.
 
-use device_signature::{
+use rust_firmware::device_signature::{
     Inputs, MASTER_KEY, MAC_LEN, NONCE_B64_LEN, NONCE_LEN, SIGNATURE_B64_LEN, sign,
 };
 
@@ -20,15 +20,15 @@ fn inputs(mac: [u8; MAC_LEN], timestamp: i64, nonce: [u8; NONCE_LEN]) -> Inputs 
     Inputs { mac, timestamp, nonce }
 }
 
-fn sig_str(s: &device_signature::Signature) -> String {
+fn sig_str(s: &rust_firmware::device_signature::Signature) -> String {
     String::from_utf8(s.sig_b64_str().to_vec()).unwrap()
 }
 
-fn nonce_str(s: &device_signature::Signature) -> String {
+fn nonce_str(s: &rust_firmware::device_signature::Signature) -> String {
     String::from_utf8(s.nonce_b64_str().to_vec()).unwrap()
 }
 
-fn ts_str(s: &device_signature::Signature) -> String {
+fn ts_str(s: &rust_firmware::device_signature::Signature) -> String {
     String::from_utf8(s.timestamp_str().to_vec()).unwrap()
 }
 

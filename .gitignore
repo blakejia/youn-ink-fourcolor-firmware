@@ -65,4 +65,4 @@ server/firmware/
 *.pbm
 
 # Rust build output (device_signature_rs component)
-firmware/main/components/device_signature_rs/rust/target/
+firmware/main/rust/target/

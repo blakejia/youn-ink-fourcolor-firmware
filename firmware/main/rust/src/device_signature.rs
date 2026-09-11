@@ -16,12 +16,7 @@
 //!
 //! The whole algorithm is pure and host-testable ([`sign`]); the three values
 //! that only the device can produce (Wi-Fi MAC, wall clock, entropy) are
-//! gathered in [`ffi`], which is compiled only for the Xtensa target.
-
-// `no_std` only for the device: on the host the crate is built as an rlib for
-// `cargo test`, and a no_std host build cannot unwind (which the test harness
-// needs). Nothing in here uses std either way.
-#![cfg_attr(target_arch = "xtensa", no_std)]
+//! gathered by the C++ shim, which calls [`ffi::devsig_sign`] with them.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;

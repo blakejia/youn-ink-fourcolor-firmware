@@ -1,29 +1,13 @@
 //! Xtensa-only C ABI surface.
 //!
-//! Deliberately thin: `shim.c` owns the hardware side (`esp_read_mac`, `time`,
-//! `esp_fill_random`) and the public `device_sign_pair_start` symbol declared in
-//! `main/common/device_signature.h`, then calls [`devsig_sign`] here for the
-//! cryptography. Nothing in this file touches ESP-IDF.
-//!
-//! The direction matters for linking: `shim.c` lives in this component's archive
-//! and the Rust staticlib is attached right after it, so the C object is pulled
-//! in first and its reference to `devsig_sign` resolves against the archive that
-//! follows.
+//! Deliberately thin: the C++ shim owns the hardware side (`esp_read_mac`,
+//! `time`, `esp_fill_random`) and the public `device_sign_pair_start` symbol
+//! declared in `include/device_signature.h`, then calls [`devsig_sign`] here for
+//! the cryptography. Nothing in this file touches ESP-IDF.
 
 use core::ffi::c_char;
 
-use crate::{Inputs, MAC_LEN, NONCE_LEN, sign_with_build_key};
-
-unsafe extern "C" {
-    /// C `abort()`, so a panic in the staticlib does not unwind into C++
-    /// (which has exceptions enabled and would not survive a foreign frame).
-    fn abort() -> !;
-}
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    unsafe { abort() }
-}
+use super::{Inputs, MAC_LEN, NONCE_LEN, sign_with_build_key};
 
 fn c_str_len(s: *const c_char) -> usize {
     let mut n = 0;

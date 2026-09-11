@@ -62,9 +62,8 @@ set(SOURCES
     "common/ble_image_receiver.cc"
     "common/holiday_fetcher.cc"
     "common/server_pairing.cc"
+    "rust/shim.cpp"
     "common/http_client_wrapper.cc"
-    "common/page_sync.cc"
-    "common/notify.cc"
     "ui/widgets/status_bar.cc"
     "ui/renderers/rawdraw/ebook_renderer.cc"
     "ui/renderers/rawdraw/chat_renderer.cc"
@@ -109,6 +108,7 @@ set(INCLUDE_DIRS
     "boards/common"
     "rawdraw"
     "rawdraw/components"
+    "rust/include"
     "common"
 )
 
@@ -127,7 +127,6 @@ idf_component_register(
         78__esp-opus
         78__esp-wifi-connect
         78__xiaozhi-fonts
-        device_signature_rs
         esp_app_format
         app_update
         esp_partition
@@ -156,6 +155,57 @@ target_compile_definitions(
     PROJECT_VER=\"6.5.9\"  # F5: Make version available to renderer code
 )
 
-# Device signature master key is injected at build time into the Rust
-# implementation (`main/components/device_signature_rs`), which is the only
-# consumer: see that component's CMakeLists.txt.
+# Device signature master key is injected at build time (CMake cache -> cargo
+# env -> `option_env!`) into the Rust implementation under `main/rust/`, which is
+# its only consumer: see the cargo wiring at the bottom of this file.
+# ── Rust modules (main/rust) ───────────────────────────────────────────────
+#
+# `rust/` holds the Rust implementations of the pair-start signature, page_sync
+# and notify, plus `shim.cpp`, the only file that touches ESP-IDF on their
+# behalf. They live inside `main` rather than in a component because the shim
+# needs main's headers (`board.h`, `custom_lcd_display.h`, ...) and components
+# cannot depend on main.
+#
+# Upstream rustc has no Xtensa target, so this needs the esp-rs toolchain
+# (`espup install -t esp32s3`); `+esp` selects it explicitly. `-Zbuild-std=core`
+# is required because that toolchain ships `rust-src` but no prebuilt core for
+# the Xtensa targets.
+set(RUST_DIR "${CMAKE_CURRENT_LIST_DIR}/rust")
+set(RUST_TARGET "xtensa-esp32s3-none-elf")
+set(RUST_LIB "${RUST_DIR}/target/${RUST_TARGET}/release/librust_firmware.a")
+
+# Listed explicitly (no glob): IDF does not expand this file early, but an
+# explicit list keeps the rebuild rules obvious.
+set(RUST_SOURCES
+    "${RUST_DIR}/Cargo.toml"
+    "${RUST_DIR}/Cargo.lock"
+    "${RUST_DIR}/src/lib.rs"
+    "${RUST_DIR}/src/device_signature.rs"
+    "${RUST_DIR}/src/device_signature/ffi.rs"
+    "${RUST_DIR}/src/page_sync.rs"
+    "${RUST_DIR}/src/notify.rs"
+    "${RUST_DIR}/src/json.rs"
+    "${RUST_DIR}/src/log.rs"
+    "${RUST_DIR}/src/shim.rs")
+
+# DEVICE_MASTER_KEY is baked into the archive, so it has to take part in
+# dependency tracking: without this stamp, changing -DDEVICE_MASTER_KEY would
+# reuse a stale .a and the device would sign with the previous key.
+set(RUST_KEY_STAMP "${CMAKE_CURRENT_BINARY_DIR}/rust_devsig_master_key.txt")
+file(WRITE "${RUST_KEY_STAMP}.tmp" "${DEVICE_MASTER_KEY}")
+execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${RUST_KEY_STAMP}.tmp" "${RUST_KEY_STAMP}")
+
+add_custom_command(
+    OUTPUT "${RUST_LIB}"
+    COMMAND ${CMAKE_COMMAND} -E env "DEVICE_MASTER_KEY=${DEVICE_MASTER_KEY}"
+            cargo +esp build --release --target ${RUST_TARGET}
+                  -Zbuild-std=core --manifest-path "${RUST_DIR}/Cargo.toml"
+    DEPENDS ${RUST_SOURCES} "${RUST_KEY_STAMP}"
+    WORKING_DIRECTORY "${RUST_DIR}"
+    COMMENT "Building Rust firmware modules (${RUST_TARGET})"
+    VERBATIM)
+
+add_custom_target(rust_firmware DEPENDS "${RUST_LIB}")
+add_dependencies(${COMPONENT_LIB} rust_firmware)
+target_link_libraries(${COMPONENT_LIB} INTERFACE "${RUST_LIB}")
