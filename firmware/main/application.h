@@ -109,6 +109,15 @@ private:
     // promoted_ makes it one-shot per boot; both atomics, no lock needed.
     std::atomic<bool> promote_requested_{false};
     std::atomic<bool> promoted_{false};
+    // Interactive cold boot only. The UI's shell paint is held back so the
+    // canvas's frame from the first power cycle is the only one that reaches
+    // the glass: on this 4-color panel each full refresh is ~25 s and the two
+    // otherwise land back to back, the first one showing a shell the second
+    // immediately covers. When the canvas has nothing to paint (sync failed,
+    // or that page is already on the glass) the image already up is the frame
+    // to keep — spec §13 — not the shell. Cleared by the first cycle and by
+    // any button activity, so the UI can never be left unpainted.
+    std::atomic<bool> ui_boot_paint_deferred_{false};
     // (The sync-failure backoff streak is NOT here: it lives in RTC memory
     // via rf_fail_streak_*, because RAM is cleared on every deep-sleep wake.)
     // Set by RunPowerCycle immediately before page_sync_sync_once(); consumed

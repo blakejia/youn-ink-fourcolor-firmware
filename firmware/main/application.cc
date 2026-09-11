@@ -266,6 +266,13 @@ void Application::Initialize(bool quiet) {
     if (quiet_boot_.load(std::memory_order_acquire)) {
         ESP_LOGI(kTag, "Quiet boot: UI manager skipped, panel bring-up skipped");
     } else {
+        // A paired device has the canvas painting this panel on the cycle that
+        // begins seconds from now, and that frame covers all of it. Hold back
+        // the UI's shell paint rather than spend a second full refresh on a
+        // frame the canvas is about to supersede (see the member). Unpaired
+        // keeps painting: provisioning and the pairing code are the UI's.
+        ui_boot_paint_deferred_.store(server_pairing_init() == SERVER_PAIR_OK,
+                                      std::memory_order_release);
         BuildRawDrawUi(static_cast<CustomLcdDisplay*>(display));
     }
 
@@ -364,10 +371,16 @@ void Application::Initialize(bool quiet) {
 
 void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
     rawdraw_ui_manager_ = std::make_unique<ui::RawDrawUiManager>();
-    rawdraw_ui_manager_->Init(lcd, [lcd](const rawdraw::Rect&, bool urgent) {
+    rawdraw_ui_manager_->Init(lcd, [this, lcd](const rawdraw::Rect&, bool urgent) {
         // Every UI-side repaint (page switch, dirty rect, clock) funnels through
         // here; the canvas asks the display directly, so the label is enough to
         // tell the two refresh sources apart in the log.
+        if (ui_boot_paint_deferred_.load(std::memory_order_acquire)) {
+            // Cold boot with the canvas about to paint the whole panel: see the
+            // member. The render has already landed in the framebuffer, so only
+            // the panel refresh is skipped.
+            return;
+        }
         if (urgent) {
             lcd->RequestUrgentFullRefresh("ui");
         } else {
@@ -629,6 +642,9 @@ void Application::OnBootLongPress() {
 
 void Application::NoteButtonActivity() {
     Board::GetInstance().FlashActivityLed();
+    // Someone is in front of the device: whatever the boot held back, they are
+    // waiting on a screen now and the canvas's frame is no longer the answer.
+    ui_boot_paint_deferred_.store(false, std::memory_order_release);
     if (rawdraw_ui_manager_) {
         rawdraw_ui_manager_->RequestActivePageRefresh();
     } else {
@@ -749,6 +765,10 @@ void Application::RunPowerCycle() {
     // the empty hint, which is what makes the canvas's display-ownership
     // claim honest.
     page_sync_paint_if_changed();
+    // The cold boot may have held the UI's first paint back for exactly this
+    // frame; from here the UI paints normally (button activity would have
+    // cleared the flag before this point).
+    ui_boot_paint_deferred_.store(false, std::memory_order_release);
     ServicePowerPolicy();
     cycle_in_progress_.store(false, std::memory_order_release);
 }
