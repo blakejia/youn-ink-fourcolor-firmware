@@ -122,6 +122,18 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+# 设备签名组件（main/components/device_signature_rs）用 Rust 实现，编译需要
+# cargo 和 esp-rs 的 Xtensa 工具链。缺失时在这里报清楚，否则会在 CMake 自定义
+# 命令里抛出一句难懂的 "cargo: command not found"。
+if ! command -v cargo >/dev/null 2>&1 || ! command -v rustup >/dev/null 2>&1; then
+  echo "[ERROR] 未检测到 cargo/rustup，请先安装: https://rustup.rs" >&2
+  exit 1
+fi
+if ! rustup toolchain list 2>/dev/null | grep -q '^esp'; then
+  echo "[ERROR] 未找到 esp-rs Xtensa 工具链，请先执行: espup install -t esp32s3" >&2
+  exit 1
+fi
+
 cd "$PROJECT_DIR"
 load_idf_env
 

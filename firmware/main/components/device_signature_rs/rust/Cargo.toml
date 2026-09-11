@@ -1,0 +1,23 @@
+[package]
+name = "device_signature"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Pair-start device signature (HMAC-SHA256 over MAC|timestamp|nonce)"
+
+# Only a staticlib: ESP-IDF's linker does the final link, so cargo never needs
+# a linker for the target (which is why this works without the esp-rs GCC).
+# The extra `rlib` is what lets `cargo test` link the crate without a target.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+base64 = { version = "0.22", default-features = false }
+
+[profile.release]
+# No unwinding tables: a panic aborts through the shim's abort().
+panic = "abort"
+lto = true
+codegen-units = 1

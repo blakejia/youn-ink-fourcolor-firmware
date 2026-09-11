@@ -63,3 +63,6 @@ server/firmware/
 *.zip
 *.tar.gz
 *.pbm
+
+# Rust build output (device_signature_rs component)
+firmware/main/components/device_signature_rs/rust/target/

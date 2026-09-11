@@ -70,8 +70,7 @@
 
 
 
-// Device signature master key (compile-time inject, do NOT commit actual value)
-#ifndef DEVICE_MASTER_KEY
-#define DEVICE_MASTER_KEY "REPLACE_ME_AT_BUILD_TIME_WITH_32_BYTE_RANDOM"
-#endif
+// Device signature master key now lives in the Rust component
+// (main/components/device_signature_rs), injected at build time via
+// `idf.py -DDEVICE_MASTER_KEY=... build`. Value NEVER committed.
 #endif // _BOARD_CONFIG_H_

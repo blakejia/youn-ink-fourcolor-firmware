@@ -64,7 +64,6 @@ set(SOURCES
     "common/server_pairing.cc"
     "common/http_client_wrapper.cc"
     "common/page_sync.cc"
-    "common/device_signature.cc"
     "common/notify.cc"
     "ui/widgets/status_bar.cc"
     "ui/renderers/rawdraw/ebook_renderer.cc"
@@ -128,6 +127,7 @@ idf_component_register(
         78__esp-opus
         78__esp-wifi-connect
         78__xiaozhi-fonts
+        device_signature_rs
         esp_app_format
         app_update
         esp_partition
@@ -156,14 +156,6 @@ target_compile_definitions(
     PROJECT_VER=\"6.5.9\"  # F5: Make version available to renderer code
 )
 
-# Device signature master key: injected at build time via
-# `idf.py -DDEVICE_MASTER_KEY=... build` (CMake cache, gitignored build/).
-# config.h falls back to REPLACE_ME placeholder when absent — signatures
-# then fail HMAC verification server-side. Value NEVER committed.
-if(DEFINED DEVICE_MASTER_KEY AND NOT "${DEVICE_MASTER_KEY}" STREQUAL "")
-    target_compile_definitions(
-        ${COMPONENT_LIB}
-        PRIVATE
-        DEVICE_MASTER_KEY=\"${DEVICE_MASTER_KEY}\"
-    )
-endif()
+# Device signature master key is injected at build time into the Rust
+# implementation (`main/components/device_signature_rs`), which is the only
+# consumer: see that component's CMakeLists.txt.
