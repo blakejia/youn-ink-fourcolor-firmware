@@ -19,6 +19,7 @@
 pub mod device_signature;
 pub mod input;
 pub mod json;
+pub mod lifecycle;
 pub mod log;
 pub mod notify;
 pub mod page_sync;

@@ -27,6 +27,7 @@
 #include "page_sync.h"
 #include "notify.h"
 #include "input.h"
+#include "lifecycle.h"
 #include "power.h"
 #include "shim_power.h"
 
@@ -1022,6 +1023,15 @@ void Application::TransitionLifecycle(LifecycleState next, const char* reason) {
     const LifecycleState old = lifecycle_.exchange(next, std::memory_order_acq_rel);
     if (old == next) {
         return;  // 只记录真正的变更，重复上报由各模块自带 LOG 覆盖
+    }
+    // 迁移合法性由 lifecycle.rs 判定（表驱动、主机可测）。可疑不等于致命：
+    // 一次状态广播不值得让设备停下来，但要当场可见——历史上"永卡
+    // WifiConnecting 导致自动休眠永久失效"那种事，就是没人看得见才活了很久。
+    rf_lifecycle_verdict_t v = {};
+    rf_lifecycle_verdict(static_cast<uint8_t>(old), static_cast<uint8_t>(next), &v);
+    if (v.kind == RF_LIFECYCLE_SUSPICIOUS && v.message != nullptr) {
+        ESP_LOGW(kTag, "Lifecycle: %s -> %s (%s) 可疑：%s", LifecycleName(old),
+                 LifecycleName(next), reason ? reason : "", v.message);
     }
     ESP_LOGI(kTag, "Lifecycle: %s -> %s (%s)",
              LifecycleName(old), LifecycleName(next), reason ? reason : "");
