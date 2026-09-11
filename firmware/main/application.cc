@@ -565,7 +565,7 @@ bool Application::CanEnterSleepMode() const {
 void Application::EnterScheduledSleep() {
     // 只有 SYNC_IDLE 才允许休眠：配网/配对/连接中一律跳过。
     // （替代旧的 IsConfigMode 特判——状态机统一覆盖）
-    if (GetLifecycleState() != kLifecycleSyncIdle) {
+    if (!CanEnterSleepMode()) {
         // 必须重装：esp_timer_start_once 是一次性的，直接 return 会让定时器
         // 永久失效——之后即使配对成功进入 SyncIdle 也不会再有任何休眠定时器。
         ESP_LOGI(kTag, "Scheduled sleep skipped: lifecycle not SyncIdle, retry in 1 min");
