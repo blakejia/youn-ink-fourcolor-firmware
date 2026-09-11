@@ -203,6 +203,8 @@ pub(crate) mod host {
         now_us: 0,
     });
     static FB: Mutex<Option<&'static mut [u8]>> = Mutex::new(None);
+    /// Live allocations, so the HTTP stubs can prove they stay in bounds.
+    static ALLOCS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
     fn counters<R>(f: impl FnOnce(&mut Counters) -> R) -> R {
         let mut g = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -232,6 +234,7 @@ pub(crate) mod host {
         *c = Counters::default();
         drop(c);
         FB.lock().unwrap_or_else(|e| e.into_inner()).take();
+        ALLOCS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         guard
     }
 
@@ -324,6 +327,42 @@ pub(crate) mod host {
         true
     }
 
+    fn allocation_size(ptr: *mut u8) -> Option<usize> {
+        let p = ptr as usize;
+        ALLOCS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(base, _)| *base == p)
+            .map(|(_, size)| *size)
+    }
+
+    /// Copy a scripted body into `buf` under the wrapper's contract: `cap` is
+    /// the capacity *including* the terminator, and nothing may be written
+    /// outside the allocation. This is the invariant that used to be off by one
+    /// byte (`out_buf[ctx.len]` with `len == capacity`).
+    fn write_response(body: &[u8], buf: *mut c_char, cap: usize) -> usize {
+        // Only heap buffers can be checked; stack buffers (the ack response
+        // CBuf) are the caller's declared capacity, which the reserve below
+        // already respects.
+        if let Some(size) = allocation_size(buf as *mut u8) {
+            assert!(cap <= size, "HTTP capacity {cap} exceeds the {size}-byte allocation");
+        }
+        // Reserve the terminator byte, exactly like http_client_wrapper.cc.
+        let n = body.len().min(cap.saturating_sub(1));
+        if let Some(size) = allocation_size(buf as *mut u8) {
+            assert!(
+                n + 1 <= size,
+                "terminator would be written at offset {n} of a {size}-byte allocation"
+            );
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(body.as_ptr(), buf as *mut u8, n);
+            *buf.add(n) = 0;
+        }
+        n
+    }
+
     /// 16-byte header so `rf_free` can rebuild the layout.
     fn payload_layout(bytes: usize) -> std::alloc::Layout {
         std::alloc::Layout::from_size_align(bytes + 16, 16).unwrap()
@@ -352,7 +391,12 @@ pub(crate) mod host {
                 return p;
             }
             *(p as *mut usize) = bytes;
-            p.add(16)
+            let payload = p.add(16);
+            ALLOCS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((payload as usize, bytes));
+            payload
         }
     }
 
@@ -361,6 +405,10 @@ pub(crate) mod host {
         if p.is_null() {
             return;
         }
+        ALLOCS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(base, _)| *base != p as usize);
         unsafe {
             let base = p.sub(16);
             let bytes = *(base as *const usize);
@@ -465,14 +513,8 @@ pub(crate) mod host {
         };
         match hit {
             Some((status, body)) => {
-                let n = body.len().min(cap);
-                unsafe {
-                    core::ptr::copy_nonoverlapping(body.as_ptr(), buf as *mut u8, n);
-                    // http_wrapper_get NUL-terminates one past the length, which
-                    // is why every caller over-allocates by one byte.
-                    *buf.add(n) = 0;
-                    *len = n as c_int;
-                }
+                let n = write_response(&body, buf, cap);
+                unsafe { *len = n as c_int };
                 status
             }
             None => {
@@ -501,12 +543,8 @@ pub(crate) mod host {
         };
         match hit {
             Some((status, body)) => {
-                let n = body.len().min(cap);
-                unsafe {
-                    core::ptr::copy_nonoverlapping(body.as_ptr(), buf as *mut u8, n);
-                    *buf.add(n) = 0;
-                    *len = n as c_int;
-                }
+                let n = write_response(&body, buf, cap);
+                unsafe { *len = n as c_int };
                 status
             }
             None => {

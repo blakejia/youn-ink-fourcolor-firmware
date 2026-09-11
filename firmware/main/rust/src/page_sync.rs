@@ -559,6 +559,26 @@ pub fn start() {
     }
 }
 
+/// What one pass of the poll loop should do.
+///
+/// Pure so the cadence rules are host-tested; they are otherwise only visible
+/// as "the panel does/does not repaint" on real hardware.
+#[derive(Debug, PartialEq, Eq)]
+struct Tick {
+    /// Fetch the schedule now (its own cadence, owned by the server).
+    poll: bool,
+    /// Touch the panel now (rotation, first paint).
+    paint: bool,
+}
+
+fn plan_tick(now_us: u64, last_poll_us: u64, first: bool, suspended: bool, t: &Table) -> Tick {
+    let interval_s = if t.policy.screen_active { t.policy.poll_s } else { t.policy.sleep_poll_s };
+    let poll = last_poll_us == 0
+        || now_us.saturating_sub(last_poll_us) >= interval_s as u64 * 1_000_000;
+    let inside_sleep_window = !t.policy.screen_active && !first;
+    Tick { poll, paint: !suspended && !inside_sleep_window }
+}
+
 extern "C" fn task_entry(_arg: *mut c_void) {
     let mut first = true;
     let mut last_poll_us: u64 = 0;
@@ -567,14 +587,11 @@ extern "C" fn task_entry(_arg: *mut c_void) {
             break;
         }
 
-        // The server owns the poll cadence (and slows it down inside its sleep
-        // window); the tick above only drives rotation and painting.
-        let (poll_us, screen_active) = with_table(|t| {
-            let interval = if t.policy.screen_active { t.policy.poll_s } else { t.policy.sleep_poll_s };
-            (interval as u64 * 1_000_000, t.policy.screen_active)
-        });
-        let now = now_us();
-        if last_poll_us == 0 || now.saturating_sub(last_poll_us) >= poll_us {
+        // The server owns the poll cadence (slower inside its sleep window);
+        // the local tick only drives rotation and painting.
+        let suspended = SUSPENDED.load(Ordering::Acquire);
+        let tick = with_table(|t| plan_tick(now_us(), last_poll_us, first, suspended, t));
+        if tick.poll {
             sync_once();
             last_poll_us = now_us();
         }
@@ -587,14 +604,9 @@ extern "C" fn task_entry(_arg: *mut c_void) {
             });
         }
 
-        if SUSPENDED.load(Ordering::Acquire) {
-            // Keep the data fresh but do not touch the panel: the UI owns it.
-            unsafe { shim::rf_delay_ms(TICK_MS) };
-            continue;
-        }
-
-        if !screen_active && !first {
-            // Sleep window: keep polling, but spend no panel cycles (a
+        if !tick.paint {
+            // Either the UI owns the panel, or the server's sleep window is
+            // open: keep the page table fresh, spend no panel cycles (a
             // four-colour refresh is >= 15 s with the radio up). The first paint
             // after boot still happens, so a wake press shows content.
             unsafe { shim::rf_delay_ms(TICK_MS) };
@@ -695,6 +707,61 @@ mod tests {
         assert_eq!(parsed.pages[0].duration_s, 600);
     }
 
+    // ── poll cadence / sleep window ──
+
+    fn table_with(policy: Policy) -> Table {
+        let mut t = Table::new();
+        t.policy = policy;
+        t
+    }
+
+    #[test]
+    fn the_first_tick_always_polls_and_paints() {
+        let t = table_with(Policy::DEFAULT);
+        let tick = plan_tick(1_000_000, 0, true, false, &t);
+        assert!(tick.poll, "a cold start must fetch the schedule immediately");
+        assert!(tick.paint);
+
+        // Same on the very first tick inside the sleep window: a wake press
+        // should show content rather than a blank panel.
+        let t = table_with(Policy { screen_active: false, ..Policy::DEFAULT });
+        let tick = plan_tick(1_000_000, 0, true, false, &t);
+        assert!(tick.poll);
+        assert!(tick.paint);
+    }
+
+    #[test]
+    fn polling_follows_the_servers_cadence_not_the_tick() {
+        let t = table_with(Policy::DEFAULT); // poll every 600 s
+        let startup = 1_000_000;
+        assert!(!plan_tick(startup + 5_000_000, startup, false, false, &t).poll, "5 s: no poll");
+        assert!(!plan_tick(startup + 599_000_000, startup, false, false, &t).poll, "599 s: no poll");
+        assert!(plan_tick(startup + 600_000_000, startup, false, false, &t).poll, "600 s: poll");
+    }
+
+    #[test]
+    fn the_sleep_window_polls_slowly_and_stops_painting() {
+        let t = table_with(Policy { poll_s: 600, sleep_poll_s: 3600, screen_active: false });
+        let startup = 1_000_000;
+
+        let at_10min = plan_tick(startup + 600_000_000, startup, false, false, &t);
+        assert!(!at_10min.poll, "inside the window the cadence is the sleep one");
+        assert!(!at_10min.paint, "and the panel must be left alone");
+
+        let at_60min = plan_tick(startup + 3_600_000_000, startup, false, false, &t);
+        assert!(at_60min.poll);
+        assert!(!at_60min.paint, "polling does not imply repainting");
+    }
+
+    #[test]
+    fn a_suspended_canvas_polls_but_never_paints() {
+        let t = table_with(Policy::DEFAULT);
+        let startup = 1_000_000;
+        let tick = plan_tick(startup + 600_000_000, startup, false, true, &t);
+        assert!(tick.poll, "data stays fresh while the UI owns the screen");
+        assert!(!tick.paint, "but paint_page_sync must not fight the UI for it");
+    }
+
     // ── flows driven through the module, against the scripted shim ──
 
     fn md5hex(tag: u8) -> String {
@@ -724,6 +791,30 @@ mod tests {
 
     fn page0_byte() -> u8 {
         with_table(|t| unsafe { *t.pages[0].bitmap })
+    }
+
+
+    #[test]
+    fn the_bitmap_buffer_is_sized_for_the_wrapper_contract() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
+        // Exactly one panel of payload: the allocation must be one byte larger,
+        // because the wrapper's capacity includes the terminator it appends.
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+
+        setup_one_page();
+
+        assert_eq!(
+            with_table(|t| unsafe { *t.pages[0].bitmap }),
+            0xa1,
+            "a full-size bitmap still lands, terminator included"
+        );
+    }
+
+    /// Apply an already-scripted schedule.
+    fn setup_one_page() {
+        sync_once();
     }
 
     /// Script and apply a two-page schedule, markers 0xa1 / 0xb2.
