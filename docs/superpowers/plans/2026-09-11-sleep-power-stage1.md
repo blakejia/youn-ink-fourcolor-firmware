@@ -1035,6 +1035,12 @@ reset path is unchanged; only the quiet wake can now skip it entirely."
 
 两条路径都要跑**同一个一次性周期**（顺序见 Task 7）：`page_sync_sync_once()` → `notify_request_next()` → `page_sync_paint_if_changed()` → `ServicePowerPolicy()`。`quiet` 只影响三件事：是否建 UI/音频、面板是否 bring-up、以及启动后是进入交互宽限还是直接按占空比算下一次唤醒。交互路径同样需要这一步——原来画板首次绘制是轮询任务的第一个 tick 做的，循环删掉之后没人画了。
 
+- [ ] **Step 2b: quiet 可提升 + 兜底装填**
+
+`Application` 增加提升请求（原子标志 + 已提升标志），由主循环消费：补建 UI（`BuildRawDrawUi`）+ `BringUpPanel()` + 刷新状态栏 + 日志一行；幂等。请求来源：策略的 `mains` 保持清醒分支、`NoteButtonActivity()`（当 UI 尚未建）、以及 `EnterWifiConfigMode()`（并在提升完成后若处于配网态则重新渲染配网页）。
+
+`Initialize()` 末尾在 quiet 时 `RearmPowerTimer(30000)` 作为兜底：WiFi 连不上时也保证周期与策略能跑一次（同步失败 → 退避 → 睡），连上后由连接路径的 3 秒装填覆盖。
+
 - [ ] **Step 3: 板级按 quiet 建屏**
 
 `zectrix-s3-epaper-4.2.cc` 的 `InitializeLcdDisplay(...)` 调用改为 `InitializeLcdDisplay(/*bring_up_panel=*/!quiet)`。

@@ -70,10 +70,23 @@ seconds_until_next_page = 区间结束秒 - pos_s
 
 | 条件 | 路径 |
 |---|---|
-| `ESP_SLEEP_WAKEUP_TIMER` | **quiet**：不创建 `RawDrawUiManager`（因此状态栏不更新，屏上只有画板内容本身）、不进配网页、不做面板上电初始化 |
+| `ESP_SLEEP_WAKEUP_TIMER` | **quiet**：不创建 `RawDrawUiManager`（因此状态栏不更新，屏上只有画板内容本身）、不进配网页、不做面板上电初始化。**quiet 只是起始状态，可被提升**（见下） |
 | 其它（`EXT0`=BOOT / `EXT1`=充电插入 / 上电 / 软件复位） | **interactive**：现有完整启动（UI、生命周期、配对、首次绘屏） |
 
 `ESP_RST_DEEPSLEEP` 且 cause 为 TIMER 时才是 quiet；上电复位（拔电重插）一律 interactive。
+
+### 4.1b quiet 可被提升（2026-09-11 补充）
+
+quiet 假设"这次唤醒最终会去睡"。一旦这个假设不成立，quiet 就成了单向门：设备既没有 UI、也没做面板初始化，而策略又因为条件不满足永远保持清醒——只能拔插电源恢复。因此补两条：
+
+**提升（promote**）：quiet 启动后，遇到下列任一情况就补建 UI 并给面板上电，转为交互态：
+- 策略判定为 `mains`（插电后本 boot 再也不会睡）；
+- 任何按键活动（有人在设备前）；
+- 请求进入配网 AP（配网页本身就靠 UI 渲染，否则用户看不到 AP 名/密码/地址，且 AP 模式会阻止休眠 → 空白屏耗到没电）。
+
+提升必须在**拥有 UI 构造权的那个任务**（主循环）里执行，不能在 WiFi/定时器任务里改 `rawdraw_ui_manager_`，否则与状态栏更新争用同一个 unique_ptr。提升后若正处于配网态，要重新渲染配网页。
+
+**兜底（backstop）**：quiet 路径在 `Initialize()` 末尾自己装一个 30 秒定时器。否则 WiFi 一直连不上时定时器永远不会被装填，周期与策略都不执行 → 电池上的 quiet 唤醒无限期保持清醒（正是占空比要避免的耗电）。若 WiFi 随后连上，连接路径的 3 秒装填会覆盖它，而调度器的"本 boot 还没跑过周期"判断保证不会因此多跑一次周期。
 
 ### 4.2 三条电源形态
 
@@ -107,7 +120,7 @@ cap = screen_active ? policy.poll_interval_minutes*60 : policy.sleep_poll_interv
 
 1. （quiet）跳过 UI/配网初始化
 2. `esp_wifi` 连接（沿用现有 `WifiManager`，含 3.4 的快速重连缓存持久化）
-3. `page_sync_sync_once()`：拉 `/api/pages/schedule`
+3. `page_sync_sync_once()`：拉 `/api/pages/schedule`（若 WiFi 未连上则失败 → 退避 → 睡，这正是 backstop 存在的意义）
 4. `notify_request_next()`：拉 `/api/notifications/next`
 5. `page_sync_paint_if_changed()`：**仅当**目标页 md5 ≠ RTC 记录中屏上的 md5 时才绘屏
 6. 若通知待确认：展示，等待 5 分钟 TTL 或 UP/DOWN/BOOT 交互；此期间不睡
