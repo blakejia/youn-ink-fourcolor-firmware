@@ -176,6 +176,13 @@ def test_schedule_position_single_page_and_empty():
     assert pages_mod.schedule_position([], 12345) == (0, None)
 
 
+def test_schedule_empty_reports_position_for_no_pages(client):
+    """空排期的端点契约：第 0 页、无下次翻页（None，不是 0）。"""
+    body = client.get("/api/pages/schedule").json()
+    assert body["current_index"] == 0
+    assert body["seconds_until_next_page"] is None
+
+
 def test_schedule_position_clamps_zero_duration():
     # 0 分钟页会让 cycle 为 0；必须夹到 1 分钟，否则除零
     entries = _entries([0, 5])
@@ -183,10 +190,25 @@ def test_schedule_position_clamps_zero_duration():
     assert pages_mod.schedule_position(entries, 60) == (1, 300)
 
 
-def test_schedule_response_carries_position_but_md5_ignores_it(client):
-    body = client.get("/api/pages/schedule").json()
-    assert "current_index" in body and "seconds_until_next_page" in body
-    # 位置字段不参与 schedule_md5，否则设备缓存会被时间推进无限击穿
-    md5_a = pages_mod.compute_schedule_md([pages_mod.PageEntry("a" * 32, 10, 0, "x")])
-    md5_b = pages_mod.compute_schedule_md([pages_mod.PageEntry("a" * 32, 10, 0, "x")])
-    assert md5_a == md5_b
+def test_schedule_md5_does_not_move_with_the_clock(client, monkeypatch):
+    """设备缓存靠 md5 相等短路；位置字段一旦混进摘要，缓存会被时间推进不停击穿。"""
+    # 时长必须 >= policy 下限 10，否则保存被 400 拒绝（§3.2 的契约）。
+    for i, mins in enumerate((20, 10)):          # cycle = 1800 s，翻页点在 1200 s
+        r = client.post("/api/pages", json={
+            "name": f"clock{i}",
+            "canvas_json": {"default": [{"type": "div", "props": {
+                "tw": "bg-white", "style": {"color": "#000000"}, "children": "x",
+            }}]},
+            "duration_minutes": mins, "order": i,
+        })
+        assert r.status_code == 200
+
+    # 1_000_000 % 1800 == 1000 -> 第 0 页；1_000_600 % 1800 == 1600 -> 已跨过 1200 翻页点
+    monkeypatch.setattr("youn_server.app.time.time", lambda: 1_000_000.0)
+    a = client.get("/api/pages/schedule").json()
+    monkeypatch.setattr("youn_server.app.time.time", lambda: 1_000_600.0)  # 10 分钟后
+    b = client.get("/api/pages/schedule").json()
+
+    assert a["schedule_md5"] == b["schedule_md5"], "摘要不随时间推进而变"
+    assert a["current_index"] == 0 and b["current_index"] == 1, "位置必须跟着走"
+    assert a["seconds_until_next_page"] == 200 and b["seconds_until_next_page"] == 200
