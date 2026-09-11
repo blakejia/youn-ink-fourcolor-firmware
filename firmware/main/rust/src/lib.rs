@@ -17,6 +17,7 @@
 #![cfg_attr(target_arch = "xtensa", no_std)]
 
 pub mod device_signature;
+pub mod input;
 pub mod json;
 pub mod log;
 pub mod notify;

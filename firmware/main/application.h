@@ -58,6 +58,10 @@ public:
     void OnWifiConfigComboLongPress();
     void OnBootClick();
     void OnBootLongPress();
+    // Button routing: gather the facts, let input.rs decide who owns the
+    // gesture, perform the answer. The handlers above are thin wrappers.
+    void RouteInput(uint8_t button, uint8_t gesture);
+    void EnterSettingsFromInput(bool enter, bool drop_orphan);
 
     // One-shot duty-cycle step both boot paths share (Task 6 quiet path calls
     // this once per wake): page_sync_sync_once() -> notify_request_next() ->

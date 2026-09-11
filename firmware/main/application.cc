@@ -26,6 +26,7 @@
 #include "ssid_manager.h"
 #include "page_sync.h"
 #include "notify.h"
+#include "input.h"
 #include "power.h"
 #include "shim_power.h"
 
@@ -512,131 +513,181 @@ void Application::ServicePromotion() {
     }
 }
 
+// ── input routing ────────────────────────────────────────────────────────
+// Who owns a gesture — the popup, the canvas or the UI — is decided in
+// input.rs, including the guards that used to be re-derived at each call site
+// (a popup answers before the canvas, Settings only answers UP-long if there is
+// somewhere to go back to, provisioning ignores DOWN-long). Each handler below
+// now only names the gesture.
 void Application::OnUpClick() {
     ESP_LOGI(kTag, "UP click");
-    // 通知展示时上键确认（agree）
-    if (notify_is_active()) {
-        notify_post_ack("agree");
-        return;
-    }
-    Board::GetInstance().FlashActivityLed();
-    // 画板显示时上键翻页
-    if (page_sync_is_displaying()) {
-        page_sync_prev();
-        return;
-    }
-    if (rawdraw_ui_manager_) {
-        rawdraw_ui_manager_->HandleInput(rawdraw::ButtonEvent{rawdraw::ButtonEvent::kUpClick});
-    }
+    RouteInput(RF_INPUT_UP, RF_INPUT_CLICK);
 }
 
 void Application::OnUpDoubleClick() {
     ESP_LOGI(kTag, "UP double click");
-    Board::GetInstance().FlashActivityLed();
-    // The overlay is a UI affordance; while a notification or the canvas owns
-    // the panel it would be drawn over and lose its backing snapshot.
-    if (notify_is_active() || page_sync_is_displaying()) {
-        return;
-    }
-    if (rawdraw_ui_manager_) {
-        rawdraw_ui_manager_->HandleInput(
-            rawdraw::ButtonEvent{rawdraw::ButtonEvent::kUpDoubleClick});
-    }
+    RouteInput(RF_INPUT_UP, RF_INPUT_DOUBLE_CLICK);
 }
 
 void Application::OnDownClick() {
     ESP_LOGI(kTag, "DOWN click");
-    // 通知展示时下键拒绝（reject）
-    if (notify_is_active()) {
-        notify_post_ack("reject");
-        return;
-    }
-    Board::GetInstance().FlashActivityLed();
-    // 画板显示时下键翻页
-    if (page_sync_is_displaying()) {
-        page_sync_next();
-        return;
-    }
-    if (rawdraw_ui_manager_) {
-        rawdraw_ui_manager_->HandleInput(rawdraw::ButtonEvent{rawdraw::ButtonEvent::kDownClick});
-    }
+    RouteInput(RF_INPUT_DOWN, RF_INPUT_CLICK);
 }
+
 void Application::OnUpLongPress() {
     ESP_LOGI(kTag, "UP long press");
-    NoteButtonActivity();
-    // 只有 Settings 页响应：返回上一个页面（之前是原地切 Settings 不动）
-    if (rawdraw_ui_manager_ &&
-        rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::Settings) {
-        const auto prev = rawdraw_ui_manager_->GetPreviousPage();
-        if (prev != ui::RawDrawPageId::Settings) {
-            ESP_LOGI(kTag, "UP long press - leaving settings");
-            rawdraw_ui_manager_->SwitchPage(prev);
-        }
-        // 离开 Settings：把屏幕还给画板（此前进 Settings 时挂起过）
-        page_sync_allow_display();
-    }
+    RouteInput(RF_INPUT_UP, RF_INPUT_LONG_PRESS);
 }
 
 void Application::OnDownLongPress() {
     ESP_LOGI(kTag, "DOWN long press");
-    NoteButtonActivity();
-    // 统一收口：配网中忽略；离开当前屏前作废孤儿弹窗（否则切屏后
-    // 通知还在后台收 UP/DOWN 当 agree/reject）。
-    // 用 quiet 版：notify_dismiss 会把画板画回屏幕，与随后的 SwitchPage 抢屏。
-    if (GetLifecycleState() == kLifecycleApProvision) {
-        ESP_LOGI(kTag, "DOWN long press ignored during provisioning");
-        return;
-    }
-    if (notify_is_active()) {
-        notify_dismiss_quiet();
-    }
-    if (rawdraw_ui_manager_) {
-        ESP_LOGI(kTag, "DOWN long press - entering settings");
-        rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Settings);
-    }
+    RouteInput(RF_INPUT_DOWN, RF_INPUT_LONG_PRESS);
 }
 
 void Application::OnWifiConfigComboLongPress() {
     ESP_LOGI(kTag, "UP+DOWN long press");
-    NoteButtonActivity();
-    EnterWifiConfigMode();
+    RouteInput(RF_INPUT_UP, RF_INPUT_COMBO_LONG_PRESS);
 }
 
 void Application::OnBootClick() {
     ESP_LOGI(kTag, "BOOT click");
-    Board::GetInstance().FlashActivityLed();
-    // 通知展示时 BOOT 短按直接关闭（不发 ack）
-    if (notify_is_active()) {
-        notify_dismiss();
-        return;
-    }
-    // 画板显示时 BOOT 短按拉取下一条待确认通知（异步，不阻塞回调）
-    if (page_sync_is_displaying()) {
-        notify_request_next();
-        return;
-    }
-    if (rawdraw_ui_manager_) {
-        rawdraw_ui_manager_->HandleInput(rawdraw::ButtonEvent{rawdraw::ButtonEvent::kBootClick});
-    }
+    RouteInput(RF_INPUT_BOOT, RF_INPUT_CLICK);
 }
 
 void Application::OnBootLongPress() {
     ESP_LOGI(kTag, "BOOT long press");
-    NoteButtonActivity();
-    if (WifiManager::GetInstance().IsConfigMode()) {
-        ESP_LOGI(kTag, "BOOT long press - exiting WiFi config AP");
-        WifiManager::GetInstance().StartStation();
-        OnDownLongPress();
+    RouteInput(RF_INPUT_BOOT, RF_INPUT_LONG_PRESS);
+}
+
+void Application::RouteInput(uint8_t button, uint8_t gesture) {
+    rf_input_inputs_t in = {};
+    in.button = button;
+    in.gesture = gesture;
+    in.notify_active = notify_is_active() ? 1 : 0;
+    in.canvas_displaying = page_sync_is_displaying() ? 1 : 0;
+    in.on_settings = (rawdraw_ui_manager_ &&
+                      rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::Settings)
+                         ? 1
+                         : 0;
+    in.previous_is_settings =
+        (rawdraw_ui_manager_ &&
+         rawdraw_ui_manager_->GetPreviousPage() == ui::RawDrawPageId::Settings)
+            ? 1
+            : 0;
+    in.config_mode = WifiManager::GetInstance().IsConfigMode() ? 1 : 0;
+    in.provisioning = (GetLifecycleState() == kLifecycleApProvision) ? 1 : 0;
+
+    rf_input_decision_t d = {};
+    rf_input_decide(&in, &d);
+
+    // Side effects that belong to "the user pressed something" rather than to
+    // whoever owns the screen. A long press counts as activity (it repaints and
+    // restarts the idle clock); a click only flashes the LED — and the old
+    // handlers skipped that flash when UP/DOWN was answering a popup, while
+    // BOOT flashed either way.
+    if (gesture == RF_INPUT_LONG_PRESS || gesture == RF_INPUT_COMBO_LONG_PRESS) {
+        NoteButtonActivity();
+    } else if (button == RF_INPUT_BOOT || d.action != RF_INPUT_ACTION_NOTIFY_ACK) {
+        Board::GetInstance().FlashActivityLed();
+    }
+
+    switch (d.action) {
+        case RF_INPUT_ACTION_IGNORE:
+            return;
+
+        case RF_INPUT_ACTION_UI_INPUT: {
+            if (rawdraw_ui_manager_ == nullptr) {
+                return;
+            }
+            rawdraw::ButtonEvent::Type type = rawdraw::ButtonEvent::kUpClick;
+            switch (button) {
+                case RF_INPUT_UP:
+                    type = (gesture == RF_INPUT_DOUBLE_CLICK)
+                               ? rawdraw::ButtonEvent::kUpDoubleClick
+                               : rawdraw::ButtonEvent::kUpClick;
+                    break;
+                case RF_INPUT_DOWN:
+                    type = rawdraw::ButtonEvent::kDownClick;
+                    break;
+                default:
+                    type = (gesture == RF_INPUT_LONG_PRESS)
+                               ? rawdraw::ButtonEvent::kBootLongPress
+                               : rawdraw::ButtonEvent::kBootClick;
+                    break;
+            }
+            rawdraw_ui_manager_->HandleInput(rawdraw::ButtonEvent{type});
+            return;
+        }
+
+        case RF_INPUT_ACTION_NOTIFY_ACK:
+            notify_post_ack(d.agree ? "agree" : "reject");
+            return;
+
+        case RF_INPUT_ACTION_NOTIFY_DISMISS:
+            notify_dismiss();
+            return;
+
+        case RF_INPUT_ACTION_NOTIFY_FETCH_NEXT:
+            notify_request_next();
+            return;
+
+        case RF_INPUT_ACTION_CANVAS_PREV:
+            page_sync_prev();
+            return;
+
+        case RF_INPUT_ACTION_CANVAS_NEXT:
+            page_sync_next();
+            return;
+
+        case RF_INPUT_ACTION_ENTER_SETTINGS:
+            EnterSettingsFromInput(d.enter_settings != 0, d.drop_orphan_notification != 0);
+            return;
+
+        case RF_INPUT_ACTION_LEAVE_SETTINGS:
+            if (d.switch_to_previous != 0 && rawdraw_ui_manager_ != nullptr) {
+                ESP_LOGI(kTag, "input: leaving settings");
+                rawdraw_ui_manager_->SwitchPage(rawdraw_ui_manager_->GetPreviousPage());
+            }
+            // Leaving Settings hands the panel back to the canvas, which was
+            // suspended when Settings was entered.
+            page_sync_allow_display();
+            return;
+
+        case RF_INPUT_ACTION_ENTER_WIFI_CONFIG:
+            EnterWifiConfigMode();
+            return;
+
+        case RF_INPUT_ACTION_EXIT_WIFI_CONFIG:
+            WifiManager::GetInstance().StartStation();
+            EnterSettingsFromInput(d.enter_settings != 0, d.drop_orphan_notification != 0);
+            return;
+
+        case RF_INPUT_ACTION_STOP_CANVAS:
+            page_sync_stop_display();
+            EnterSettingsFromInput(d.enter_settings != 0, d.drop_orphan_notification != 0);
+            return;
+
+        default:
+            ESP_LOGW(kTag, "input: unknown action %u", (unsigned)d.action);
+            return;
+    }
+}
+
+void Application::EnterSettingsFromInput(bool enter, bool drop_orphan) {
+    if (!enter) {
+        // Provisioning: the panel was handed back above, and the provisioning
+        // page needs the user where they are.
+        ESP_LOGI(kTag, "input: settings entry skipped (provisioning)");
         return;
     }
-    // 画板显示时 BOOT 长按退出画板：复用 OnDownLongPress（含弹窗作废）
-    if (page_sync_is_displaying()) {
-        page_sync_stop_display();
-        OnDownLongPress();
-        return;
+    if (drop_orphan) {
+        // Quiet, not notify_dismiss(): the loud one paints the canvas back onto
+        // the panel and then fights the SwitchPage below for it.
+        notify_dismiss_quiet();
     }
-    if (rawdraw_ui_manager_) {
-        rawdraw_ui_manager_->HandleInput(rawdraw::ButtonEvent{rawdraw::ButtonEvent::kBootLongPress});
+    if (rawdraw_ui_manager_ != nullptr) {
+        ESP_LOGI(kTag, "input: entering settings");
+        rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Settings);
     }
 }
 
