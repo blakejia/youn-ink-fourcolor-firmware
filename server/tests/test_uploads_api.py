@@ -7,7 +7,10 @@ page alone.
 """
 from __future__ import annotations
 
+import hashlib
 import io
+import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -154,6 +157,37 @@ def test_two_uploads_to_one_page_do_not_create_a_second_page(client):
                         data={"page": "test-upload-twice"})
         assert r.status_code == 200
     assert len(pages_mod.list_pages()) == n0
+
+
+def test_replacing_a_page_twice_in_one_second_points_schedule_at_newest(client, monkeypatch):
+    # A double-click on upload (or create then re-save) can land two renders
+    # in the same wall-clock second. rendered_at has one-second resolution,
+    # so the schedule tie-break falls through to md5 order and can point the
+    # device at the superseded bitmap — unless a page belongs to exactly one
+    # bitmap.
+    name = "test-upload-samesec"
+    _make_page(name)
+    frame_a = bytes(i % 256 for i in range(30000))
+    frame_b = frame_a[:-1] + bytes([(frame_a[-1] + 1) % 256])
+    # Label so the FIRST write has the larger md5: without the fix the tie
+    # resolves to it and the schedule points at the stale bitmap.
+    first, second = sorted(
+        [frame_a, frame_b],
+        key=lambda b: hashlib.md5(b).hexdigest(), reverse=True)
+    md5_first = hashlib.md5(first).hexdigest()
+    md5_second = hashlib.md5(second).hexdigest()
+    assert md5_first != md5_second
+
+    frozen = int(time.time()) + 60
+    with monkeypatch.context() as m:
+        m.setattr(pages_mod.time, "time", lambda: frozen)
+        pages_mod.upsert_page(name, _canvas(), 10, 3, first)
+        pages_mod.upsert_page(name, _canvas(), 10, 3, second)
+
+    assert _schedule_md5_of(client, name) == md5_second
+    stale_meta = pages_mod._bitmap_meta_path(md5_first)
+    if stale_meta.exists():
+        assert name not in json.loads(stale_meta.read_text()).get("sources", [])
 
 
 def test_bytes_that_are_not_an_image_leave_the_page_alone(client):

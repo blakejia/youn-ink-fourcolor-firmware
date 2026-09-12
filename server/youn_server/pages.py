@@ -167,6 +167,14 @@ def upsert_page(
             "rendered_at": int(time.time()),
             "refcount": 0,
         }))
+    # A page belongs to exactly one bitmap: drop the name from every other
+    # bitmap meta before recording the new reference. Without this, a page
+    # replaced twice within one rendered_at second leaves two bitmaps
+    # claiming it, and the schedule tie-break (max rendered_at, then md5)
+    # can point the device at the superseded bitmap.
+    for meta in _all_bitmap_metas():
+        if meta.get("md5") != md5 and name in meta.get("sources", []):
+            _drop_source_reference(meta["md5"], source_name=name)
     _record_source_reference(md5, source_name=name)
     log.info("page upserted name=%s md5=%s duration=%dmin order=%d",
              name, md5, duration_minutes, order)
