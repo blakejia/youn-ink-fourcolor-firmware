@@ -228,7 +228,7 @@ def test_upload_to_an_unknown_page_lists_the_pages_you_could_have_meant(client):
                     files={"image": ("a.png", _png(), "image/png")},
                     data={"page": "no-such-page"})
     assert r.status_code == 400
-    assert "test-upload-known" in r.json()["pages"]
+    assert "test-upload-known" in r.json()["detail"]["pages"]
 
 
 def test_upload_replaces_the_picture_but_not_the_page_identity(client):
@@ -301,6 +301,11 @@ Expected: FAIL —— `/api/uploads` 返回 404（端点不存在）。
             raise ValueError(f"invalid upload id: {upload_id!r}")
         return (settings.uploads_dir / f"{upload_id}.png",
                 settings.uploads_dir / f"{upload_id}.src.png")
+
+    # Constants are local: Task 3 deletes image_conv.py, which the scalar
+    # aliases in this file's neighbours came from.
+    PANEL_WIDTH = 400
+    PANEL_HEIGHT = 300
 
     def _normalize_upload(data: bytes) -> bytes:
         """Fit the picture inside the panel, letterboxed on white.
@@ -376,12 +381,7 @@ Expected: FAIL —— `/api/uploads` 返回 404（端点不存在）。
         return {"page": page, **entry.to_dict()}
 ```
 
-补齐该文件顶部缺失的导入：`import io`、`import re`、`import secrets`、`from pathlib import Path`、`from PIL import Image`、`from youn_server.canvas_render import render_canvas_to_bitmap, RenderError`，并定义面板尺寸常量：
-
-```python
-PANEL_WIDTH = 400
-PANEL_HEIGHT = 300
-```
+补齐该文件顶部缺失的导入：`import io`、`import re`、`import secrets`、`from pathlib import Path`、`from PIL import Image`、`from youn_server.canvas_render import render_canvas_to_bitmap, RenderError`。
 
 （`File`/`Form`/`UploadFile`/`HTTPException`/`pages_mod`/`settings`/`log` 在该文件已存在，按现状复用。）
 
