@@ -1054,7 +1054,7 @@ mod tests {
         format!("{tag:02x}").repeat(16)
     }
 
-    fn schedule_json(entries: &[(u8, u32)]) -> Vec<u8> {
+    fn schedule_json_with_md5(sched_tag: u8, entries: &[(u8, u32)]) -> Vec<u8> {
         let pages: Vec<String> = entries
             .iter()
             .map(|(tag, min)| {
@@ -1063,10 +1063,14 @@ mod tests {
             .collect();
         format!(
             r#"{{"schedule_md5":"{}","pages":[{}]}}"#,
-            md5hex(0x11),
+            md5hex(sched_tag),
             pages.join(",")
         )
         .into_bytes()
+    }
+
+    fn schedule_json(entries: &[(u8, u32)]) -> Vec<u8> {
+        schedule_json_with_md5(0x11, entries)
     }
 
     /// A bitmap body whose every byte is `fill`, so the framebuffer shows which
@@ -1277,6 +1281,34 @@ mod tests {
             1,
             "the second poll hit only the schedule endpoint"
         );
+    }
+
+    #[test]
+    fn a_changed_schedule_carries_over_the_kept_pages_bitmap() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        // First schedule: two pages, both painted so both bitmaps are resident.
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10), (0xb2, 5)]));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), &bitmap_body(0xb2));
+        assert!(sync_once());
+        assert!(paint_if_changed(), "page 0 paints and becomes resident");
+        next(); // manual step paints page 1, so its bitmap is resident too
+        let (page0_before, page1_before) = with_table(|t| (t.pages[0].bitmap, t.pages[1].bitmap));
+        assert!(!page0_before.is_null() && !page1_before.is_null(), "both bitmaps resident before the re-sync");
+        assert_ne!(page0_before, page1_before);
+        let gets_before = shim::host::calls_matching("http_get").len();
+        // Second schedule: a DIFFERENT schedule_md5 (0x22, so the unchanged
+        // fast path cannot fire) keeping page 0 and replacing page 1.
+        shim::host::script_ok("/api/pages/schedule", &schedule_json_with_md5(0x22, &[(0xa1, 10), (0xc3, 5)]));
+        assert!(sync_once());
+        let (page0_after, page1_after) = with_table(|t| (t.pages[0].bitmap, t.pages[1].bitmap));
+        assert_eq!(page0_after, page0_before, "the kept page's bitmap moved into the new table, not re-downloaded");
+        assert!(page1_after.is_null(), "the dropped page's slot is null, not a stale pointer");
+        let fresh = &shim::host::calls_matching("http_get")[gets_before..];
+        assert_eq!(fresh.len(), 1, "the second sync hit only the schedule endpoint");
+        assert!(fresh.iter().all(|c| !c.contains(&md5hex(0xa1))), "no new GET for the carried-over page");
     }
 
     #[test]

@@ -27,7 +27,7 @@ void page_sync_set_display(void* display);
  *  Idempotent. */
 void page_sync_start(void);
 
-/** One sync: fetch the schedule, apply it, download missing bitmaps.
+/** One sync: fetch the schedule and apply it; the page being painted is fetched by the paint path.
  *  Returns true on success. */
 bool page_sync_sync_once(void);
 
