@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 
 import pytest
+from PIL import Image
 
 from youn_server.canvas_render import (
     RenderError, render_canvas_to_bitmap, _PILLOW_BG,
@@ -138,3 +139,44 @@ def test_palette_colors_exist():
     assert PALETTE_BWRY[IDX_WHITE] == (255, 255, 255)
     assert PALETTE_BWRY[IDX_YELLOW] == (255, 215, 0)
     assert PALETTE_BWRY[IDX_RED] == (220, 30, 30)
+
+
+def _write_upload(upload_id: str) -> None:
+    """A 400x300 solid-red PNG sits in the uploads dir."""
+    from youn_server.config import settings
+    img = Image.new("RGB", (400, 300), (220, 30, 30))
+    settings.uploads_dir.mkdir(parents=True, exist_ok=True)
+    img.save(settings.uploads_dir / f"{upload_id}.png", format="PNG")
+
+
+def test_uploads_scheme_renders_the_stored_image():
+    from youn_server.config import settings
+    up_id = "a" * 32
+    _write_upload(up_id)
+    canvas = {"default": [{"type": "div", "props": {
+        "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
+        "children": [{"type": "img", "props": {"src": f"uploads://{up_id}"}}]}}]}
+    bitmap = render_canvas_to_bitmap(canvas)
+    assert len(bitmap) == 30000
+
+    blank = {"default": [{"type": "div", "props": {
+        "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
+        "children": []}}]}
+    # A red picture must differ from an empty white canvas.
+    assert bitmap != render_canvas_to_bitmap(blank)
+
+
+def test_uploads_scheme_rejects_an_id_that_could_escape_the_directory():
+    canvas = {"default": [{"type": "div", "props": {
+        "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
+        "children": [{"type": "img", "props": {"src": "uploads://../../etc/passwd"}}]}}]}
+    # _render_img logs and skips an image it cannot load; the page still renders.
+    bitmap = render_canvas_to_bitmap(canvas)
+    assert len(bitmap) == 30000
+
+
+def test_uploads_scheme_skips_a_missing_file():
+    canvas = {"default": [{"type": "div", "props": {
+        "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
+        "children": [{"type": "img", "props": {"src": "uploads://" + "b" * 32}}]}}]}
+    assert len(render_canvas_to_bitmap(canvas)) == 30000

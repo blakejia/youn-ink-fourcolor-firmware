@@ -40,12 +40,14 @@ def _device_signature_key():
 
 @pytest.fixture(autouse=True)
 def isolate_pages_dir():
-    """Isolate pages/ storage to a per-test temp dir."""
+    """Isolate pages/ and uploads/ storage to per-test temp dirs."""
     tmp = tempfile.mkdtemp(prefix="pages_test_")
-    orig = settings.data_dir
+    orig_data, orig_uploads = settings.data_dir, settings.uploads_dir
     settings.data_dir = Path(tmp)
-    # Ensure pages subdir exists for _all_page_sources glob
+    settings.uploads_dir = Path(tmp) / "uploads"
     (Path(tmp) / "pages").mkdir(parents=True, exist_ok=True)
+    settings.uploads_dir.mkdir(parents=True, exist_ok=True)
     yield
-    settings.data_dir = orig
+    settings.data_dir = orig_data
+    settings.uploads_dir = orig_uploads
     shutil.rmtree(tmp, ignore_errors=True)

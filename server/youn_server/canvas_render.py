@@ -44,6 +44,7 @@ from typing import Any, Optional
 import httpx
 from PIL import Image, ImageDraw, ImageFont
 
+from .config import settings
 from .image_conv import (
     PALETTE_BWRY, IDX_BLACK, IDX_WHITE, IDX_YELLOW, IDX_RED,
     SCREEN_W, SCREEN_H, pack_2bpp, _floyd_steinberg_palette,
@@ -542,6 +543,14 @@ class _CanvasRenderer:
             r = self._http.get(src)
             r.raise_for_status()
             img = Image.open(io.BytesIO(r.content))
+        elif src.startswith("uploads://"):
+            ident = src[len("uploads://"):]
+            if not re.fullmatch(r"[0-9a-f]{32}", ident):
+                raise RenderError("src", f"invalid upload id: {ident[:40]}")
+            path = settings.uploads_dir / f"{ident}.png"
+            if not path.exists():
+                raise RenderError("src", f"upload not found: {ident}")
+            img = Image.open(path)
         else:
             raise RenderError("src", f"unsupported scheme: {src[:16]}")
         img.load()
