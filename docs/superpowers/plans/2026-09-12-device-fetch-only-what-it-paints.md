@@ -147,7 +147,7 @@
         let rec = read_panel_record();
         assert_ne!(
             &rec.0[8..40],
-            &md5hex(0xa1)[..],
+            md5hex(0xa1).as_bytes(),
             "a failed fetch must not be recorded as displayed"
         );
 
@@ -155,7 +155,7 @@
         sync_once();
         assert!(paint_if_changed(), "the retry paints once the bitmap arrives");
         let rec = read_panel_record();
-        assert_eq!(&rec.0[8..40], &md5hex(0xa1)[..], "and only then is it recorded");
+        assert_eq!(&rec.0[8..40], md5hex(0xa1).as_bytes(), "and only then is it recorded");
     }
 ```
 
