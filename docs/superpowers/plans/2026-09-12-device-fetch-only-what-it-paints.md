@@ -93,6 +93,37 @@
     }
 ```
 
+再把 `unchanged_schedule_is_not_re_downloaded`（约 1228 行）换成有意义的版本——改后 sync 不再取图，原用例里的 `before` 与被比的值**都会是 null**，断言退化为空转：
+
+```rust
+    fn an_unchanged_schedule_does_not_re_fetch_the_painted_page() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        sync_once();
+        assert!(paint_if_changed(), "the paint path fetched the page");
+
+        // Only now is there something cached to preserve, so this pair of
+        // assertions means what it says.
+        let before = with_table(|t| t.pages[0].bitmap);
+        assert!(!before.is_null(), "the painted page's bitmap is in RAM");
+        let gets_before = shim::host::calls_matching("http_get").len();
+        sync_once();
+
+        assert_eq!(
+            with_table(|t| t.pages[0].bitmap),
+            before,
+            "the cached bitmap is kept, not re-fetched"
+        );
+        assert_eq!(
+            shim::host::calls_matching("http_get").len() - gets_before,
+            1,
+            "the second poll hit only the schedule endpoint"
+        );
+    }
+```
+
 并把 `a_missing_bitmap_keeps_the_schedule_uncommitted_for_a_retry`（约 1252 行）替换为：
 
 ```rust
@@ -191,7 +222,9 @@ Expected: FAIL — `sync_records_the_pages_but_downloads_nothing` 断言 `1` 却
     true
 ```
 
-删除不再使用的 `downloaded` 变量与 `all_ready` 绑定（`all_ready` 若还被别处引用，一并在本步清理，并记在报告里）。
+同时删掉不再使用的 `downloaded` 变量与 `all_ready` 绑定（grep 已确认它们只出现在本函数与日志里：`:411/:435/:442/:451/:460-463`），并把快路径上方那句会变陈旧的注释（`:393` 附近，"…even when nothing is re-downloaded"）改写成新契约下的真实含义：热路径仍更新 `server_index`/`next_wake_s`/`override_index`，位图改由绘制路径按需取。
+
+另外两个 setup 夹具（`setup_one_page` 约 1109 行、`setup_two_pages` 约 1114 行）现在会真的取图，改后由 `paint_if_changed()` 取。**全量跑完后**，本文件里凡是失败**或变成空转**的用例逐个适配，并把改了什么写进报告（已知要动的就是上面三条；setup 夹具若需调整也算在内）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
