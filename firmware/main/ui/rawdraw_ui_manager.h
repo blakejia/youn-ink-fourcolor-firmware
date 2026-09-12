@@ -225,9 +225,6 @@ public:
     void HideChatStatus();
     void SetChatListening(bool listening);
     void SetChatBottomStatus(const std::string& status);
-    void SetSettingsItems(const std::vector<rawdraw::SettingsItemDef>& items);
-    void UpdateSettingsItem(int index, const std::string& value);
-    void UpdateSettingsChecked(int index, bool checked);
     void SetRawDrawTheme(rawdraw::ThemeId theme_id);
     rawdraw::ThemeId GetRawDrawTheme() const;
     void UpdateWifiStatus(const rawdraw::WifiStatus& status);

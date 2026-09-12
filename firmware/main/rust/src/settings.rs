@@ -1,0 +1,540 @@
+//! The Settings menu: what it holds and where the cursor is.
+//!
+//! The page is a renderer, and renderers stay in C++ — fonts, framebuffer,
+//! theme, the 关于 info panel and the values read off the device (SSID, IP,
+//! RSSI, reachability) are all mechanism. What is policy is the shape of the
+//! menu and the rules that move a cursor around it, and that is what lives
+//! here: two levels, three sections, and a cursor that never comes to rest on
+//! a row that cannot be acted on.
+//!
+//! That last rule is not decoration. A row the user can select but not confirm
+//! is how the reported bug felt from the outside — a confirm that went nowhere.
+
+/// `rf_settings_kind_t` in `rust/include/settings.h`. Keep in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// BOOT runs it.
+    Action,
+    /// BOOT flips it.
+    Toggle,
+    /// Read-out. Shown, never selected, never confirmed.
+    Info,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Item {
+    pub id: u8,
+    pub label: &'static core::ffi::CStr,
+    pub kind: Kind,
+}
+
+pub struct Section {
+    pub label: &'static core::ffi::CStr,
+    pub items: &'static [Item],
+}
+
+// ── Item ids. The C++ switches on these to fill a value or run an effect, so
+// ── they are the whole contract; `every_item_id_is_distinct` holds it.
+
+pub const ITEM_RESTART: u8 = 0;
+pub const ITEM_RESET_NETWORK: u8 = 1;
+pub const ITEM_SLEEP: u8 = 2;
+pub const ITEM_WIFI_TOGGLE: u8 = 3;
+pub const ITEM_WIFI_STATE: u8 = 4;
+pub const ITEM_WIFI_IP: u8 = 5;
+pub const ITEM_WIFI_SIGNAL: u8 = 6;
+pub const ITEM_SERVER: u8 = 7;
+
+use Item as I;
+
+const SYSTEM_ITEMS: &[Item] = &[
+    I { id: ITEM_RESTART, label: c"重启", kind: Kind::Action },
+    I { id: ITEM_RESET_NETWORK, label: c"重置网络", kind: Kind::Action },
+    I { id: ITEM_SLEEP, label: c"省电模式", kind: Kind::Action },
+];
+
+const NETWORK_ITEMS: &[Item] = &[
+    I { id: ITEM_WIFI_TOGGLE, label: c"Wi-Fi", kind: Kind::Toggle },
+    I { id: ITEM_WIFI_STATE, label: c"连接状态", kind: Kind::Info },
+    I { id: ITEM_WIFI_IP, label: c"IP 地址", kind: Kind::Info },
+    I { id: ITEM_WIFI_SIGNAL, label: c"信号强度", kind: Kind::Info },
+    I { id: ITEM_SERVER, label: c"服务端", kind: Kind::Info },
+];
+
+/// 关于 draws its own info panel; it holds no options, so BOOT does nothing
+/// there — which is what "暂时不动" means in the UI.
+const ABOUT_ITEMS: &[Item] = &[];
+
+pub const SECTIONS: &[Section] = &[
+    Section { label: c"系统", items: SYSTEM_ITEMS },
+    Section { label: c"网络", items: NETWORK_ITEMS },
+    Section { label: c"关于", items: ABOUT_ITEMS },
+];
+
+pub const FOCUS_NAV: u8 = 0;
+pub const FOCUS_OPTIONS: u8 = 1;
+
+/// Which pane the cursor is in. Landing in the nav is what makes "press BOOT to
+/// enter the second level" the obvious first move after arriving at the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Nav,
+    Options,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cursor {
+    pub section: u8,
+    pub focus: Focus,
+    pub option: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    None,
+    Activate(u8),
+    Toggle(u8),
+}
+
+/// The button that was clicked. Long presses and the combo are routed elsewhere
+/// (leaving the page, entering the config AP) and never reach the menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Button {
+    Up,
+    Down,
+    Boot,
+}
+
+impl Cursor {
+    /// Where the page starts: the nav, on the first section.
+    pub fn start() -> Cursor {
+        Cursor { section: 0, focus: Focus::Nav, option: 0 }
+    }
+}
+
+fn section(index: u8) -> &'static Section {
+    &SECTIONS[index as usize % SECTIONS.len()]
+}
+
+/// The first item in `s` the cursor may rest on, if any.
+fn first_selectable(s: &Section) -> Option<u8> {
+    s.items.iter().position(|i| i.kind != Kind::Info).map(|p| p as u8)
+}
+
+fn next_selectable(s: &Section, from: u8) -> Option<u8> {
+    let start = from as usize + 1;
+    s.items[start.min(s.items.len())..]
+        .iter()
+        .position(|i| i.kind != Kind::Info)
+        .map(|p| (start + p) as u8)
+}
+
+fn prev_selectable(s: &Section, from: u8) -> Option<u8> {
+    s.items[..(from as usize).min(s.items.len())]
+        .iter()
+        .rposition(|i| i.kind != Kind::Info)
+        .map(|p| p as u8)
+}
+
+/// One click. Pure: the C++ performs the effect and hands the cursor back next
+/// time.
+pub fn step(c: Cursor, b: Button) -> (Cursor, Effect) {
+    let last_section = SECTIONS.len() as u8 - 1;
+    let index = if c.section <= last_section { c.section } else { 0 };
+    let s = &SECTIONS[index as usize];
+    let mut out = Cursor { section: index, focus: c.focus, option: c.option };
+
+    match (c.focus, b) {
+        (Focus::Nav, Button::Up) => {
+            out.section = index.saturating_sub(1);
+            (out, Effect::None)
+        }
+        (Focus::Nav, Button::Down) => {
+            out.section = (index + 1).min(last_section);
+            (out, Effect::None)
+        }
+        (Focus::Nav, Button::Boot) => {
+            // Entering a section runs nothing by itself; a section with no
+            // options (关于) stays in the nav, which is what "not touched" means.
+            if let Some(option) = first_selectable(s) {
+                out.focus = Focus::Options;
+                out.option = option;
+            }
+            (out, Effect::None)
+        }
+        (Focus::Options, Button::Up) => match prev_selectable(s, c.option) {
+            Some(option) => {
+                out.option = option;
+                (out, Effect::None)
+            }
+            // Nothing above the first option: that is the way back out.
+            None => {
+                out.focus = Focus::Nav;
+                (out, Effect::None)
+            }
+        },
+        (Focus::Options, Button::Down) => {
+            if let Some(option) = next_selectable(s, c.option) {
+                out.option = option;
+            }
+            (out, Effect::None)
+        }
+        (Focus::Options, Button::Boot) => match s.items.get(c.option as usize) {
+            Some(item) => match item.kind {
+                Kind::Action => (out, Effect::Activate(item.id)),
+                Kind::Toggle => (out, Effect::Toggle(item.id)),
+                // Info rows are read-outs; the cursor is not supposed to rest
+                // on one, and a confirm there does nothing rather than pretend.
+                Kind::Info => (out, Effect::None),
+            },
+            None => (out, Effect::None),
+        },
+    }
+}
+
+// ─────────────────────────── C boundary ───────────────────────────
+
+/// `rf_settings_kind_t`. Keep in step.
+pub const RF_SETTINGS_KIND_ACTION: u8 = 0;
+pub const RF_SETTINGS_KIND_TOGGLE: u8 = 1;
+pub const RF_SETTINGS_KIND_INFO: u8 = 2;
+
+/// `rf_settings_focus_t`.
+pub const RF_SETTINGS_FOCUS_NAV: u8 = 0;
+pub const RF_SETTINGS_FOCUS_OPTIONS: u8 = 1;
+
+/// `rf_settings_effect_t`.
+pub const RF_SETTINGS_EFFECT_NONE: u8 = 0;
+pub const RF_SETTINGS_EFFECT_ACTIVATE: u8 = 1;
+pub const RF_SETTINGS_EFFECT_TOGGLE: u8 = 2;
+
+#[repr(C)]
+pub struct CSection {
+    pub label: *const core::ffi::c_char,
+    pub item_count: u8,
+    pub _pad: [u8; 7],
+}
+
+#[repr(C)]
+pub struct CItem {
+    pub id: u8,
+    pub kind: u8,
+    pub _pad: [u8; 6],
+    pub label: *const core::ffi::c_char,
+}
+
+#[repr(C)]
+pub struct CStep {
+    pub section: u8,
+    pub focus: u8,
+    pub option: u8,
+    pub effect: u8,
+    pub effect_item: u8,
+    pub _pad: [u8; 3],
+}
+
+fn kind_code(k: Kind) -> u8 {
+    match k {
+        Kind::Action => RF_SETTINGS_KIND_ACTION,
+        Kind::Toggle => RF_SETTINGS_KIND_TOGGLE,
+        Kind::Info => RF_SETTINGS_KIND_INFO,
+    }
+}
+
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rf_settings_section_count() -> u8 {
+    SECTIONS.len() as u8
+}
+
+/// # Safety
+/// `out` must point to a valid, correctly aligned struct.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rf_settings_get_section(index: u8, out: *mut CSection) {
+    let d = unsafe { &mut *out };
+    match SECTIONS.get(index as usize) {
+        Some(s) => {
+            d.label = s.label.as_ptr();
+            d.item_count = s.items.len() as u8;
+        }
+        None => {
+            d.label = core::ptr::null();
+            d.item_count = 0;
+        }
+    }
+}
+
+/// # Safety
+/// `out` must point to a valid, correctly aligned struct.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rf_settings_get_item(section: u8, index: u8, out: *mut CItem) {
+    let d = unsafe { &mut *out };
+    match SECTIONS
+        .get(section as usize)
+        .and_then(|s| s.items.get(index as usize))
+    {
+        Some(i) => {
+            d.id = i.id;
+            d.kind = kind_code(i.kind);
+            d.label = i.label.as_ptr();
+        }
+        None => {
+            d.id = 0xFF;
+            d.kind = 0xFF;
+            d.label = core::ptr::null();
+        }
+    }
+}
+
+/// # Safety
+/// `out` must point to a valid, correctly aligned struct.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rf_settings_step(
+    section: u8, focus: u8, option: u8, button: u8, out: *mut CStep,
+) {
+    let focus = if focus == RF_SETTINGS_FOCUS_OPTIONS {
+        Focus::Options
+    } else {
+        Focus::Nav
+    };
+    // Numbering is `rf_input_button_t` (input.h): 0 up, 1 down, 2 boot.
+    let button = match button {
+        0 => Button::Up,
+        1 => Button::Down,
+        _ => Button::Boot,
+    };
+    let (c, e) = step(Cursor { section, focus, option }, button);
+    let d = unsafe { &mut *out };
+    d.section = c.section;
+    d.focus = if c.focus == Focus::Options {
+        RF_SETTINGS_FOCUS_OPTIONS
+    } else {
+        RF_SETTINGS_FOCUS_NAV
+    };
+    d.option = c.option;
+    match e {
+        Effect::None => {
+            d.effect = RF_SETTINGS_EFFECT_NONE;
+            d.effect_item = 0;
+        }
+        Effect::Activate(id) => {
+            d.effect = RF_SETTINGS_EFFECT_ACTIVATE;
+            d.effect_item = id;
+        }
+        Effect::Toggle(id) => {
+            d.effect = RF_SETTINGS_EFFECT_TOGGLE;
+            d.effect_item = id;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nav(section: u8) -> Cursor {
+        Cursor { section, focus: Focus::Nav, option: 0 }
+    }
+
+    fn opts(section: u8, option: u8) -> Cursor {
+        Cursor { section, focus: Focus::Options, option }
+    }
+
+    // ── structure ───────────────────────────────────────────────────────
+
+    #[test]
+    fn the_menu_is_system_network_about_in_that_order() {
+        let labels: Vec<String> = SECTIONS.iter().map(|s| s.label.to_str().unwrap().to_string()).collect();
+        assert_eq!(labels, vec!["系统", "网络", "关于"]);
+    }
+
+    #[test]
+    fn system_holds_restart_and_reset_network() {
+        let labels: Vec<String> = SYSTEM_ITEMS.iter().map(|i| i.label.to_str().unwrap().to_string()).collect();
+        assert_eq!(&labels[..2], &["重启", "重置网络"]);
+        assert!(SYSTEM_ITEMS[0..2].iter().all(|i| i.kind == Kind::Action));
+    }
+
+    #[test]
+    fn network_shows_the_wifi_switch_and_the_current_network_status() {
+        let labels: Vec<String> = NETWORK_ITEMS.iter().map(|i| i.label.to_str().unwrap().to_string()).collect();
+        assert_eq!(labels, vec!["Wi-Fi", "连接状态", "IP 地址", "信号强度", "服务端"]);
+        assert_eq!(NETWORK_ITEMS[0].kind, Kind::Toggle);
+        assert!(NETWORK_ITEMS[1..].iter().all(|i| i.kind == Kind::Info));
+    }
+
+    #[test]
+    fn about_has_no_options_of_its_own() {
+        assert!(ABOUT_ITEMS.is_empty());
+    }
+
+    #[test]
+    fn every_item_id_is_distinct() {
+        let mut ids: Vec<u8> = SECTIONS
+            .iter()
+            .flat_map(|s| s.items.iter().map(|i| i.id))
+            .collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "the C++ switches on these ids");
+    }
+
+    // ── nav pane ────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_page_starts_in_the_nav_on_the_first_section() {
+        let c = Cursor::start();
+        assert_eq!(c.focus, Focus::Nav);
+        assert_eq!(c.section, 0);
+    }
+
+    #[test]
+    fn up_and_down_move_between_sections() {
+        let (c, e) = step(nav(0), Button::Down);
+        assert_eq!((c.section, c.focus), (1, Focus::Nav));
+        assert_eq!(e, Effect::None);
+        let (c, _) = step(nav(1), Button::Up);
+        assert_eq!(c.section, 0);
+    }
+
+    #[test]
+    fn the_nav_clamps_at_the_ends() {
+        assert_eq!(step(nav(0), Button::Up).0.section, 0);
+        let last = (SECTIONS.len() - 1) as u8;
+        assert_eq!(step(nav(last), Button::Down).0.section, last);
+    }
+
+    #[test]
+    fn boot_in_the_nav_enters_the_sections_first_option() {
+        let (c, e) = step(nav(0), Button::Boot);
+        assert_eq!((c.focus, c.option), (Focus::Options, 0));
+        assert_eq!(e, Effect::None, "entering a section does not run anything");
+    }
+
+    #[test]
+    fn boot_in_the_nav_of_about_stays_in_the_nav() {
+        let about = (SECTIONS.len() - 1) as u8;
+        let (c, e) = step(nav(about), Button::Boot);
+        assert_eq!(c.focus, Focus::Nav);
+        assert_eq!(e, Effect::None);
+    }
+
+    // ── options pane ────────────────────────────────────────────────────
+
+    #[test]
+    fn up_at_the_first_option_returns_to_the_nav() {
+        let (c, e) = step(opts(0, 0), Button::Up);
+        assert_eq!(c.focus, Focus::Nav);
+        assert_eq!(e, Effect::None);
+    }
+
+    #[test]
+    fn down_moves_between_options_and_clamps() {
+        let (c, _) = step(opts(0, 0), Button::Down);
+        assert_eq!(c.option, 1);
+        let (c, _) = step(opts(0, 1), Button::Up);
+        assert_eq!(c.option, 0);
+    }
+
+    #[test]
+    fn the_cursor_skips_info_rows_and_stops_at_the_last_option() {
+        // 网络: option 0 is the toggle, 1..4 are info read-outs.
+        let (c, _) = step(opts(1, 0), Button::Down);
+        assert_eq!(c.option, 0, "nothing after the toggle can be confirmed");
+        assert_eq!(first_selectable(&SECTIONS[1]), Some(0));
+        assert_eq!(next_selectable(&SECTIONS[1], 0), None);
+    }
+
+    #[test]
+    fn boot_on_an_action_activates_that_item() {
+        let (c, e) = step(opts(0, 1), Button::Boot);
+        assert_eq!(e, Effect::Activate(ITEM_RESET_NETWORK));
+        assert_eq!(c, opts(0, 1), "confirming does not move the cursor");
+    }
+
+    #[test]
+    fn boot_on_a_toggle_asks_for_a_toggle() {
+        let (_, e) = step(opts(1, 0), Button::Boot);
+        assert_eq!(e, Effect::Toggle(ITEM_WIFI_TOGGLE));
+    }
+
+    // ── the C side ──────────────────────────────────────────────────────
+
+    fn step_c(section: u8, focus: u8, option: u8, button: u8) -> CStep {
+        let mut d = CStep {
+            section: 255,
+            focus: 255,
+            option: 255,
+            effect: 255,
+            effect_item: 255,
+            _pad: [0; 3],
+        };
+        // SAFETY: `d` outlives the call.
+        unsafe { rf_settings_step(section, focus, option, button, &mut d) };
+        d
+    }
+
+    #[test]
+    fn the_button_codes_are_the_ones_the_input_router_sends() {
+        // rf_input_button_t: RF_INPUT_UP = 0, RF_INPUT_DOWN = 1, RF_INPUT_BOOT = 2.
+        assert_eq!(step_c(0, RF_SETTINGS_FOCUS_NAV, 0, 1).section, 1);
+        assert_eq!(step_c(1, RF_SETTINGS_FOCUS_NAV, 0, 0).section, 0);
+        assert_eq!(step_c(0, RF_SETTINGS_FOCUS_NAV, 0, 2).focus, RF_SETTINGS_FOCUS_OPTIONS);
+    }
+
+    #[test]
+    fn every_kind_the_c_side_switches_on_is_reachable() {
+        let mut seen = Vec::new();
+        for (si, s) in SECTIONS.iter().enumerate() {
+            for i in 0..s.items.len() as u8 {
+                let mut d = CItem { id: 0, kind: 0, _pad: [0; 6], label: core::ptr::null() };
+                // SAFETY: `d` outlives the call.
+                unsafe { rf_settings_get_item(si as u8, i, &mut d) };
+                seen.push((d.id, d.kind));
+                assert!(!d.label.is_null());
+                let label = unsafe { core::ffi::CStr::from_ptr(d.label) };
+                assert_eq!(label, s.items[i as usize].label);
+            }
+        }
+        assert!(seen.iter().any(|(_, k)| *k == RF_SETTINGS_KIND_ACTION));
+        assert!(seen.iter().any(|(_, k)| *k == RF_SETTINGS_KIND_TOGGLE));
+        assert!(seen.iter().any(|(_, k)| *k == RF_SETTINGS_KIND_INFO));
+    }
+
+    #[test]
+    fn the_labels_cross_as_c_strings_the_renderer_can_draw() {
+        assert_eq!(rf_settings_section_count() as usize, SECTIONS.len());
+        for (i, s) in SECTIONS.iter().enumerate() {
+            let mut d = CSection { label: core::ptr::null(), item_count: 255, _pad: [0; 7] };
+            // SAFETY: `d` outlives the call.
+            unsafe { rf_settings_get_section(i as u8, &mut d) };
+            let label = unsafe { core::ffi::CStr::from_ptr(d.label) };
+            assert_eq!(label, s.label);
+            assert_eq!(d.item_count as usize, s.items.len());
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_lookup_returns_nothing_instead_of_reading_past_the_table() {
+        let mut d = CSection { label: core::ptr::null(), item_count: 255, _pad: [0; 7] };
+        // SAFETY: `d` outlives the call.
+        unsafe { rf_settings_get_section(200, &mut d) };
+        assert!(d.label.is_null());
+        assert_eq!(d.item_count, 0);
+
+        let mut d = CItem { id: 0, kind: 0, _pad: [0; 6], label: core::ptr::null() };
+        // SAFETY: `d` outlives the call.
+        unsafe { rf_settings_get_item(200, 200, &mut d) };
+        assert!(d.label.is_null());
+    }
+
+    #[test]
+    fn a_section_with_only_info_rows_never_takes_the_cursor() {
+        // 网络's info rows sit after the toggle; asking for the option after it
+        // must not land on one.
+        let (c, _) = step(opts(1, 0), Button::Down);
+        assert_eq!(c.option, 0);
+        assert!(NETWORK_ITEMS[c.option as usize].kind != Kind::Info);
+    }
+}

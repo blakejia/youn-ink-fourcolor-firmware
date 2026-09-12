@@ -12,6 +12,8 @@
 #include "page_renderer.h"
 #include "rawdraw/style.h"
 #include "rawdraw/theme.h"
+#include "settings_menu.h"
+#include <map>
 #include <vector>
 #include <string>
 #include <functional>
@@ -59,12 +61,17 @@ public:
     void Render(uint8_t* fb, int width, int height) override;
     bool HandleInput(const ButtonEvent& event) override;
 
-    // Data interface
-    void SetItems(const std::vector<SettingsItemDef>& items);
-    void UpdateItem(int index, const std::string& value);
-    void UpdateChecked(int index, bool checked);
-    int GetItemCount() const { return static_cast<int>(items_.size()); }
-    int GetSelectedIndex() const { return selected_index_; }
+    // Data interface. The menu's shape and navigation come from
+    // `rust/src/settings.rs`; the C side supplies only what the device knows:
+    // a row's value, a toggle's state, and what to run when a row is confirmed.
+    void SetItemValue(uint8_t id, const std::string& value);
+    void SetItemChecked(uint8_t id, bool checked);
+    void SetItemHandler(std::function<void(uint8_t id, bool toggle)> handler) {
+        item_handler_ = std::move(handler);
+    }
+    /// Which section the cursor is on; the about panel is drawn when the
+    /// current section has no rows of its own.
+    uint8_t GetFocusedSection() const { return section_; }
 
     // Debug info
     void ShowDebugInfo();
@@ -178,13 +185,10 @@ public:
 
 private:
     // Layout computed from Style constants
-    int CalcItemHeight(const SettingsItemDef& item) const;
-    int CalcTotalContentHeight() const;
-    int GetFirstSelectableIndex() const;
-    int GetLastSelectableIndex() const;
-    int FindPrevSelectable(int index) const;
-    int FindNextSelectable(int index) const;
-    void EnsureSelectionVisible();
+    /// Ask the model what the current section holds and mirror it into
+    /// `items_`, so the drawing code below stays a pure function of that view.
+    void SyncItemsFromModel();
+    std::string ValueFor(uint8_t id) const;
     void DrawSelectedBackground(uint8_t* fb, int width, int x, int y, int w, int h) const;
 
     // Render a single settings item as a card row
@@ -214,10 +218,14 @@ private:
     void RenderOtaConfirmDialog(uint8_t* fb, int width, int height);  // OTA 确认弹窗
     void UpdateVolumeValue(int delta, bool commit);
 
+    /// The current section's rows, rebuilt from the model on every render.
     std::vector<SettingsItemDef> items_;
-    int selected_index_ = 0;
-    int scroll_offset_ = 0;  // preserved for compatibility/debug; item-window scrolling is primary
-    int first_visible_index_ = 0;
+    uint8_t section_ = 0;
+    uint8_t focus_ = 0;
+    uint8_t option_ = 0;
+    std::map<uint8_t, std::string> values_;
+    std::map<uint8_t, bool> checks_;
+    std::function<void(uint8_t, bool)> item_handler_;
 
     // Debug info state
     bool showing_debug_info_ = false;

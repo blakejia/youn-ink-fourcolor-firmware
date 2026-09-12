@@ -25,6 +25,7 @@ pub mod notify;
 pub mod page_sync;
 pub mod pairing;
 pub mod power;
+pub mod settings;
 pub mod shim;
 
 /// A panic aborts the whole firmware instead of unwinding into C++, which has

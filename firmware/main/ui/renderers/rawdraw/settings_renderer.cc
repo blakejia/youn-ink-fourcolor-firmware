@@ -18,6 +18,7 @@
  */
 
 #include "settings_renderer.h"
+#include "input.h"
 #include "rawdraw/layout_utils.h"
 #include "rawdraw/rawdraw.h"
 #include "rawdraw/style.h"
@@ -263,9 +264,7 @@ void DrawSettingsLayoutDebugOverlay(uint8_t* fb,
 }  // namespace
 
 SettingsRenderer::SettingsRenderer()
-    : selected_index_(0)
-    , scroll_offset_(0)
-    , font_(&SourceHanSansSC_Regular_slim)
+    : font_(&SourceHanSansSC_Regular_slim)
     , title_font_(&SourceHanSansSC_Medium_slim)
     , icon_font_(&fa_settings_16)
     , value_font_(&SourceHanSansSC_Regular_slim) {
@@ -277,8 +276,9 @@ void SettingsRenderer::Init(int width, int height) {
     width_ = width;
     height_ = height;
     needs_full_refresh_ = true;
-    scroll_offset_ = 0;
-    first_visible_index_ = 0;
+    section_ = 0;
+    focus_ = RF_SETTINGS_FOCUS_NAV;
+    option_ = 0;
     showing_debug_info_ = false;
     debug_hint_until_us_ = 0;
     ShowCategoryHint();
@@ -300,98 +300,12 @@ bool SettingsRenderer::IsCategoryHintVisible() const {
     return esp_timer_get_time() < category_hint_until_us_;
 }
 
-int SettingsRenderer::CalcItemHeight(const SettingsItemDef& item) const {
-    if (item.type == SettingsItemType::Section) {
-        return title_font_->line_height + Style::kSpacingSM * 2;
-    }
-    // Minimum height for comfortable touch targets
-    int h = font_->line_height + kItemPadding * 2;
-    if (h < kItemMinHeight) h = kItemMinHeight;
-    return h;
-}
 
-int SettingsRenderer::CalcTotalContentHeight() const {
-    int total = 0;
-    for (const auto& item : items_) {
-        total += CalcItemHeight(item);
-    }
-    return total;
-}
 
-int SettingsRenderer::GetFirstSelectableIndex() const {
-    for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
-        if (items_[i].type != SettingsItemType::Section) return i;
-    }
-    return 0;
-}
 
-int SettingsRenderer::GetLastSelectableIndex() const {
-    for (int i = static_cast<int>(items_.size()) - 1; i >= 0; --i) {
-        if (items_[i].type != SettingsItemType::Section) return i;
-    }
-    return 0;
-}
 
-int SettingsRenderer::FindPrevSelectable(int index) const {
-    for (int i = index - 1; i >= 0; --i) {
-        if (items_[i].type != SettingsItemType::Section) return i;
-    }
-    return index;
-}
 
-int SettingsRenderer::FindNextSelectable(int index) const {
-    for (int i = index + 1; i < static_cast<int>(items_.size()); ++i) {
-        if (items_[i].type != SettingsItemType::Section) return i;
-    }
-    return index;
-}
 
-void SettingsRenderer::EnsureSelectionVisible() {
-    if (items_.empty()) {
-        first_visible_index_ = 0;
-        scroll_offset_ = 0;
-        return;
-    }
-
-    if (items_[selected_index_].type == SettingsItemType::Section) {
-        selected_index_ = GetFirstSelectableIndex();
-    }
-
-    if (first_visible_index_ < 0 || first_visible_index_ >= static_cast<int>(items_.size()) ||
-        items_[first_visible_index_].type == SettingsItemType::Section) {
-        first_visible_index_ = selected_index_;
-    }
-
-    int visible_count = 0;
-    bool selection_visible = false;
-    for (int i = first_visible_index_; i < static_cast<int>(items_.size()); ++i) {
-        if (items_[i].type == SettingsItemType::Section) continue;
-        if (i == selected_index_) selection_visible = true;
-        visible_count++;
-        if (visible_count >= kVisibleOptionCount) break;
-    }
-
-    while (!selection_visible) {
-        if (selected_index_ < first_visible_index_) {
-            first_visible_index_ = selected_index_;
-        } else {
-            int next = FindNextSelectable(first_visible_index_);
-            if (next == first_visible_index_) break;
-            first_visible_index_ = next;
-        }
-
-        visible_count = 0;
-        selection_visible = false;
-        for (int i = first_visible_index_; i < static_cast<int>(items_.size()); ++i) {
-            if (items_[i].type == SettingsItemType::Section) continue;
-            if (i == selected_index_) selection_visible = true;
-            visible_count++;
-            if (visible_count >= kVisibleOptionCount) break;
-        }
-    }
-
-    scroll_offset_ = 0;
-}
 
 void SettingsRenderer::DrawSelectedBackground(uint8_t* fb, int width, int x, int y, int w, int h) const {
     if (!fb || w <= 0 || h <= 0) return;
@@ -443,7 +357,7 @@ void SettingsRenderer::UpdateVolumeValue(int delta, bool commit) {
 void SettingsRenderer::Render(uint8_t* fb, int width, int height) {
     if (!fb) return;
 
-    EnsureSelectionVisible();
+    SyncItemsFromModel();
     const auto& theme = ThemeManager::Get();
     const PaintStyle bg_style = theme.Style(ThemeToken::BackgroundPrimary);
     const PaintStyle text_style = theme.Style(ThemeToken::TextPrimary);
@@ -459,26 +373,21 @@ void SettingsRenderer::Render(uint8_t* fb, int width, int height) {
     DrawVLine(fb, width, kSettingsNavDividerX,
               body_top + kSettingsContentTopGap, body_bottom - 1, border_style.border);
 
-    std::vector<int> section_indices;
-    for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
-        if (items_[i].type == SettingsItemType::Section) section_indices.push_back(i);
-    }
-    if (section_indices.empty()) section_indices.push_back(-1);
-
-    int current_section_pos = 0;
-    for (int i = 0; i < static_cast<int>(section_indices.size()); ++i) {
-        if (section_indices[i] <= selected_index_) current_section_pos = i;
-    }
-
-    const char* current_section = (section_indices[current_section_pos] >= 0)
-        ? items_[section_indices[current_section_pos]].label.c_str()
-        : "系统";
+    const uint8_t section_count = rf_settings_section_count();
+    if (section_ >= section_count) section_ = 0;
+    rf_settings_section_t current_sec = {};
+    rf_settings_get_section(section_, &current_sec);
 
     const int nav_top = body_top + kSettingsContentTopGap;
-    for (int i = 0; i < static_cast<int>(section_indices.size()); ++i) {
+    for (uint8_t i = 0; i < section_count; ++i) {
         const int sy = nav_top + i * kSettingsNavItemH;
-        const bool selected = (i == current_section_pos);
-        const char* label = (section_indices[i] >= 0) ? items_[section_indices[i]].label.c_str() : "系统";
+        // The pill marks the section the cursor is on. With the cursor in the
+        // rows below, the row rail is the only highlight, so which pane has
+        // the focus is never ambiguous.
+        const bool selected = (i == section_);
+        rf_settings_section_t sec = {};
+        rf_settings_get_section(i, &sec);
+        const char* label = sec.label ? sec.label : "";
         const int nav_pill_x = 16;
         const int nav_pill_w = kSettingsNavDividerX - 26;
         const int nav_pill_h = 28;
@@ -497,17 +406,8 @@ void SettingsRenderer::Render(uint8_t* fb, int width, int height) {
                  label, font_, nav_fg);
     }
 
-    const int section_start = section_indices[current_section_pos] + 1;
-    const int section_end = (current_section_pos + 1 < static_cast<int>(section_indices.size()))
-        ? section_indices[current_section_pos + 1]
-        : static_cast<int>(items_.size());
-
-    std::vector<int> option_indices;
-    for (int i = section_start; i < section_end; ++i) {
-        if (items_[i].type != SettingsItemType::Section) option_indices.push_back(i);
-    }
-
-    const bool about_section = std::string(current_section) == "关于";
+    // A section with no rows of its own (关于) draws the about panel instead.
+    const bool about_section = (current_sec.item_count == 0);
     int debug_visible_row_count = 0;
     if (about_section) {
         struct InfoRow {
@@ -540,14 +440,12 @@ void SettingsRenderer::Render(uint8_t* fb, int width, int height) {
             y += row_h;
         }
     } else {
-        int selected_pos = 0;
-        for (int i = 0; i < static_cast<int>(option_indices.size()); ++i) {
-            if (option_indices[i] == selected_index_) selected_pos = i;
-        }
-        const int visible_count = std::min(kVisibleOptionCount, static_cast<int>(option_indices.size()));
+        const int total = static_cast<int>(items_.size());
+        const int selected_pos = (total > 0) ? std::min<int>(option_, total - 1) : 0;
+        const int visible_count = std::min(kVisibleOptionCount, total);
         int window_start = std::max(0, selected_pos - visible_count / 2);
-        if (window_start + visible_count > static_cast<int>(option_indices.size())) {
-            window_start = std::max(0, static_cast<int>(option_indices.size()) - visible_count);
+        if (window_start + visible_count > total) {
+            window_start = std::max(0, total - visible_count);
         }
         debug_visible_row_count = visible_count;
         int y = kSettingsTableTop;
@@ -557,17 +455,18 @@ void SettingsRenderer::Render(uint8_t* fb, int width, int height) {
         // scrolling only starts once a section has more than eight options.
         const int option_row_h = std::min(row_h, std::max(28, available_h / std::max(1, visible_count)));
         for (int i = 0; i < visible_count; ++i) {
-            const int item_index = option_indices[window_start + i];
-            RenderItem(fb, width, y, content_x, item_index, item_index == selected_index_, option_row_h);
+            const int item_index = window_start + i;
+            RenderItem(fb, width, y, content_x, item_index,
+                       focus_ == RF_SETTINGS_FOCUS_OPTIONS && item_index == selected_pos,
+                       option_row_h);
             y += option_row_h;
         }
 
-        if (static_cast<int>(option_indices.size()) > kVisibleOptionCount) {
+        if (total > kVisibleOptionCount) {
             const int track_x = width - 10;
             const int track_y = kSettingsTableTop + 2;
             const int track_h = std::max(24, option_row_h * visible_count - 4);
             DrawVLine(fb, width, track_x, track_y, track_y + track_h, border_style.border);
-            const int total = static_cast<int>(option_indices.size());
             const int thumb_h = std::max(10, track_h * visible_count / total);
             const int max_start = std::max(1, total - visible_count);
             const int thumb_y = track_y + (track_h - thumb_h) * window_start / max_start;
@@ -638,7 +537,7 @@ void SettingsRenderer::Render(uint8_t* fb, int width, int height) {
         !showing_ota_dialog_) {
         DrawSettingsLayoutDebugOverlay(fb, width, height, font_,
                                        body_top, body_bottom, nav_top,
-                                       current_section_pos,
+                                       section_,
                                        content_x, content_right, row_h,
                                        debug_visible_row_count);
     }
@@ -972,123 +871,92 @@ bool SettingsRenderer::HandleInput(const ButtonEvent& event) {
     }
 
 
+    // Clicks only: long presses and the combo are routed by the application
+    // (leaving the page, entering the config AP), and never reach the menu.
+    uint8_t button = 0;
     switch (event.type) {
         case ButtonEvent::kUpClick:
-            if (selected_index_ > 0) {
-                selected_index_ = FindPrevSelectable(selected_index_);
-            } else {
-                selected_index_ = GetLastSelectableIndex();
-            }
-            EnsureSelectionVisible();
-            needs_full_refresh_ = true;
-            return true;
-
-        case ButtonEvent::kDownClick: {
-            const int n = static_cast<int>(items_.size());
-            if (selected_index_ < n - 1) {
-                selected_index_ = FindNextSelectable(selected_index_);
-            } else {
-                selected_index_ = GetFirstSelectableIndex();  // Wrap to first
-            }
-            EnsureSelectionVisible();
-            needs_full_refresh_ = true;
-            return true;
-        }
-
-        case ButtonEvent::kUpLongPress:
-            // Scroll to top
-            scroll_offset_ = 0;
-            selected_index_ = GetFirstSelectableIndex();
-            first_visible_index_ = selected_index_;
-            needs_full_refresh_ = true;
-            return true;
-
+            button = RF_INPUT_UP;
+            break;
+        case ButtonEvent::kDownClick:
+            button = RF_INPUT_DOWN;
+            break;
         case ButtonEvent::kBootClick:
-            // Toggle checkbox, trigger action, or navigate
-            if (selected_index_ >= 0 &&
-                selected_index_ < static_cast<int>(items_.size())) {
-                SettingsItemDef& item = items_[selected_index_];
-                if (item.type == SettingsItemType::Checkbox) {
-                    item.checked = !item.checked;
-                    if (item.on_click) {
-                        item.on_click();
-                    }
-                    needs_full_refresh_ = true;
-                    return true;
-                } else if (item.type == SettingsItemType::Action || item.on_click) {
-                    if (item.on_click) {
-                        item.on_click();
-                    }
-                    return true;
-                }
-            }
+            button = RF_INPUT_BOOT;
             break;
-
-        case ButtonEvent::kDownLongPress: {
-            // Scroll to bottom
-            selected_index_ = GetLastSelectableIndex();
-            first_visible_index_ = selected_index_;
-            for (int shown = 1; shown < kVisibleOptionCount; ++shown) {
-                int prev = FindPrevSelectable(first_visible_index_);
-                if (prev == first_visible_index_) break;
-                first_visible_index_ = prev;
-            }
-            EnsureSelectionVisible();
-            needs_full_refresh_ = true;
-            return true;
-        }
-
         default:
-            break;
+            return false;
     }
 
-    return false;
+    rf_settings_step_t st = {};
+    rf_settings_step(section_, focus_, option_, button, &st);
+    const bool moved = (st.section != section_ || st.focus != focus_ || st.option != option_);
+    section_ = st.section;
+    focus_ = st.focus;
+    option_ = st.option;
+
+    bool acted = false;
+    if (st.effect == RF_SETTINGS_EFFECT_ACTIVATE || st.effect == RF_SETTINGS_EFFECT_TOGGLE) {
+        acted = true;
+        if (item_handler_) item_handler_(st.effect_item, st.effect == RF_SETTINGS_EFFECT_TOGGLE);
+    }
+
+    // Only a visible change is worth a full refresh: on this panel one costs
+    // 10-25 s. A confirm that acts repaints through its own path.
+    if (!moved && !acted) return false;
+    needs_full_refresh_ = true;
+    return true;
 }
 
-void SettingsRenderer::SetItems(const std::vector<SettingsItemDef>& items) {
-    // Remember current selection label to preserve it across rebuilds
-    std::string prev_label;
-    if (selected_index_ >= 0 && selected_index_ < static_cast<int>(items_.size())) {
-        prev_label = items_[selected_index_].label;
-    }
-
-    items_.clear();
-    items_ = items;
-
-    // Try to find the previously selected item in the new list
-    if (!prev_label.empty()) {
-        for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
-            if (items_[i].label == prev_label && items_[i].type != SettingsItemType::Section) {
-                selected_index_ = i;
-                break;
-            }
-        }
-        if (items_[selected_index_].type == SettingsItemType::Section) {
-            selected_index_ = GetFirstSelectableIndex();
-        }
-    } else {
-        selected_index_ = GetFirstSelectableIndex();
-    }
-
-    scroll_offset_ = 0;
-    first_visible_index_ = selected_index_;
-    EnsureSelectionVisible();
-    ShowCategoryHint();
+void SettingsRenderer::SetItemValue(uint8_t id, const std::string& value) {
+    if (values_[id] == value) return;
+    values_[id] = value;
     needs_full_refresh_ = true;
 }
 
-void SettingsRenderer::UpdateItem(int index, const std::string& value) {
-    if (index >= 0 && index < static_cast<int>(items_.size())) {
-        items_[index].value = value;
-        needs_full_refresh_ = true;
-    }
+void SettingsRenderer::SetItemChecked(uint8_t id, bool checked) {
+    if (checks_[id] == checked) return;
+    checks_[id] = checked;
+    needs_full_refresh_ = true;
 }
 
-void SettingsRenderer::UpdateChecked(int index, bool checked) {
-    if (index >= 0 && index < static_cast<int>(items_.size())) {
-        items_[index].checked = checked;
-        needs_full_refresh_ = true;
+std::string SettingsRenderer::ValueFor(uint8_t id) const {
+    auto it = values_.find(id);
+    return (it == values_.end()) ? std::string() : it->second;
+}
+
+// The model owns the menu; this mirrors the current section into `items_` so
+// the drawing below stays a pure function of one view.
+void SettingsRenderer::SyncItemsFromModel() {
+    if (section_ >= rf_settings_section_count()) section_ = 0;
+    rf_settings_section_t sec = {};
+    rf_settings_get_section(section_, &sec);
+
+    items_.clear();
+    items_.reserve(sec.item_count);
+    for (uint8_t i = 0; i < sec.item_count; ++i) {
+        rf_settings_item_t it = {};
+        rf_settings_get_item(section_, i, &it);
+        SettingsItemDef def;
+        def.label = it.label ? it.label : "";
+        def.value = ValueFor(it.id);
+        def.checked = checks_[it.id];
+        switch (it.kind) {
+            case RF_SETTINGS_KIND_ACTION:
+                def.type = SettingsItemType::Action;
+                break;
+            case RF_SETTINGS_KIND_TOGGLE:
+                def.type = SettingsItemType::Checkbox;
+                break;
+            default:
+                // Read-outs use the plain row: label left, value right, and no
+                // affordance that confirming them would do anything.
+                def.type = SettingsItemType::Normal;
+                break;
+        }
+        items_.push_back(std::move(def));
     }
+    if (option_ >= items_.size()) option_ = 0;
 }
 
 void SettingsRenderer::ShowOtaDialog(const std::vector<std::string>& versions,

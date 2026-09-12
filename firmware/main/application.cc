@@ -37,17 +37,36 @@ namespace {
 constexpr char kTag[] = "Application";
 constexpr char kPowerNamespace[] = "power";
 
-// Index space is the pushed item list, Section rows included:
-// 0 系统 / 1 重启 / 2 重置网络 / 3 网络 / 4 Wi-Fi / 5 省电模式 / 6 关于 / 7 固件
-constexpr int kSettingsWifiIndex = 4;
+// The settings menu's rows are addressed by id, and the labels/order live in
+// rust/src/settings.rs (`rf_settings_item_t`). Only the device-supplied parts
+// are here: what a row does, and the values it reads.
 
 
+
+// The 网络 section is a read-out; these are the values only the device knows.
+void RefreshNetworkStatusItems(rawdraw::SettingsRenderer* renderer, bool connected) {
+    if (!renderer) return;
+    auto& wifi = WifiManager::GetInstance();
+    const bool up = connected || wifi.IsConnected();
+    renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_IP, up ? wifi.GetIpAddress() : "--");
+    if (up) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%d dBm", wifi.GetRssi());
+        renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_SIGNAL, buf);
+    } else {
+        renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_SIGNAL, "--");
+    }
+    renderer->SetItemValue(RF_SETTINGS_ITEM_SERVER,
+                           page_sync_server_reachable() ? "可达" : "不可达");
+}
 
 void UpdateWifiSettingsItem(rawdraw::SettingsRenderer* renderer, bool connected,
                             const char* value = nullptr) {
     if (!renderer) return;
-    renderer->UpdateChecked(kSettingsWifiIndex, connected);
-    renderer->UpdateItem(kSettingsWifiIndex, value ? value : (connected ? "已连接" : "未连接"));
+    renderer->SetItemChecked(RF_SETTINGS_ITEM_WIFI_TOGGLE, connected);
+    renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_STATE,
+                           value ? value : (connected ? "已连接" : "未连接"));
+    RefreshNetworkStatusItems(renderer, connected);
 }
 
 void StartSntpClockSyncOnce() {
@@ -390,42 +409,46 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
         }
     });
     if (auto* sr = rawdraw_ui_manager_->GetSettingsRenderer()) {
-        std::vector<rawdraw::SettingsItemDef> items;
-        items.push_back({"系统", "", nullptr, rawdraw::SettingsItemType::Section, false});
-        items.push_back({"重启", "执行", nullptr, rawdraw::SettingsItemType::Action, false,
-                         []() { esp_restart(); }});
-        items.push_back({"重置网络", "清凭据重启", nullptr, rawdraw::SettingsItemType::Action, false,
-                         []() {
-                             ESP_LOGW(kTag, "Reset network: clearing WiFi credentials and pairing token");
-                             SsidManager::GetInstance().Clear();
-                             server_pairing_clear();
-                             esp_restart();
-                         }});
-        items.push_back({"网络", "", nullptr, rawdraw::SettingsItemType::Section, false});
-        items.push_back({"Wi-Fi", "未连接", nullptr, rawdraw::SettingsItemType::Checkbox, false,
-                         [this, sr]() {
-                             auto& wifi = WifiManager::GetInstance();
-                             if (wifi_connected_.load(std::memory_order_acquire) || wifi.IsConnected()) {
-                                 ESP_LOGI(kTag, "Wi-Fi setting toggled OFF");
-                                 wifi.StopStation();
-                                 wifi_connected_.store(false, std::memory_order_release);
-                                 UpdateWifiSettingsItem(sr, false);
-                             } else {
-                                 ESP_LOGI(kTag, "Wi-Fi setting toggled ON");
-                                 UpdateWifiSettingsItem(sr, false, "连接中");
-                                 wifi.StartStation();
-                             }
-                             UpdateStatusBarForUi();
-                         }});
-        items.push_back({"省电模式", "手动进入", nullptr,
-                         rawdraw::SettingsItemType::Action, false,
-                         [this]() {
-                             ESP_LOGI(kTag, "Manual sleep requested from settings");
-                             EnterManualSleep();
-                         }});
-        items.push_back({"关于", "", nullptr, rawdraw::SettingsItemType::Section, false});
-        items.push_back({"固件", PROJECT_VER, nullptr, rawdraw::SettingsItemType::Normal, false});
-        sr->SetItems(items);
+        // What each row does. The menu's shape and its navigation are Rust;
+        // this is the only place that knows how to restart, clear credentials,
+        // sleep or toggle the radio.
+        sr->SetItemHandler([this, sr](uint8_t id, bool /*toggle*/) {
+            switch (id) {
+                case RF_SETTINGS_ITEM_RESTART:
+                    ESP_LOGW(kTag, "Settings: restart requested");
+                    esp_restart();
+                    break;
+                case RF_SETTINGS_ITEM_RESET_NETWORK:
+                    ESP_LOGW(kTag, "Reset network: clearing WiFi credentials and pairing token");
+                    SsidManager::GetInstance().Clear();
+                    server_pairing_clear();
+                    esp_restart();
+                    break;
+                case RF_SETTINGS_ITEM_SLEEP:
+                    ESP_LOGI(kTag, "Manual sleep requested from settings");
+                    EnterManualSleep();
+                    break;
+                case RF_SETTINGS_ITEM_WIFI_TOGGLE: {
+                    auto& wifi = WifiManager::GetInstance();
+                    if (wifi_connected_.load(std::memory_order_acquire) || wifi.IsConnected()) {
+                        ESP_LOGI(kTag, "Wi-Fi setting toggled OFF");
+                        wifi.StopStation();
+                        wifi_connected_.store(false, std::memory_order_release);
+                    } else {
+                        ESP_LOGI(kTag, "Wi-Fi setting toggled ON");
+                        wifi.StartStation();
+                    }
+                    UpdateWifiSettingsItem(sr, wifi_connected_.load(std::memory_order_acquire));
+                    UpdateStatusBarForUi();
+                    break;
+                }
+                default:
+                    break;
+            }
+        });
+        sr->SetItemValue(RF_SETTINGS_ITEM_RESET_NETWORK, "清凭据重启");
+        sr->SetItemValue(RF_SETTINGS_ITEM_SLEEP, "手动进入");
+        UpdateWifiSettingsItem(sr, wifi_connected_.load(std::memory_order_acquire));
         sr->SetFirmwareVersion("v" PROJECT_VER);
 
         uint8_t mac_bytes[6] = {};

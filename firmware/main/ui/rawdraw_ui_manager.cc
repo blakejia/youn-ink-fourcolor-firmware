@@ -1412,42 +1412,6 @@ void RawDrawUiManager::SetChatBottomStatus(const std::string& status) {
 // Settings page data updates
 // ============================================================
 
-void RawDrawUiManager::SetSettingsItems(const std::vector<rawdraw::SettingsItemDef>& items) {
-    if (settings_renderer_) {
-        settings_renderer_->SetItems(items);
-        settings_renderer_->MarkFullRefresh();
-
-        if (current_page_ == RawDrawPageId::Settings) {
-            auto* fb = lcd_ ? lcd_->GetFramebuffer() : nullptr;
-            if (fb) {
-                auto* mutex = lcd_->GetMutex();
-                if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
-
-                rawdraw::Clear(fb, width_, height_);
-                RenderAll(fb, width_, height_);
-
-                if (mutex) xSemaphoreGive(mutex);
-
-                TriggerRefresh(false);
-            }
-        }
-    }
-}
-
-void RawDrawUiManager::UpdateSettingsItem(int index, const std::string& value) {
-    if (settings_renderer_) {
-        settings_renderer_->UpdateItem(index, value);
-        settings_renderer_->MarkFullRefresh();
-    }
-}
-
-void RawDrawUiManager::UpdateSettingsChecked(int index, bool checked) {
-    if (settings_renderer_) {
-        settings_renderer_->UpdateChecked(index, checked);
-        settings_renderer_->MarkFullRefresh();
-    }
-}
-
 // ============================================================
 // WiFi page data updates
 // ============================================================
