@@ -28,7 +28,8 @@ Supported:
       margin, marginX/Y, width, height, border, overflow, fontWeight
     - text content via props.children string
     - image src: data:image/...;base64,... or http(s) URL (must be anonymously
-      fetchable)
+      fetchable), or uploads://<id> (id is 32 lowercase hex; resolved inside
+      settings.uploads_dir)
 
 Output: exactly 30000 bytes (400 px * 300 px * 2 bpp / 8).
 """

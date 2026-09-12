@@ -167,12 +167,24 @@ def test_uploads_scheme_renders_the_stored_image():
 
 
 def test_uploads_scheme_rejects_an_id_that_could_escape_the_directory():
+    from youn_server.config import settings
+    # A real PNG one level above uploads/: a naive filename join
+    # (uploads_dir / "../secret.png") would resolve to it and render it.
+    Image.new("RGB", (400, 300), (220, 30, 30)).save(
+        settings.uploads_dir.parent / "secret.png", format="PNG")
+
+    blank = {"default": [{"type": "div", "props": {
+        "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
+        "children": []}}]}
     canvas = {"default": [{"type": "div", "props": {
         "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
-        "children": [{"type": "img", "props": {"src": "uploads://../../etc/passwd"}}]}}]}
-    # _render_img logs and skips an image it cannot load; the page still renders.
+        "children": [{"type": "img", "props": {"src": "uploads://../secret"}}]}}]}
+    # The id regex rejects the traversal, so the loader never touches the file
+    # and the page is byte-identical to the empty white canvas. Drop the regex
+    # and the traversal resolves to the red PNG, changing the pixels.
     bitmap = render_canvas_to_bitmap(canvas)
     assert len(bitmap) == 30000
+    assert bitmap == render_canvas_to_bitmap(blank)
 
 
 def test_uploads_scheme_skips_a_missing_file():
