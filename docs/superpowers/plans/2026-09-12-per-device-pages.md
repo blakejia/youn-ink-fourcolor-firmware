@@ -73,9 +73,12 @@ def client():
 
 
 def _canvas(label: str) -> dict:
+    # Text is a plain string child, not a node: canvas_render accepts only
+    # div/span/img node types and raises RenderError for anything else
+    # (_resolve_children, canvas_render.py:282).
     return {"default": [{"type": "div", "props": {
         "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
-        "children": [{"type": "text", "props": {"children": label}}]}}]}
+        "children": label}}]}
 
 
 def _make(device: str, name: str, order: int = 0) -> None:
