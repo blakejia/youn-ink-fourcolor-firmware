@@ -68,3 +68,9 @@ server/firmware/
 firmware/main/rust/target/
 server/data/devices.db
 server/data/notifications.jsonl
+# Runtime content the server generates: rendered bitmaps, uploaded originals,
+# and the directory of the image-push API that was deleted (config still
+# creates the directory at startup).
+server/data/pages/*.bin
+server/data/uploads/
+server/data/images/
