@@ -446,7 +446,8 @@ Expected: FAIL —— 端点仍在，返回 200/400/405 而不是 404。
 - 用 `grep -n "_image_path\|_image_meta_path\|_device_can_push\|_push_image_to_device\|push_image\|images_dir\|image_conv" server/youn_server/*.py` 确认删干净，并删掉 `settings.images_dir` 的引用（`config.py` 里的字段本身可留，标为未用）。
 - `session.py`：删 `pending_pushes` 计数与该模块里 `LIST_IMAGES` 的分支。
 - `protocol.py`：删 `MsgType.LIST_IMAGES`、`OutMsg.IMAGE_PUSH_META`、`OutMsg.IMAGE_PUSH_DONE`。
-- `git rm server/youn_server/image_conv.py`（只被 `/api/images` 使用）。
+- **不要删 `image_conv.py`**：它不是死的。`canvas_render.py:49` 从它导入 `SCREEN_W`/`SCREEN_H`、`PALETTE_BWRY` 与调色板索引，`tests/test_canvas_render.py:21,135` 也导入它。计划原先的判断（"只被 /api/images 使用"）是错的，实现者拒绝删除是对的。
+- 更新 `README.md` 里描述已删上传接口的段落（`api/images` / `push_image`），使它反映现在唯一的路径 `POST /api/uploads`。
 - `git rm -r --cached` 不适用；`data/images/` 是运行期目录，若被跟踪则一并删并加进 `.gitignore`。
 
 - [ ] **Step 4: 跑全量套件确认通过**
@@ -549,7 +550,7 @@ cd server && ./start.sh status
 curl -s -X POST http://10.0.0.90:9002/api/pages \
   -H "X-Operator-Token: 962f48a9a67c87e5baaca1f44d764631" \
   -H "Content-Type: application/json" \
-  -d '{"name":"plan-e2e","canvas_json":{"default":[{"type":"div","props":{"tw":"flex flex-col w-full h-full items-center justify-center bg-white","children":[{"type":"text","props":{"children":"before"}}]}}]},"duration_minutes":10,"order":90}'
+  -d '{"name":"plan-e2e","canvas_json":{"default":[{"type":"div","props":{"tw":"flex flex-col w-full h-full items-center justify-center bg-white","children":[{"type":"div","props":{"tw":"w-full h-full flex items-center justify-center bg-white","children":[{"type":"text","props":{"children":"before"}}]}}]}}]},"duration_minutes":10,"order":90}'
 ```
 
 Expected: 200，返回 `{"md5": "...", ...}`。记下这个 md5（替换前的）。
