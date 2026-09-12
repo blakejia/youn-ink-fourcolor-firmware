@@ -406,6 +406,21 @@ PY
 ls server/data/pages server/data/pages/NOTE4C-3400FC
 ```
 
+立刻验证迁移不变量（不要等到 Task 3 —— 本任务的其他测试都在临时目录里跑，迁移写错它们不会红）：
+
+```bash
+cd server && ./.venv/bin/python -c "
+import sys; sys.path.insert(0, '.')
+from youn_server import pages as p
+entries = p.build_schedule_from_disk('NOTE4C-3400FC')
+print('md5:', p.compute_schedule_md(entries))
+print('pages:', [(e.name, e.md5[:8]) for e in entries])
+"
+cd ..
+```
+
+Expected: `md5: de3dc3118cd0d350e94dee7cfc54a7be`，`pages: [('logo-1024', '36be550c'), ('page2', '9c9c526b')]` —— 与迁移前实测值逐字符相同。不一样就是迁移写错了，当场修，不要提交。
+
 - [ ] **Step 8: 提交（代码与数据同一提交，不留布局真空期）**
 
 ```bash
