@@ -87,6 +87,8 @@ class PageEntry:
 # ─── helpers ──────────────────────────────────────────────────────────
 def is_safe_component(value: str) -> bool:
     """Whitelist check for device ids and page names used as path components."""
+    if value in (".", ".."):
+        return False
     safe = "".join(c for c in value if c.isalnum() or c in "._-")
     return bool(safe) and safe == value
 
@@ -309,7 +311,14 @@ def build_schedule_from_disk(device: str) -> list[PageEntry]:
         if not candidates:
             continue
         candidates.sort(reverse=True)
-        out.append(PageEntry(md5=candidates[0][1], duration_minutes=src.duration_minutes,
+        md5 = candidates[0][1]
+        if not _bitmap_path(md5).is_file():
+            # The meta survived but the bytes are gone (refcount GC drops the
+            # .bin through _drop_source_reference; a lost meta leaves the
+            # orphan with no reaper). Never advertise an unfetchable md5.
+            log.warning("schedule skips %s/%s: bitmap %s missing", device, src.name, md5)
+            continue
+        out.append(PageEntry(md5=md5, duration_minutes=src.duration_minutes,
                              order=src.order, name=src.name))
     out.sort(key=lambda e: e.order)
     return out

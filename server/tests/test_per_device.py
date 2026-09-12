@@ -115,6 +115,16 @@ def test_a_schedule_entry_carries_the_pages_own_duration_and_order():
     _make(DEV_A, "dur", order=7)
     entry = pages_mod.build_schedule_from_disk(DEV_A)[0]
     assert (entry.name, entry.order, entry.duration_minutes) == ("dur", 7, 10)
+def test_a_page_whose_bitmap_is_gone_is_not_advertised():
+    """A meta that claims a page whose .bin is absent (refcount GC dropped the
+    bytes while the meta survived) must not put that md5 on the schedule."""
+    _make(DEV_A, "ghost")
+    md5 = pages_mod.build_schedule_from_disk(DEV_A)[0].md5
+    assert pages_mod.get_bitmap(md5) is not None
+    pages_mod._bitmap_path(md5).unlink()
+    assert pages_mod.get_bitmap(md5) is None
+    assert pages_mod.build_schedule_from_disk(DEV_A) == []
+
 
 
 # ── the admin API ──────────────────────────────────────────────────────
@@ -189,3 +199,22 @@ def test_a_page_name_with_a_space_is_a_400_not_a_500(client):
     files_after = sorted(p.relative_to(settings.data_dir)
                          for p in settings.data_dir.rglob("*") if p.is_file())
     assert files_after == files_before
+
+
+def test_a_dotdot_device_is_a_400_not_an_escape(client):
+    """"." and ".." pass a naive alnum/._- whitelist; _page_dir would then
+    resolve outside pages/. Even a registered ".." device must be refused
+    before anything touches disk."""
+    assert not pages_mod.is_safe_component(".")
+    assert not pages_mod.is_safe_component("..")
+    _register("..", "dd0t" * 16)
+    files_before = sorted(p.relative_to(settings.data_dir)
+                          for p in settings.data_dir.rglob("*") if p.is_file())
+    r = client.post("/api/pages", json={
+        "device": "..", "name": "x", "canvas_json": _canvas("x"),
+        "duration_minutes": 10, "order": 0})
+    assert r.status_code == 400
+    files_after = sorted(p.relative_to(settings.data_dir)
+                         for p in settings.data_dir.rglob("*") if p.is_file())
+    assert files_after == files_before
+    assert not (settings.data_dir / "x.json").exists()

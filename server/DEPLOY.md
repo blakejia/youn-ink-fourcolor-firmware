@@ -209,6 +209,7 @@ curl -X POST http://127.0.0.1:9002/api/pages \
      -H "X-Operator-Token: $OPERATOR_TOKEN" \
      -H 'Content-Type: application/json' \
      -d '{
+       "device": "NOTE4C-3400FC",
        "name": "morning",
        "canvas_json": {
          "default": [{
@@ -230,9 +231,11 @@ curl -X POST http://127.0.0.1:9002/api/pages \
 ```
 
 ### 查询当前 schedule
-
 ```bash
-curl http://127.0.0.1:9002/api/pages/schedule | python3 -m json.tool
+# schedule 是设备接口：需要该设备的 Bearer token（配对后签发），不是 operator header。
+# DEVICE_TOKEN=<pair-start/claim 流程签发的设备 token>
+curl http://127.0.0.1:9002/api/pages/schedule \
+     -H "Authorization: Bearer $DEVICE_TOKEN" | python3 -m json.tool
 ```
 
 返回包含 `schedule_md5`、`policy.sleep_window`、`policy.poll_interval_minutes`、
@@ -241,7 +244,7 @@ curl http://127.0.0.1:9002/api/pages/schedule | python3 -m json.tool
 ### 删除页
 
 ```bash
-curl -X DELETE http://127.0.0.1:9002/api/pages/morning \
+curl -X DELETE "http://127.0.0.1:9002/api/pages/morning?device=NOTE4C-3400FC" \
      -H "X-Operator-Token: $OPERATOR_TOKEN"
 ```
 

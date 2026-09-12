@@ -105,6 +105,21 @@ def test_upload_without_a_page_is_refused(client):
     assert _upload_dir_files() == files_before
 
 
+def test_upload_without_a_page_name_lists_the_pages(client):
+    """Omitting `page` must take the structured branch (with the candidate
+    list), not the plain whitelist rejection for the empty name."""
+    _register()
+    _make_page("test-upload-named")
+    files_before = _upload_dir_files()
+    r = client.post("/api/uploads",
+                    files={"image": ("a.png", _png(), "image/png")},
+                    data={"device": DEV})
+    assert r.status_code == 400
+    assert "test-upload-named" in r.json()["detail"]["pages"]
+    # Refused before anything was written to disk.
+    assert _upload_dir_files() == files_before
+
+
 def test_upload_to_an_unknown_page_lists_the_pages_you_could_have_meant(client):
     _register()
     _make_page("test-upload-known")

@@ -20,7 +20,11 @@ function DeviceSelector() {
   }, []);
   useEffect(() => {
     api.devices().then((ds) => {
-      setDevices((ds || []).filter((d) => d.trust));
+      const trusted = (ds || []).filter((d) => d.trust);
+      setDevices(trusted);
+      if (getSelectedDevice() && !trusted.some((d) => d.device_id === getSelectedDevice())) {
+        setSelectedDevice('');
+      }
       setSelected(getSelectedDevice());
       setLoadErr('');
     }).catch(() => {

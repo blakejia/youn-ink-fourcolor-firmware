@@ -124,6 +124,8 @@ def _require_device_token(request: Request) -> "Device":
 def _require_known_device(device: str) -> str:
     """The admin's device selector must name a device that exists and is trusted;
     a typo would otherwise create a phantom page set on disk."""
+    if not pages_mod.is_safe_component(device):
+        raise HTTPException(400, f"invalid device: {device!r}")
     dev = registry.get(device)
     if dev is None or not dev.trusted:
         raise HTTPException(400, f"unknown or untrusted device: {device!r}")
@@ -496,6 +498,8 @@ def create_app() -> FastAPI:
     @app.get("/api/pages/schedule")
     async def get_schedule(request: Request) -> dict:
         dev = _require_device_token(request)
+        if not pages_mod.is_safe_component(dev.device_id):
+            raise HTTPException(status_code=401, detail="unauthorized")
         entries = pages_mod.build_schedule_from_disk(dev.device_id)
         sched_md = pages_mod.compute_schedule_md(entries)
         current_index, seconds_until_next_page = pages_mod.schedule_position(entries, time.time())
@@ -579,7 +583,7 @@ def create_app() -> FastAPI:
         its `style.width/height` — `w-full`/`h-full` are not parsed and an
         unsized img measures 0x0, which pastes a single pixel. So the img gets
         the same explicit `style` the existing pages use
-        (`server/data/pages/logo-1024.json`). The stored file is already
+        (`server/data/pages/NOTE4C-3400FC/logo-1024.json`). The stored file is already
         panel-sized and letterboxed on white, so this draws 1:1."""
         return {"default": [{"type": "div", "props": {
             "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
@@ -600,8 +604,6 @@ def create_app() -> FastAPI:
         device = device.strip()
         _require_known_device(device)
         page = page.strip()
-        if not pages_mod.is_safe_component(page):
-            raise HTTPException(400, f"invalid page name: {page!r}")
         sources = pages_mod.list_pages(device)
         existing = [s.name for s in sources]
         if not page or page not in existing:
@@ -609,6 +611,8 @@ def create_app() -> FastAPI:
                 "detail": "unknown page: uploads must name a page to replace",
                 "pages": existing,
             })
+        if not pages_mod.is_safe_component(page):
+            raise HTTPException(400, f"invalid page name: {page!r}")
 
         data = await image.read()
         if len(data) > 25 * 1024 * 1024:
