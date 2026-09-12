@@ -23,7 +23,7 @@
 ```text
 .
 ├── firmware/        ESP32-IDF 固件，RawDraw UI、页面渲染、屏幕驱动、AP 传图
-├── server/          Python 后端，WebSocket 对话、TTS、Discovery、图片推送、OTA API
+├── server/          Python 后端，WebSocket 对话、TTS、Discovery、图片上传、OTA API
 ├── frontend/        管理前端源码，使用独立的 package/pnpm 工作流
 ├── docs/            历史设计文档和实现记录
 ├── documents/       项目资料
@@ -40,7 +40,7 @@
 | --- | --- | --- |
 | `9001` | WebSocket | ESP32 语音、LLM、TTS、同步消息 |
 | `8766` | UDP | 设备发现 |
-| `8766` | HTTP | 图片推送、设备图片管理、OTA API |
+| `8766` | HTTP | OTA API（备用入口，见下） |
 | `8090` | HTTP | 独立管理服务，可选 |
 
 ### 安装依赖
@@ -87,28 +87,24 @@ python3 mock_client.py --server ws://127.0.0.1:9001
 
 ## 图片和设备管理
 
-图片 HTTP API 由 `server/push_image.py` 挂到 `8766` 端口。它支持：
-
-- 上传图片文件并转换后推送到设备。
-- 选择 `1bpp` 黑白格式或 `2bpp` 四色 BWRY 格式。
-- 查询设备图片列表。
-- 删除设备图片。
-- 上传固件并提供 OTA 下载。
+图片上传走绑定页面的接口：`POST /api/uploads`，multipart 表单带 `image` 文件与
+`page`（已存在的页面名），配置了 `OPERATOR_TOKEN` 时需带 `X-Operator-Token` 请求头；
+上传后替换该页面的图片。`server/push_image.py` 是同一后端应用挂到 `8766` 端口的
+备用入口（另带 UDP 发现），OTA 相关接口（上传固件、查询、下载）仍可用：
 
 常用接口：
 
 ```bash
-curl http://localhost:8766/api/status
-curl http://localhost:8766/api/images
+curl http://localhost:9001/api/health
 ```
 
-上传图片示例：
+上传图片示例（替换名为 `album` 的页面）：
 
 ```bash
-curl -X POST http://localhost:8766/api/upload_image \
+curl -X POST http://localhost:9001/api/uploads \
+  -H "X-Operator-Token: $OPERATOR_TOKEN" \
   -F "image=@/path/to/photo.jpg" \
-  -F "format=bwry2bpp" \
-  -F "title=照片标题"
+  -F "page=album"
 ```
 
 设备进入 AP 传图模式后，手机连接设备热点并访问：
@@ -169,7 +165,7 @@ ZECTRIX_EPD_PANEL_1BPP            黑白 1bpp 屏
 | `LISTEN_HOST` | `0.0.0.0` | WebSocket 监听地址 |
 | `LISTEN_PORT` | `9001` | WebSocket 端口 |
 | `DISCOVERY_PORT` | `8766` | UDP 发现端口 |
-| `PUSH_IMAGE_PORT` | `8766` | 图片/OTA HTTP API 端口 |
+| `PUSH_IMAGE_PORT` | `8766` | OTA/备用 HTTP API 及 UDP 发现端口 |
 | `TTS_WS_CHUNK_BYTES` | `8000` | TTS 推送分片大小 |
 | `TTS_WS_CHUNK_GAP_SEC` | `0.01` | TTS 分片发送间隔 |
 
