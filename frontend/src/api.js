@@ -33,17 +33,19 @@ export const api = {
   pairConfirm: (deviceId, code) =>
     request('/devices/pair-confirm', { method: 'POST', body: { device_id: deviceId, code } }),
   pairPending: async () => (await request('/devices/pair-pending')).sessions ?? [],
-  pages: async () => (await request('/pages')).pages ?? [],
+  pages: async (device) => (await request(`/pages?device=${encodeURIComponent(device)}`)).pages ?? [],
   createPage: (data) => request('/pages', { method: 'POST', body: data }),
-  deletePage: (name) => request(`/pages/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  deletePage: (name, device) =>
+    request(`/pages/${encodeURIComponent(name)}?device=${encodeURIComponent(device)}`, { method: 'DELETE' }),
   preview: async (canvasJson) => {
     const res = await request('/pages/preview', { method: 'POST', body: { canvas_json: canvasJson } });
     return res.blob();
   },
-  uploadToPage: async (file, page) => {
+  uploadToPage: async (file, page, device) => {
     const fd = new FormData();
     fd.append('image', file);
     fd.append('page', page);
+    fd.append('device', device);
     const headers = {};
     const token = getToken();
     if (token) headers['X-Operator-Token'] = token;
