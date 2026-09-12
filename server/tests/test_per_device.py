@@ -5,10 +5,12 @@ global and content-addressed, keyed in their meta by "<device>/<name>".
 """
 from __future__ import annotations
 
+import io
 import json
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from youn_server import pages as pages_mod
 from youn_server.app import create_app, registry
@@ -35,6 +37,12 @@ def _canvas(label: str) -> dict:
 def _make(device: str, name: str, order: int = 0) -> None:
     canvas = _canvas(name)
     pages_mod.upsert_page(device, name, canvas, 10, order, render_canvas_to_bitmap(canvas))
+
+
+def _png() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (800, 600), (10, 120, 200)).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _register(device_id: str, token: str, trusted: bool = True) -> None:
@@ -142,6 +150,16 @@ def test_an_upload_must_name_a_device_and_a_page_of_that_device(client):
                     data={"device": DEV_A, "page": "not-here"})
     assert r.status_code == 400
     assert not any(settings.uploads_dir.iterdir())
+    # A page of the OTHER device is not good enough either. b"x" would also
+    # 400 on image parsing, so use a real picture: with a global page list
+    # the endpoint would accept the name and upsert into DEV_A's directory.
+    _make(DEV_B, "b-only")
+    uploads_before = sorted(p.name for p in settings.uploads_dir.iterdir())
+    r = client.post("/api/uploads", files={"image": ("a.png", _png(), "image/png")},
+                    data={"device": DEV_A, "page": "b-only"})
+    assert r.status_code == 400
+    assert sorted(p.name for p in settings.uploads_dir.iterdir()) == uploads_before
+    assert [p.name for p in pages_mod.list_pages(DEV_A)] == []
 
 
 def test_the_schedule_requires_the_device_token(client):
@@ -156,3 +174,18 @@ def test_an_untrusted_device_token_cannot_read_a_schedule(client):
     _register("NOTE4C-TESTD", "d" * 64, trusted=False)
     r = client.get("/api/pages/schedule", headers={"Authorization": "Bearer " + "d" * 64})
     assert r.status_code == 401
+
+
+def test_a_page_name_with_a_space_is_a_400_not_a_500(client):
+    """Names that mix valid and invalid characters must be refused as 400
+    before anything touches disk — never escape as a 500."""
+    _register(DEV_A, "a" * 64)
+    files_before = sorted(p.relative_to(settings.data_dir)
+                          for p in settings.data_dir.rglob("*") if p.is_file())
+    r = client.post("/api/pages", json={
+        "device": DEV_A, "name": "home page", "canvas_json": _canvas("x"),
+        "duration_minutes": 10, "order": 0})
+    assert r.status_code == 400
+    files_after = sorted(p.relative_to(settings.data_dir)
+                         for p in settings.data_dir.rglob("*") if p.is_file())
+    assert files_after == files_before

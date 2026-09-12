@@ -456,6 +456,8 @@ def create_app() -> FastAPI:
         order = int(body.get("order", 0))
         if not name:
             raise HTTPException(400, "name required")
+        if not pages_mod.is_safe_component(name):
+            raise HTTPException(400, f"invalid page name: {name!r}")
         if not isinstance(canvas_json, dict):
             raise HTTPException(400, "canvas_json must be an object")
         if duration_minutes < settings.canvas_min_page_duration_minutes:
@@ -485,6 +487,8 @@ def create_app() -> FastAPI:
         if not device:
             raise HTTPException(400, "device required")
         _require_known_device(device)
+        if not pages_mod.is_safe_component(name):
+            raise HTTPException(400, f"invalid page name: {name!r}")
         if not pages_mod.delete_page(device, name):
             raise HTTPException(404, "unknown page")
         return {"deleted": name}
@@ -596,6 +600,8 @@ def create_app() -> FastAPI:
         device = device.strip()
         _require_known_device(device)
         page = page.strip()
+        if not pages_mod.is_safe_component(page):
+            raise HTTPException(400, f"invalid page name: {page!r}")
         sources = pages_mod.list_pages(device)
         existing = [s.name for s in sources]
         if not page or page not in existing:

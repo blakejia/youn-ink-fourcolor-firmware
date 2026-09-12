@@ -85,11 +85,16 @@ class PageEntry:
 
 
 # ─── helpers ──────────────────────────────────────────────────────────
-def _safe_component(value: str, what: str) -> str:
+def is_safe_component(value: str) -> bool:
+    """Whitelist check for device ids and page names used as path components."""
     safe = "".join(c for c in value if c.isalnum() or c in "._-")
-    if not safe or safe != value:
+    return bool(safe) and safe == value
+
+
+def _safe_component(value: str, what: str) -> str:
+    if not is_safe_component(value):
         raise ValueError(f"invalid {what}: {value!r}")
-    return safe
+    return value
 
 
 def _page_dir(device: str) -> Path:
