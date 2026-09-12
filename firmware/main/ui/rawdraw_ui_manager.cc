@@ -82,10 +82,18 @@ int64_t MsUntilNextMinuteBoundary() {
     return static_cast<int64_t>(std::max(1, seconds_to_next)) * 1000;
 }
 
-bool IsNavigationClick(const rawdraw::ButtonEvent& event) {
+// A click that moves the selection has to wait for the panel to catch up: on
+// this 4-colour panel every repaint is a full refresh (~10-25 s), so letting
+// them queue would run the selection far ahead of the glass.
+//
+// BOOT is deliberately not one of these. It is a confirm: it acts on the row
+// that is already selected, so it stays valid while a refresh is in flight.
+// Gating it is what made "press BOOT to enter a sub-option" look dead — the
+// lock armed by the direction key that brought the user into Settings was
+// still held when they pressed BOOT a moment later.
+bool IsSelectionChangeClick(const rawdraw::ButtonEvent& event) {
     return event.type == rawdraw::ButtonEvent::kUpClick ||
-           event.type == rawdraw::ButtonEvent::kDownClick ||
-           event.type == rawdraw::ButtonEvent::kBootClick;
+           event.type == rawdraw::ButtonEvent::kDownClick;
 }
 
 void DrawBatteryIcon(uint8_t* fb, int width, int x, int y, int level, bool vertical) {
@@ -602,9 +610,9 @@ void RawDrawUiManager::ShowPairingCodePage(const std::string& code, int expires_
 // ============================================================
 
 bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
-    const bool navigation_click = IsNavigationClick(event);
-    if (navigation_click && input_refresh_locked_.load(std::memory_order_acquire)) {
-        ESP_LOGI(kTag, "Navigation click ignored until current refresh completes: type=%d", event.type);
+    const bool selection_change = IsSelectionChangeClick(event);
+    if (selection_change && input_refresh_locked_.load(std::memory_order_acquire)) {
+        ESP_LOGI(kTag, "Selection change ignored until current refresh completes: type=%d", event.type);
         return true;
     }
 
@@ -685,7 +693,7 @@ bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
     bool handled = renderer->HandleInput(event);
 
     if (handled) {
-        if (navigation_click) {
+        if (selection_change) {
             input_refresh_locked_.store(true, std::memory_order_release);
         }
         // Re-render the framebuffer with updated state
