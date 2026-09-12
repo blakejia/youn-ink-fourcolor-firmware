@@ -95,7 +95,7 @@ export default function Pages() {
                   <td>{p.name}</td>
                   <td>{p.duration_minutes}</td>
                   <td>{p.order}</td>
-                  <td className="mono">{p.canvas_json ? p.name : p.name}</td>
+                  <td className="mono">{p.md5 || '—'}</td>
                   <td>
                     <button className="btn secondary" onClick={() => startEdit(p)} disabled={!device}>编辑</button>{' '}
                     <button className="btn danger" onClick={() => del(p.name)} disabled={!device}>删除</button>

@@ -34,8 +34,8 @@ def _canvas(label: str) -> dict:
         "children": label}}]}
 
 
-def _make(device: str, name: str, order: int = 0) -> None:
-    canvas = _canvas(name)
+def _make(device: str, name: str, order: int = 0, label: str | None = None) -> None:
+    canvas = _canvas(label or name)
     pages_mod.upsert_page(device, name, canvas, 10, order, render_canvas_to_bitmap(canvas))
 
 
@@ -218,3 +218,40 @@ def test_a_dotdot_device_is_a_400_not_an_escape(client):
                          for p in settings.data_dir.rglob("*") if p.is_file())
     assert files_after == files_before
     assert not (settings.data_dir / "x.json").exists()
+
+
+# ── the md5 an operator sees ───────────────────────────────────────────
+
+def test_the_pages_endpoint_reports_the_md5_the_schedule_advertises(client):
+    """The admin's MD5 column must be the key the device caches the page under.
+
+    Both come from one resolver, so a drift between what an operator reads and
+    what the device is told to fetch is a test failure rather than a mystery.
+    """
+    _register(DEV_A, "a" * 64)
+    r = client.post("/api/pages", json={
+        "device": DEV_A, "name": "listed", "canvas_json": _canvas("x"),
+        "duration_minutes": 10, "order": 0})
+    assert r.status_code == 200
+
+    listed = client.get("/api/pages", params={"device": DEV_A}).json()["pages"][0]
+    advertised = pages_mod.build_schedule_from_disk(DEV_A)[0].md5
+    assert listed["md5"] == advertised
+    assert len(listed["md5"]) == 32
+    assert all(c in "0123456789abcdef" for c in listed["md5"])
+
+
+def test_the_reported_md5_follows_a_new_picture():
+    _make(DEV_A, "changing", order=0)
+    first = pages_mod.page_bitmap_md5(DEV_A, "changing")
+    _make(DEV_A, "changing", order=0, label="v2")
+    second = pages_mod.page_bitmap_md5(DEV_A, "changing")
+    assert first and second and first != second
+
+
+def test_a_page_without_fetchable_bytes_reports_no_md5():
+    """Rather than handing the UI a key whose frame the server cannot serve."""
+    _make(DEV_B, "vanishes", order=0)
+    md5 = pages_mod.page_bitmap_md5(DEV_B, "vanishes")
+    (pages_mod._bitmap_path(md5)).unlink()
+    assert pages_mod.page_bitmap_md5(DEV_B, "vanishes") is None

@@ -4,9 +4,11 @@ Isolate pages/ storage to a per-test temp dir. Uses pydantic-settings'
 mutability to change data_dir on the fly; the settings object is the same
 instance used by the server.
 """
+import logging
 import os
 import shutil
 import tempfile
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import pytest
@@ -40,14 +42,37 @@ def _device_signature_key():
 
 @pytest.fixture(autouse=True)
 def isolate_pages_dir():
-    """Isolate pages/ and uploads/ storage to per-test temp dirs."""
+    """Isolate pages/, uploads/ and the log file to per-test temp dirs.
+
+    The log file needs real work, not just a settings change: the rotating
+    handler is created at import (config._configure_root_logging) and keeps its
+    path, so a test run would append its own `page upserted device=...` lines to
+    the running server's log where they read as live activity. Measured: one
+    suite run added 286 lines to server/data/server.log before this; 27 after,
+    the remainder being import/collection-time logging that happens before an
+    autouse fixture can run.
+    """
     tmp = tempfile.mkdtemp(prefix="pages_test_")
-    orig_data, orig_uploads = settings.data_dir, settings.uploads_dir
+    orig = (settings.data_dir, settings.uploads_dir, settings.log_dir, settings.log_file)
     settings.data_dir = Path(tmp)
     settings.uploads_dir = Path(tmp) / "uploads"
+    settings.log_dir = Path(tmp)
+    settings.log_file = "test.log"
     (Path(tmp) / "pages").mkdir(parents=True, exist_ok=True)
     settings.uploads_dir.mkdir(parents=True, exist_ok=True)
-    yield
-    settings.data_dir = orig_data
-    settings.uploads_dir = orig_uploads
-    shutil.rmtree(tmp, ignore_errors=True)
+
+    redirected: list[tuple[RotatingFileHandler, str]] = []
+    for h in logging.getLogger().handlers:
+        if isinstance(h, RotatingFileHandler):
+            redirected.append((h, h.baseFilename))
+            h.close()                      # drops the stream, so the next emit reopens
+            h.baseFilename = str(Path(tmp) / "test.log")
+    try:
+        yield
+    finally:
+        for h, original in redirected:
+            h.close()
+            h.baseFilename = original
+        (settings.data_dir, settings.uploads_dir,
+         settings.log_dir, settings.log_file) = orig
+        shutil.rmtree(tmp, ignore_errors=True)

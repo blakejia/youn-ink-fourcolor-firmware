@@ -300,23 +300,42 @@ def load_schedule() -> Optional[dict]:
         return None
 
 
+def _resolve_bitmap_md5(device: str, name: str, metas: list[dict]) -> Optional[str]:
+    """The bitmap a page currently draws, or None when its bytes are gone.
+
+    One definition with two callers — the schedule and the admin page listing —
+    so the md5 an operator sees can never drift from the one the device is told
+    to fetch. The bytes must be on disk: the meta can survive a reclaimed .bin
+    (refcount GC drops the .bin through _drop_source_reference, and a lost meta
+    leaves the orphan with no reaper), and advertising that md5 would promise a
+    frame the server cannot serve.
+    """
+    key = _source_key(device, name)
+    candidates = [(m.get("rendered_at", 0), m["md5"]) for m in metas
+                  if key in m.get("sources", [])]
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    md5 = candidates[0][1]
+    if not _bitmap_path(md5).is_file():
+        log.warning("bitmap %s for %s/%s is missing; treating the page as blank",
+                    md5, device, name)
+        return None
+    return md5
+
+
+def page_bitmap_md5(device: str, name: str) -> Optional[str]:
+    """The md5 the device will cache this page under, or None if it has none."""
+    return _resolve_bitmap_md5(device, name, _all_bitmap_metas())
+
+
 def build_schedule_from_disk(device: str) -> list[PageEntry]:
     """Snapshot one device's source pages into schedule entries."""
     out: list[PageEntry] = []
     metas = _all_bitmap_metas()
     for src in _all_page_sources(device):
-        key = _source_key(device, src.name)
-        candidates = [(m.get("rendered_at", 0), m["md5"]) for m in metas
-                      if key in m.get("sources", [])]
-        if not candidates:
-            continue
-        candidates.sort(reverse=True)
-        md5 = candidates[0][1]
-        if not _bitmap_path(md5).is_file():
-            # The meta survived but the bytes are gone (refcount GC drops the
-            # .bin through _drop_source_reference; a lost meta leaves the
-            # orphan with no reaper). Never advertise an unfetchable md5.
-            log.warning("schedule skips %s/%s: bitmap %s missing", device, src.name, md5)
+        md5 = _resolve_bitmap_md5(device, src.name, metas)
+        if md5 is None:
             continue
         out.append(PageEntry(md5=md5, duration_minutes=src.duration_minutes,
                              order=src.order, name=src.name))

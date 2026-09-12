@@ -480,7 +480,10 @@ def create_app() -> FastAPI:
         if not device:
             raise HTTPException(400, "device required")
         _require_known_device(device)
-        out = [s.to_dict() for s in pages_mod.list_pages(device)]
+        # The md5 comes from the same resolution the schedule uses, so the
+        # column an operator reads is the key the device caches the page under.
+        out = [{**s.to_dict(), "md5": pages_mod.page_bitmap_md5(device, s.name)}
+               for s in pages_mod.list_pages(device)]
         return {"pages": out, "count": len(out)}
 
     @app.delete("/api/pages/{name}")
