@@ -542,13 +542,14 @@ git commit -m "feat(web): upload replaces a page's picture, and must name the pa
 **Interfaces:**
 - Consumes: 前四个任务的成果、运行中的服务端（`http://10.0.0.90:9002`）、设备 `NOTE4C-3400FC`（已配对、插电常醒）
 - Produces: 一条证据链：上传 ⇒ 该页 md5 变化 ⇒ 设备拉新位图 ⇒ 屏上出现该图
+- Token: every curl below sends `X-Operator-Token: $OPERATOR_TOKEN` — substitute the value of `OPERATOR_TOKEN` from `server/.env` (untracked; never paste the real value into a tracked file).
 
 - [ ] **Step 1: 建一个一次性页面（不动用户现有页面）**
 
 ```bash
 cd server && ./start.sh status
 curl -s -X POST http://10.0.0.90:9002/api/pages \
-  -H "X-Operator-Token: 962f48a9a67c87e5baaca1f44d764631" \
+  -H "X-Operator-Token: $OPERATOR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"plan-e2e","canvas_json":{"default":[{"type":"div","props":{"tw":"flex flex-col w-full h-full items-center justify-center bg-white","children":[{"type":"div","props":{"tw":"w-full h-full flex items-center justify-center bg-white","children":[{"type":"text","props":{"children":"before"}}]}}]}}]},"duration_minutes":10,"order":90}'
 ```
@@ -562,7 +563,7 @@ python3 -c "
 from PIL import Image
 Image.new('RGB',(1200,900),(20,140,90)).save('/tmp/e2e.png')"
 curl -s -X POST http://10.0.0.90:9002/api/uploads \
-  -H "X-Operator-Token: 962f48a9a67c87e5baaca1f44d764631" \
+  -H "X-Operator-Token: $OPERATOR_TOKEN" \
   -F "page=plan-e2e" -F "image=@/tmp/e2e.png"
 ```
 
@@ -593,7 +594,7 @@ Expected: 出现新 md5 的 `GET /api/pages/bitmap/{新 md5}.bin`。设备日志
 
 ```bash
 curl -s -X DELETE "http://10.0.0.90:9002/api/pages/plan-e2e" \
-  -H "X-Operator-Token: 962f48a9a67c87e5baaca1f44d764631"
+  -H "X-Operator-Token: $OPERATOR_TOKEN"
 git add -A && git commit -m "chore: end-to-end verification notes" --allow-empty
 ```
 
