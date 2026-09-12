@@ -16,16 +16,17 @@ export default function Images() {
     if (!dev) { setPages([]); setPage(''); setErr(''); return; }
     try {
       const p = await api.pages(dev);
+      if (getSelectedDevice() !== dev) return;
       setPages(p || []);
       setErr('');
-    } catch (e) { setErr(e.message); }
+    } catch (e) { if (getSelectedDevice() === dev) setErr(e.message); }
   };
   useEffect(() => {
     const sync = () => { setDevice(getSelectedDevice()); };
     window.addEventListener('device-changed', sync);
     return () => window.removeEventListener('device-changed', sync);
   }, []);
-  useEffect(() => { setPage(''); load(); }, [device]);
+  useEffect(() => { setPage(''); setErr(''); setOk(''); load(); }, [device]);
 
   const onPick = (e) => {
     const f = e.target.files[0];

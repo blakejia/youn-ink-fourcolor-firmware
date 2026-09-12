@@ -21,15 +21,19 @@ export default function Pages() {
   const load = async () => {
     const dev = getSelectedDevice();
     if (!dev) { setPages([]); setErr(''); return; }
-    try { setPages(await api.pages(dev)); setErr(''); }
-    catch (e) { setErr(e.message); }
+    try {
+      const p = await api.pages(dev);
+      if (getSelectedDevice() !== dev) return;
+      setPages(p); setErr('');
+    }
+    catch (e) { if (getSelectedDevice() === dev) setErr(e.message); }
   };
   useEffect(() => {
     const sync = () => { setDevice(getSelectedDevice()); };
     window.addEventListener('device-changed', sync);
     return () => window.removeEventListener('device-changed', sync);
   }, []);
-  useEffect(() => { setEditing(null); load(); }, [device]);
+  useEffect(() => { setEditing(null); setErr(''); setOk(''); load(); }, [device]);
 
   const startNew = () => {
     setEditing({});

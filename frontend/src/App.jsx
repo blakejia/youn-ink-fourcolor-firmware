@@ -12,6 +12,7 @@ import Ota from './pages/Ota.jsx';
 function DeviceSelector() {
   const [devices, setDevices] = useState([]);
   const [selected, setSelected] = useState(getSelectedDevice());
+  const [loadErr, setLoadErr] = useState('');
   useEffect(() => {
     const sync = () => setSelected(getSelectedDevice());
     window.addEventListener('device-changed', sync);
@@ -21,7 +22,12 @@ function DeviceSelector() {
     api.devices().then((ds) => {
       setDevices((ds || []).filter((d) => d.trust));
       setSelected(getSelectedDevice());
-    }).catch(() => {});
+      setLoadErr('');
+    }).catch(() => {
+      setDevices([]);
+      setSelectedDevice('');
+      setLoadErr('设备列表加载失败');
+    });
   }, []);
   return (
     <div className="row" style={{ padding: '0 12px 8px' }}>
@@ -33,6 +39,7 @@ function DeviceSelector() {
           ))}
         </select>
       </label>
+      {loadErr && <div className="err" style={{ fontSize: 12 }}>{loadErr}</div>}
     </div>
   );
 }
