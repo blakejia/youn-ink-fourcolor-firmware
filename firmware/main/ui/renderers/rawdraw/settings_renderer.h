@@ -1,9 +1,14 @@
 /**
  * @file settings_renderer.h
- * @brief Modernized settings page renderer for rawdraw mode
+ * @brief Settings page renderer for rawdraw mode
  *
- * Features: card-based layout with clear sections, chevron indicators
- * for navigation, icon+label+value layout, consistent Style constants.
+ * A two-pane page: a left nav of sections and, on the right, the rows of the
+ * one the cursor is on. Both come from `rust/src/settings.rs`; this file draws
+ * them and reports clicks, it does not decide what the menu holds or where the
+ * cursor may rest.
+ *
+ * The C side supplies only what the device knows: a row's value, a toggle's
+ * state, and what to run when a row is confirmed.
  */
 
 #ifndef RAWDRAW_SETTINGS_RENDERER_H
@@ -21,35 +26,27 @@
 namespace rawdraw {
 
 /**
- * @brief Settings item type
+ * @brief Settings row kind. Mirrors rf_settings_kind_t's intent for drawing:
+ * toggles get a switch, actions a highlighted value, read-outs a plain value.
  */
 enum class SettingsItemType {
-    Normal,    ///< Navigable item with chevron indicator
+    Normal,    ///< Read-out: label left, value right
     Checkbox,  ///< Toggleable checkbox
     Action,    ///< Action button (highlighted style)
-    Section,   ///< Section header (non-interactive label)
 };
 
 /**
- * @brief Settings item definition
+ * @brief One row as the drawing code wants it
  */
 struct SettingsItemDef {
     std::string label;
     std::string value;
-    const char* icon = nullptr;             ///< font_zectrix icon code
     SettingsItemType type = SettingsItemType::Normal;
     bool checked = false;
-    std::function<void()> on_click;
 };
 
 /**
- * @brief Modernized settings page renderer
- *
- * Card-based layout with:
- * - Compact icon + label + value rows
- * - Single outer card per option
- * - Inverted selected state
- * - Checkbox/Action variants
+ * @brief Settings page renderer
  */
 class SettingsRenderer : public PageRenderer {
 public:
@@ -61,162 +58,33 @@ public:
     void Render(uint8_t* fb, int width, int height) override;
     bool HandleInput(const ButtonEvent& event) override;
 
-    // Data interface. The menu's shape and navigation come from
-    // `rust/src/settings.rs`; the C side supplies only what the device knows:
-    // a row's value, a toggle's state, and what to run when a row is confirmed.
+    // Data interface
+    /// Fill a row's value (SSID, IP, RSSI, reachability, action hints).
     void SetItemValue(uint8_t id, const std::string& value);
+    /// Set a toggle's state.
     void SetItemChecked(uint8_t id, bool checked);
+    /// Run what the menu asked for; the application owns the effects.
     void SetItemHandler(std::function<void(uint8_t id, bool toggle)> handler) {
         item_handler_ = std::move(handler);
     }
-    /// Which section the cursor is on; the about panel is drawn when the
-    /// current section has no rows of its own.
+    /// Which section the cursor is on.
     uint8_t GetFocusedSection() const { return section_; }
 
-    // Debug info
-    void ShowDebugInfo();
     void SetFirmwareVersion(const char* version) { firmware_version_ = version; }
     void SetDeviceInfo(const char* mac, const char* chip) {
         mac_address_ = mac;
         chip_model_ = chip;
     }
-    void ShowVolumeDialog(int volume);
-    void SetVolumeDialogHandler(std::function<void(int, bool)> handler) {
-        volume_dialog_handler_ = std::move(handler);
-    }
-    void ShowCategoryHint(int duration_ms = 2000);
-    bool IsCategoryHintVisible() const;
-
-    // About dialog
-    void ShowAboutDialog() { showing_about_dialog_ = true; needs_full_refresh_ = true; }
-    void HideAboutDialog() { showing_about_dialog_ = false; needs_full_refresh_ = true; }
-    bool IsAboutDialogShowing() const { return showing_about_dialog_; }
-
-    // Storage dialog
-    void ShowStorageDialog(const std::string& used, const std::string& total,
-                           int photos, int txts) {
-        storage_used_ = used;
-        storage_total_ = total;
-        storage_photos_ = photos;
-        storage_txts_ = txts;
-        showing_storage_dialog_ = true;
-        needs_full_refresh_ = true;
-    }
-    void HideStorageDialog() { showing_storage_dialog_ = false; needs_full_refresh_ = true; }
-    bool IsStorageDialogShowing() const { return showing_storage_dialog_; }
-
-    // Server address dialog
-    void ShowServerDialog(const std::string& current_addr,
-                          const std::string& local_addr,
-                          const std::string& remote_addr) {
-        server_current_addr_ = current_addr;
-        server_local_addr_ = local_addr;
-        server_remote_addr_ = remote_addr;
-        server_selected_ = (current_addr == remote_addr) ? 1 : 0;
-        showing_server_dialog_ = true;
-        needs_full_refresh_ = true;
-    }
-    void HideServerDialog() { showing_server_dialog_ = false; needs_full_refresh_ = true; }
-    bool IsServerDialogShowing() const { return showing_server_dialog_; }
-    int GetServerDialogSelection() const { return server_selected_; }
-    void SetServerDialogHandler(std::function<void(int)> handler) {
-        server_dialog_handler_ = std::move(handler);
-    }
-
-    // Server address list dialog (scrollable list of history addresses)
-    void ShowServerListDialog(const std::vector<std::string>& addresses,
-                              const std::string& current_addr) {
-        server_list_addresses_ = addresses;
-        server_list_current_ = current_addr;
-        server_list_selected_ = 0;
-        server_list_scroll_offset_ = 0;
-        // Find current address index
-        for (size_t i = 0; i < addresses.size(); ++i) {
-            if (addresses[i] == current_addr) {
-                server_list_selected_ = static_cast<int>(i);
-                break;
-            }
-        }
-        showing_server_list_dialog_ = true;
-        needs_full_refresh_ = true;
-    }
-    void HideServerListDialog() { showing_server_list_dialog_ = false; needs_full_refresh_ = true; }
-    bool IsServerListDialogShowing() const { return showing_server_list_dialog_; }
-    std::string GetServerListSelection() const {
-        if (server_list_selected_ >= 0 && 
-            server_list_selected_ < static_cast<int>(server_list_addresses_.size())) {
-            return server_list_addresses_[server_list_selected_];
-        }
-        return "";
-    }
-    void SetServerListDialogHandler(std::function<void(const std::string&)> handler) {
-        server_list_dialog_handler_ = std::move(handler);
-    }
-
-    void ShowThemeDialog(rawdraw::ThemeId current_theme) {
-        theme_selected_ = 0;
-        for (int i = 0; i < rawdraw::ThemeManager::ThemeCount(); ++i) {
-            if (rawdraw::ThemeManager::ThemeAt(i) == current_theme) {
-                theme_selected_ = i;
-                break;
-            }
-        }
-        showing_theme_dialog_ = true;
-        needs_full_refresh_ = true;
-    }
-    void HideThemeDialog() { showing_theme_dialog_ = false; needs_full_refresh_ = true; }
-    bool IsThemeDialogShowing() const { return showing_theme_dialog_; }
-    void SetThemeDialogHandler(std::function<void(rawdraw::ThemeId)> handler) {
-        theme_dialog_handler_ = std::move(handler);
-    }
-
-    // OTA firmware update dialog
-    void ShowOtaDialog(const std::vector<std::string>& versions,
-                       const std::string& current_version,
-                       int selected_index,
-                       int progress_percent,
-                       const std::string& status_text,
-                       int state);
-    void HideOtaDialog() { showing_ota_dialog_ = false; needs_full_refresh_ = true; }
-    bool IsOtaDialogShowing() const { return showing_ota_dialog_; }
-    void SetOtaDialogHandler(std::function<void(int, bool, bool)> handler) {
-        ota_dialog_handler_ = std::move(handler);
-    }
 
 private:
-    // Layout computed from Style constants
     /// Ask the model what the current section holds and mirror it into
-    /// `items_`, so the drawing code below stays a pure function of that view.
+    /// `items_`, so the drawing below stays a pure function of that view.
     void SyncItemsFromModel();
     std::string ValueFor(uint8_t id) const;
-    void DrawSelectedBackground(uint8_t* fb, int width, int x, int y, int w, int h) const;
 
-    // Render a single settings item as a card row
+    /// Render a single settings item as a card row
     void RenderItem(uint8_t* fb, int width, int y, int content_left,
                     int index, bool selected, int row_h);
-
-    // Get checkbox icon code
-    const char* GetCheckboxIcon(bool checked) const;
-
-    // Chevron right icon
-    void DrawChevron(uint8_t* fb, int width, int x, int y, int size, Color color);
-
-    // Draw debug info section
-    void RenderDebugInfo(uint8_t* fb, int width, int height, int bottom_y);
-
-    // Draw version info bar at bottom of settings page
-    void RenderVersionBar(uint8_t* fb, int width, int height, int y);
-
-    // Draw about dialog overlay
-    void RenderAboutDialog(uint8_t* fb, int width, int height);
-    void RenderVolumeDialog(uint8_t* fb, int width, int height);
-    void RenderStorageDialog(uint8_t* fb, int width, int height);
-    void RenderServerDialog(uint8_t* fb, int width, int height);
-    void RenderServerListDialog(uint8_t* fb, int width, int height);
-    void RenderThemeDialog(uint8_t* fb, int width, int height);
-    void RenderOtaDialog(uint8_t* fb, int width, int height);
-    void RenderOtaConfirmDialog(uint8_t* fb, int width, int height);  // OTA 确认弹窗
-    void UpdateVolumeValue(int delta, bool commit);
 
     /// The current section's rows, rebuilt from the model on every render.
     std::vector<SettingsItemDef> items_;
@@ -227,77 +95,17 @@ private:
     std::map<uint8_t, bool> checks_;
     std::function<void(uint8_t, bool)> item_handler_;
 
-    // Debug info state
-    bool showing_debug_info_ = false;
-    int64_t debug_hint_until_us_ = 0;  // timestamp when hint expires
-    int64_t category_hint_until_us_ = 0;  // bottom category hint auto-hide timestamp
     std::string firmware_version_;
     std::string mac_address_;
     std::string chip_model_;
-
-    // About dialog state
-    bool showing_about_dialog_ = false;
-    bool showing_volume_dialog_ = false;
-    bool showing_storage_dialog_ = false;
-    int volume_dialog_value_ = 70;
-    std::function<void(int, bool)> volume_dialog_handler_;
-
-    // Storage dialog state
-    std::string storage_used_;
-    std::string storage_total_;
-    int storage_photos_ = 0;
-    int storage_txts_ = 0;
-
-    // Server dialog state
-    bool showing_server_dialog_ = false;
-    std::string server_current_addr_;
-    std::string server_local_addr_;
-    std::string server_remote_addr_;
-    int server_selected_ = 0;  // 0=local, 1=remote
-    std::function<void(int)> server_dialog_handler_;
-
-    // Server list dialog state (scrollable list of history addresses)
-    bool showing_server_list_dialog_ = false;
-    std::vector<std::string> server_list_addresses_;
-    std::string server_list_current_;
-    int server_list_selected_ = 0;
-    int server_list_scroll_offset_ = 0;
-    std::function<void(const std::string&)> server_list_dialog_handler_;
-
-    bool showing_theme_dialog_ = false;
-    int theme_selected_ = 0;
-    std::function<void(rawdraw::ThemeId)> theme_dialog_handler_;
-    static constexpr int kServerListVisibleRows = 5;  // Max visible rows in list
-
-    // OTA dialog state
-    bool showing_ota_dialog_ = false;
-    std::vector<std::string> ota_versions_;
-    std::string ota_current_version_;
-    int ota_selected_index_ = 0;
-    int ota_progress_percent_ = 0;
-    std::string ota_status_text_;
-    int ota_state_ = 0;
-    std::function<void(int, bool, bool)> ota_dialog_handler_;
-    static constexpr int kOtaVisibleRows = 4;
-
-    // OTA confirm dialog state (弹窗确认固件更新)
-    bool showing_ota_confirm_dialog_ = false;
-    int ota_confirm_selected_ = 0;  // 0=确认更新, 1=取消
-    std::string ota_confirm_firmware_name_;  // 待更新的固件名称
 
     const lv_font_t* font_ = nullptr;
     const lv_font_t* title_font_ = nullptr;
     const lv_font_t* icon_font_ = nullptr;
     const lv_font_t* value_font_ = nullptr;
 
-    // Layout constants derived from Style
-    static constexpr int kTitleBarH = 28;      // Title bar height
-    static constexpr int kItemPadding = Style::kSpacingXS + 1;
-    static constexpr int kIconSize = Style::kFontSizeSM;       // 16px
-    static constexpr int kItemMinHeight = 30;
-    // Right pane capacity: 8 compact option rows fit the 400x300 e-paper page.
-    // Keep this as the only scroll-window threshold so future settings rows
-    // can be added without hunting through the renderer.
+    // Right pane capacity: how many rows were once shown at a time. Kept as the
+    // single scroll-window threshold so rows can be added without hunting.
     static constexpr int kVisibleOptionCount = 8;
 };
 
