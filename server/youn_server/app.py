@@ -72,11 +72,6 @@ from .session import Session, SessionManager
 
 log = logging.getLogger(__name__)
 
-# Panel geometry for upload normalization: the same 400x300 panel the
-# renderer and image_conv use, kept aliased so there is one truth.
-PANEL_WIDTH = image_conv.SCREEN_W
-PANEL_HEIGHT = image_conv.SCREEN_H
-
 
 # ── operator auth (HTTP only) ─────────────────────────────────────────
 _OPERATOR_TOKEN = secrets.compare_digest  # type: ignore[attr-defined]
@@ -667,6 +662,11 @@ def create_app() -> FastAPI:
             raise ValueError(f"invalid upload id: {upload_id!r}")
         return (settings.uploads_dir / f"{upload_id}.png",
                 settings.uploads_dir / f"{upload_id}.src.png")
+
+    # Constants are local: Task 3 deletes image_conv.py, which the scalar
+    # aliases in this file's neighbours came from.
+    PANEL_WIDTH = 400
+    PANEL_HEIGHT = 300
 
     def _normalize_upload(data: bytes) -> bytes:
         """Fit the picture inside the panel, letterboxed on white.
