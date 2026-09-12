@@ -40,25 +40,25 @@ export const api = {
     const res = await request('/pages/preview', { method: 'POST', body: { canvas_json: canvasJson } });
     return res.blob();
   },
-  images: async () => (await request('/images')).images ?? [],
-  uploadImage: async (file, format, title, targetDeviceId) => {
+  uploadToPage: async (file, page) => {
     const fd = new FormData();
     fd.append('image', file);
-    fd.append('format', format);
-    if (title) fd.append('title', title);
-    if (targetDeviceId) fd.append('target_device_id', targetDeviceId);
+    fd.append('page', page);
     const headers = {};
     const token = getToken();
     if (token) headers['X-Operator-Token'] = token;
-    const res = await fetch(`${BASE}/images`, { method: 'POST', body: fd, headers });
+    const res = await fetch(`${BASE}/uploads`, { method: 'POST', body: fd, headers });
     if (!res.ok) {
       let d = res.statusText;
-      try { d = (await res.json()).detail || d; } catch (e) {}
+      try {
+        const body = await res.json();
+        d = (body.detail && body.detail.detail) || body.detail || d;
+        if (body.detail && body.detail.pages) d += `（可选页面：${body.detail.pages.join('、')}）`;
+      } catch (e) {}
       throw new Error(d);
     }
     return res.json();
   },
-  deleteImage: (id) => request(`/images/${id}`, { method: 'DELETE' }),
   otaCheck: async () => {
     // operator view of latest firmware (device-facing /ota/check needs Bearer)
     const j = await request('/ota');

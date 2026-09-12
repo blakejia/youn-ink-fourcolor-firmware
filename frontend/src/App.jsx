@@ -17,7 +17,7 @@ function Layout({ children }) {
         <nav>
           <Link to="/devices">设备管理</Link>
           <Link to="/pages">页组管理</Link>
-          <Link to="/images">图片推送</Link>
+          <Link to="/images">替换页面画面</Link>
           <Link to="/ota">OTA</Link>
         </nav>
         <button className="btn logout" onClick={logout}>退出</button>
