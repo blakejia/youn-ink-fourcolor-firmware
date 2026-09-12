@@ -153,17 +153,23 @@ def test_uploads_scheme_renders_the_stored_image():
     from youn_server.config import settings
     up_id = "a" * 32
     _write_upload(up_id)
+    # The img carries an explicit size, the way real pages do; an unsized img
+    # measures 0x0 (_measure_node) and pastes a single pixel.
     canvas = {"default": [{"type": "div", "props": {
         "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
-        "children": [{"type": "img", "props": {"src": f"uploads://{up_id}"}}]}}]}
+        "children": [{"type": "img", "props": {
+            "src": f"uploads://{up_id}",
+            "style": {"width": "400px", "height": "300px"}}}]}}]}
     bitmap = render_canvas_to_bitmap(canvas)
     assert len(bitmap) == 30000
 
     blank = {"default": [{"type": "div", "props": {
         "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
         "children": []}}]}
-    # A red picture must differ from an empty white canvas.
-    assert bitmap != render_canvas_to_bitmap(blank)
+    # A red picture must cover the page, not paste one pixel: a 1-pixel render
+    # changes exactly one byte of the 30000-byte frame.
+    differing = sum(a != b for a, b in zip(bitmap, render_canvas_to_bitmap(blank)))
+    assert differing > 25000
 
 
 def test_uploads_scheme_rejects_an_id_that_could_escape_the_directory():

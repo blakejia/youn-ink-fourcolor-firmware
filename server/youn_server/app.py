@@ -676,10 +676,17 @@ def create_app() -> FastAPI:
         again at render time, anything smaller would sit tiny in the middle.
         """
         img = Image.open(io.BytesIO(data))
-        img.load()
+        # Dimensions are known after open(); check the cap before load() so a
+        # huge PNG is rejected without decoding it into memory.
         if img.width * img.height > _UPLOAD_MAX_PIXELS:
             raise ValueError(f"image too large: {img.width}x{img.height}")
-        if img.mode not in ("RGB", "L"):
+        img.load()
+        if "A" in img.getbands() or "transparency" in img.info:
+            # Composite alpha onto white: convert("RGB") alone would paint
+            # transparent pixels black, contradicting the white letterbox.
+            base = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(base, img.convert("RGBA")).convert("RGB")
+        elif img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
         scale = min(PANEL_WIDTH / img.width, PANEL_HEIGHT / img.height, 1.0)
         nw, nh = max(1, int(img.width * scale)), max(1, int(img.height * scale))
@@ -691,12 +698,20 @@ def create_app() -> FastAPI:
         return out.getvalue()
 
     def _canvas_for_upload(upload_id: str) -> dict:
-        """One contain-fitted image. The renderer centres and letterboxes on its
-        own; `tw` is the same dialect the existing pages use."""
+        """One contain-fitted image, drawn at panel size.
+
+        The renderer sizes a node from its own `w-[Npx]`/`h-[Npx]` tw token or
+        its `style.width/height` — `w-full`/`h-full` are not parsed and an
+        unsized img measures 0x0, which pastes a single pixel. So the img gets
+        the same explicit `style` the existing pages use
+        (`server/data/pages/logo-1024.json`). The stored file is already
+        panel-sized and letterboxed on white, so this draws 1:1."""
         return {"default": [{"type": "div", "props": {
             "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
             "children": [{"type": "img",
-                          "props": {"src": f"uploads://{upload_id}"}}]}}]}
+                          "props": {"src": f"uploads://{upload_id}",
+                                    "style": {"width": f"{PANEL_WIDTH}px",
+                                              "height": f"{PANEL_HEIGHT}px"}}}]}}]}
 
     @app.post("/api/uploads")
     async def upload_to_page(
@@ -707,7 +722,8 @@ def create_app() -> FastAPI:
         _require_operator(request)
 
         page = page.strip()
-        existing = [s.name for s in pages_mod.list_pages()]
+        sources = pages_mod.list_pages()
+        existing = [s.name for s in sources]
         if not page or page not in existing:
             raise HTTPException(400, detail={
                 "detail": "unknown page: uploads must name a page to replace",
@@ -722,7 +738,9 @@ def create_app() -> FastAPI:
         except Exception as e:  # noqa: BLE001
             raise HTTPException(400, f"not a usable image: {e}") from e
 
-        source = next(s for s in pages_mod.list_pages() if s.name == page)
+        # Same snapshot as the validation above: re-scanning here could lose the
+        # page to a concurrent delete and raise StopIteration (a 500).
+        source = next(s for s in sources if s.name == page)
         upload_id = secrets.token_hex(16)
         settings.uploads_dir.mkdir(parents=True, exist_ok=True)
         norm_path, orig_path = _upload_paths(upload_id)
