@@ -27,6 +27,7 @@ import os
 import io
 import json
 import logging
+import re
 import secrets
 import time
 from dataclasses import asdict
@@ -50,6 +51,7 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel
+from PIL import Image
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.responses import Response
 
@@ -69,6 +71,11 @@ from .devices import Device, registry
 from .session import Session, SessionManager
 
 log = logging.getLogger(__name__)
+
+# Panel geometry for upload normalization: the same 400x300 panel the
+# renderer and image_conv use, kept aliased so there is one truth.
+PANEL_WIDTH = image_conv.SCREEN_W
+PANEL_HEIGHT = image_conv.SCREEN_H
 
 
 # ── operator auth (HTTP only) ─────────────────────────────────────────
@@ -650,6 +657,89 @@ def create_app() -> FastAPI:
             media_type="application/octet-stream",
             headers={"Cache-Control": "public, max-age=31536000, immutable"},
         )
+
+    # ── upload → page binding ────────────────────────────────────────
+    _UPLOAD_ID_RE = re.compile(r"[0-9a-f]{32}")
+    _UPLOAD_MAX_PIXELS = 4000 * 4000
+
+    def _upload_paths(upload_id: str) -> tuple[Path, Path]:
+        if not _UPLOAD_ID_RE.fullmatch(upload_id):
+            raise ValueError(f"invalid upload id: {upload_id!r}")
+        return (settings.uploads_dir / f"{upload_id}.png",
+                settings.uploads_dir / f"{upload_id}.src.png")
+
+    def _normalize_upload(data: bytes) -> bytes:
+        """Fit the picture inside the panel, letterboxed on white.
+
+        The renderer never upscales (`min(box/iw, 1.0)`), so the stored file has
+        to be the size the page will draw: anything larger would be scaled down
+        again at render time, anything smaller would sit tiny in the middle.
+        """
+        img = Image.open(io.BytesIO(data))
+        img.load()
+        if img.width * img.height > _UPLOAD_MAX_PIXELS:
+            raise ValueError(f"image too large: {img.width}x{img.height}")
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        scale = min(PANEL_WIDTH / img.width, PANEL_HEIGHT / img.height, 1.0)
+        nw, nh = max(1, int(img.width * scale)), max(1, int(img.height * scale))
+        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+        sheet = Image.new("RGB", (PANEL_WIDTH, PANEL_HEIGHT), (255, 255, 255))
+        sheet.paste(img, ((PANEL_WIDTH - nw) // 2, (PANEL_HEIGHT - nh) // 2))
+        out = io.BytesIO()
+        sheet.save(out, format="PNG")
+        return out.getvalue()
+
+    def _canvas_for_upload(upload_id: str) -> dict:
+        """One contain-fitted image. The renderer centres and letterboxes on its
+        own; `tw` is the same dialect the existing pages use."""
+        return {"default": [{"type": "div", "props": {
+            "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
+            "children": [{"type": "img",
+                          "props": {"src": f"uploads://{upload_id}"}}]}}]}
+
+    @app.post("/api/uploads")
+    async def upload_to_page(
+        request: Request,
+        image: UploadFile = File(...),
+        page: str = Form(""),
+    ) -> dict:
+        _require_operator(request)
+
+        page = page.strip()
+        existing = [s.name for s in pages_mod.list_pages()]
+        if not page or page not in existing:
+            raise HTTPException(400, detail={
+                "detail": "unknown page: uploads must name a page to replace",
+                "pages": existing,
+            })
+
+        data = await image.read()
+        if len(data) > 25 * 1024 * 1024:
+            raise HTTPException(400, "image too large")
+        try:
+            normalized = _normalize_upload(data)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, f"not a usable image: {e}") from e
+
+        source = next(s for s in pages_mod.list_pages() if s.name == page)
+        upload_id = secrets.token_hex(16)
+        settings.uploads_dir.mkdir(parents=True, exist_ok=True)
+        norm_path, orig_path = _upload_paths(upload_id)
+        orig_path.write_bytes(data)          # keep the original for re-cropping
+        norm_path.write_bytes(normalized)    # what the canvas will draw
+
+        canvas_json = _canvas_for_upload(upload_id)
+        try:
+            bitmap = render_canvas_to_bitmap(canvas_json)
+        except RenderError as e:
+            raise HTTPException(400, f"render failed: {e.path}: {e.message}") from e
+        entry = pages_mod.upsert_page(page, canvas_json, source.duration_minutes,
+                                      source.order, bitmap)
+        log.info("upload bound page=%s md5=%s upload=%s", page, entry.md5, upload_id)
+        # PageEntry.to_dict() yields md5/duration_minutes/order/name; the caller
+        # asked in terms of a page, so say `page` as well.
+        return {"page": page, **entry.to_dict()}
 
     # ── WebSocket ──
     @app.websocket("/ws")
