@@ -12,8 +12,21 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from youn_server.app import create_app
+from youn_server.app import create_app, registry
 from youn_server import pages as pages_mod
+
+DEV = "NOTE4C-SCHED"
+_TOKEN = "s" * 64
+
+
+def _register() -> None:
+    registry.upsert(DEV, "NOTE4C", ip_address="127.0.0.1")
+    registry.approve(DEV)
+    registry.set_token(DEV, _TOKEN)
+
+
+def _auth() -> dict:
+    return {"Authorization": "Bearer " + _TOKEN}
 
 
 @pytest.fixture(scope="module")
@@ -24,7 +37,8 @@ def client():
 
 
 def test_schedule_empty(client):
-    r = client.get("/api/pages/schedule")
+    _register()
+    r = client.get("/api/pages/schedule", headers=_auth())
     assert r.status_code == 200
     body = r.json()
     assert body["pages"] == []
@@ -34,7 +48,9 @@ def test_schedule_empty(client):
 
 
 def test_schedule_md5_changes_with_content(client):
+    _register()
     body = {
+        "device": DEV,
         "name": "p1",
         "canvas_json": {"default": [{"type": "div", "props": {
             "tw": "bg-white",
@@ -46,33 +62,35 @@ def test_schedule_md5_changes_with_content(client):
     }
     r1 = client.post("/api/pages", json=body)
     assert r1.status_code == 200
-    r2 = client.get("/api/pages/schedule")
+    r2 = client.get("/api/pages/schedule", headers=_auth())
     assert r2.status_code == 200
     md5_a = r2.json()["schedule_md5"]
 
     # Same page name, same content → same md5 (dedup works)
     r3 = client.post("/api/pages", json=body)
     assert r3.status_code == 200
-    r4 = client.get("/api/pages/schedule")
+    r4 = client.get("/api/pages/schedule", headers=_auth())
     assert r4.json()["schedule_md5"] == md5_a
 
     # Different content → different schedule md5
     body["canvas_json"]["default"][0]["props"]["children"] = "B"
     r5 = client.post("/api/pages", json=body)
     assert r5.status_code == 200
-    r6 = client.get("/api/pages/schedule")
+    r6 = client.get("/api/pages/schedule", headers=_auth())
     assert r6.json()["schedule_md5"] != md5_a
 
     # Different duration → different schedule md5
     body["duration_minutes"] = 20
     r7 = client.post("/api/pages", json=body)
     assert r7.status_code == 200
-    r8 = client.get("/api/pages/schedule")
+    r8 = client.get("/api/pages/schedule", headers=_auth())
     assert r8.json()["schedule_md5"] != r6.json()["schedule_md5"]
 
 
 def test_bitmap_endpoint(client):
+    _register()
     body = {
+        "device": DEV,
         "name": "p2",
         "canvas_json": {"default": [{"type": "div", "props": {"tw": "bg-white", "children": "x"}}]},
         "duration_minutes": 10,
@@ -92,7 +110,9 @@ def test_bitmap_endpoint(client):
 
 
 def test_delete_page_cleans_bitmap(client):
+    _register()
     body = {
+        "device": DEV,
         "name": "p3",
         "canvas_json": {"default": [{"type": "div", "props": {"tw": "bg-black", "children": "x"}}]},
         "duration_minutes": 10,
@@ -102,7 +122,7 @@ def test_delete_page_cleans_bitmap(client):
     entry = r1.json()
     md5 = entry["md5"]
 
-    r2 = client.delete("/api/pages/p3")
+    r2 = client.delete("/api/pages/p3", params={"device": DEV})
     assert r2.status_code == 200
 
     r3 = client.get(f"/api/pages/bitmap/{md5}.bin")
@@ -110,7 +130,9 @@ def test_delete_page_cleans_bitmap(client):
 
 
 def test_min_duration_validation(client):
+    _register()
     body = {
+        "device": DEV,
         "name": "p4",
         "canvas_json": {"default": []},
         "duration_minutes": 1,
@@ -122,7 +144,9 @@ def test_min_duration_validation(client):
 
 
 def test_render_error_returns_400_with_path(client):
+    _register()
     body = {
+        "device": DEV,
         "name": "bad",
         "canvas_json": {"default": [{"type": "button", "props": {"children": "x"}}]},
         "duration_minutes": 10,
@@ -136,14 +160,16 @@ def test_render_error_returns_400_with_path(client):
 
 
 def test_screen_active_is_bool(client):
-    r = client.get("/api/pages/schedule")
+    _register()
+    r = client.get("/api/pages/schedule", headers=_auth())
     assert r.status_code == 200
     body = r.json()
     assert isinstance(body["screen_active"], bool)
 
 
 def test_policy_matches_config(client):
-    r = client.get("/api/pages/schedule")
+    _register()
+    r = client.get("/api/pages/schedule", headers=_auth())
     assert r.status_code == 200
     body = r.json()
     policy = body["policy"]
@@ -178,7 +204,8 @@ def test_schedule_position_single_page_and_empty():
 
 def test_schedule_empty_reports_position_for_no_pages(client):
     """空排期的端点契约：第 0 页、无下次翻页（None，不是 0）。"""
-    body = client.get("/api/pages/schedule").json()
+    _register()
+    body = client.get("/api/pages/schedule", headers=_auth()).json()
     assert body["current_index"] == 0
     assert body["seconds_until_next_page"] is None
 
@@ -189,12 +216,13 @@ def test_schedule_position_clamps_zero_duration():
     assert pages_mod.schedule_position(entries, 0) == (0, 60)
     assert pages_mod.schedule_position(entries, 60) == (1, 300)
 
-
 def test_schedule_md5_does_not_move_with_the_clock(client, monkeypatch):
     """设备缓存靠 md5 相等短路；位置字段一旦混进摘要，缓存会被时间推进不停击穿。"""
     # 时长必须 >= policy 下限 10，否则保存被 400 拒绝（§3.2 的契约）。
+    _register()
     for i, mins in enumerate((20, 10)):          # cycle = 1800 s，翻页点在 1200 s
         r = client.post("/api/pages", json={
+            "device": DEV,
             "name": f"clock{i}",
             "canvas_json": {"default": [{"type": "div", "props": {
                 "tw": "bg-white", "style": {"color": "#000000"}, "children": "x",
@@ -205,9 +233,9 @@ def test_schedule_md5_does_not_move_with_the_clock(client, monkeypatch):
 
     # 1_000_000 % 1800 == 1000 -> 第 0 页；1_000_600 % 1800 == 1600 -> 已跨过 1200 翻页点
     monkeypatch.setattr("youn_server.app.time.time", lambda: 1_000_000.0)
-    a = client.get("/api/pages/schedule").json()
+    a = client.get("/api/pages/schedule", headers=_auth()).json()
     monkeypatch.setattr("youn_server.app.time.time", lambda: 1_000_600.0)  # 10 分钟后
-    b = client.get("/api/pages/schedule").json()
+    b = client.get("/api/pages/schedule", headers=_auth()).json()
 
     assert a["schedule_md5"] == b["schedule_md5"], "摘要不随时间推进而变"
     assert a["current_index"] == 0 and b["current_index"] == 1, "位置必须跟着走"

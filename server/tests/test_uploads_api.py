@@ -16,9 +16,22 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from youn_server.app import create_app
+from youn_server.app import create_app, registry
 from youn_server.config import settings
 from youn_server import pages as pages_mod
+
+DEV = "NOTE4C-UPLOAD"
+_TOKEN = "u" * 64
+
+
+def _register() -> None:
+    registry.upsert(DEV, "NOTE4C", ip_address="127.0.0.1")
+    registry.approve(DEV)
+    registry.set_token(DEV, _TOKEN)
+
+
+def _auth() -> dict:
+    return {"Authorization": "Bearer " + _TOKEN}
 
 
 @pytest.fixture(scope="module")
@@ -64,11 +77,11 @@ def _make_page(name: str = "test-upload-page",
                duration_minutes: int = 10, order: int = 3) -> None:
     canvas = _canvas()
     bitmap = pages_mod_render(canvas)
-    pages_mod.upsert_page(name, canvas, duration_minutes, order, bitmap)
+    pages_mod.upsert_page(DEV, name, canvas, duration_minutes, order, bitmap)
 
 
 def _page_source(name: str):
-    for s in pages_mod.list_pages():
+    for s in pages_mod.list_pages(DEV):
         if s.name == name:
             return s
     return None
@@ -76,28 +89,29 @@ def _page_source(name: str):
 
 def _schedule_md5_of(client, name: str) -> str:
     """Which bitmap the device is currently pointed at for this page."""
-    for p in client.get("/api/pages/schedule").json()["pages"]:
+    for p in client.get("/api/pages/schedule", headers=_auth()).json()["pages"]:
         if p["name"] == name:
             return p["md5"]
     raise AssertionError(f"{name} is not in the schedule")
 
 
 def test_upload_without_a_page_is_refused(client):
-    before = {s.name for s in pages_mod.list_pages()}
+    before = {s.name for s in pages_mod.list_pages(DEV)}
     files_before = _upload_dir_files()
     r = client.post("/api/uploads", files={"image": ("a.png", _png(), "image/png")})
     assert r.status_code == 400
-    assert {s.name for s in pages_mod.list_pages()} == before
+    assert {s.name for s in pages_mod.list_pages(DEV)} == before
     # Refused before anything was written to disk.
     assert _upload_dir_files() == files_before
 
 
 def test_upload_to_an_unknown_page_lists_the_pages_you_could_have_meant(client):
+    _register()
     _make_page("test-upload-known")
     files_before = _upload_dir_files()
     r = client.post("/api/uploads",
                     files={"image": ("a.png", _png(), "image/png")},
-                    data={"page": "no-such-page"})
+                    data={"device": DEV, "page": "no-such-page"})
     assert r.status_code == 400
     assert "test-upload-known" in r.json()["detail"]["pages"]
     # Refused before anything was written to disk.
@@ -107,6 +121,7 @@ def test_upload_to_an_unknown_page_lists_the_pages_you_could_have_meant(client):
 def test_upload_replaces_the_picture_but_not_the_page_identity(client):
     # Distinctive identity on the target, different values on a decoy page:
     # an endpoint that invents constants or grabs the wrong page fails here.
+    _register()
     _make_page("test-upload-target", duration_minutes=17, order=42)
     _make_page("test-upload-other", duration_minutes=5, order=1)
     target_before = _page_source("test-upload-target")
@@ -115,7 +130,7 @@ def test_upload_replaces_the_picture_but_not_the_page_identity(client):
 
     r = client.post("/api/uploads",
                     files={"image": ("a.png", _png(), "image/png")},
-                    data={"page": "test-upload-target"})
+                    data={"device": DEV, "page": "test-upload-target"})
     assert r.status_code == 200
     body = r.json()
     assert body["page"] == "test-upload-target"
@@ -149,14 +164,15 @@ def test_upload_replaces_the_picture_but_not_the_page_identity(client):
 
 
 def test_two_uploads_to_one_page_do_not_create_a_second_page(client):
+    _register()
     _make_page("test-upload-twice")
-    n0 = len(pages_mod.list_pages())
+    n0 = len(pages_mod.list_pages(DEV))
     for _ in range(2):
         r = client.post("/api/uploads",
                         files={"image": ("a.png", _png(), "image/png")},
-                        data={"page": "test-upload-twice"})
+                        data={"device": DEV, "page": "test-upload-twice"})
         assert r.status_code == 200
-    assert len(pages_mod.list_pages()) == n0
+    assert len(pages_mod.list_pages(DEV)) == n0
 
 
 def test_replacing_a_page_twice_in_one_second_points_schedule_at_newest(client, monkeypatch):
@@ -166,6 +182,7 @@ def test_replacing_a_page_twice_in_one_second_points_schedule_at_newest(client, 
     # device at the superseded bitmap — unless a page belongs to exactly one
     # bitmap.
     name = "test-upload-samesec"
+    _register()
     _make_page(name)
     frame_a = bytes(i % 256 for i in range(30000))
     frame_b = frame_a[:-1] + bytes([(frame_a[-1] + 1) % 256])
@@ -181,33 +198,35 @@ def test_replacing_a_page_twice_in_one_second_points_schedule_at_newest(client, 
     frozen = int(time.time()) + 60
     with monkeypatch.context() as m:
         m.setattr(pages_mod.time, "time", lambda: frozen)
-        pages_mod.upsert_page(name, _canvas(), 10, 3, first)
-        pages_mod.upsert_page(name, _canvas(), 10, 3, second)
+        pages_mod.upsert_page(DEV, name, _canvas(), 10, 3, first)
+        pages_mod.upsert_page(DEV, name, _canvas(), 10, 3, second)
 
     assert _schedule_md5_of(client, name) == md5_second
     stale_meta = pages_mod._bitmap_meta_path(md5_first)
     if stale_meta.exists():
-        assert name not in json.loads(stale_meta.read_text()).get("sources", [])
+        assert f"{DEV}/{name}" not in json.loads(stale_meta.read_text()).get("sources", [])
 
 
 def test_bytes_that_are_not_an_image_leave_the_page_alone(client):
+    _register()
     _make_page("test-upload-bad")
     before = _page_source("test-upload-bad")
     r = client.post("/api/uploads",
                     files={"image": ("a.png", b"not an image", "image/png")},
-                    data={"page": "test-upload-bad"})
+                    data={"device": DEV, "page": "test-upload-bad"})
     assert r.status_code == 400
     after = _page_source("test-upload-bad")
     assert after.canvas_json == before.canvas_json
 
 
 def test_a_transparent_upload_does_not_paint_black(client):
+    _register()
     _make_page("test-upload-alpha")
     buf = io.BytesIO()
     Image.new("RGBA", (800, 600), (0, 0, 0, 0)).save(buf, format="PNG")
     r = client.post("/api/uploads",
                     files={"image": ("a.png", buf.getvalue(), "image/png")},
-                    data={"page": "test-upload-alpha"})
+                    data={"device": DEV, "page": "test-upload-alpha"})
     assert r.status_code == 200
     # Alpha must be composited onto white, so a fully transparent picture leaves
     # the page blank. Dropping alpha instead makes it black: all 30000 differ.

@@ -341,10 +341,10 @@ def test_ws_token_must_bind_to_the_claimed_device(client):
 # ── Public endpoints stay public ─────────────────────────────────────
 
 
-def test_schedule_no_token_200(client):
-    """GET /api/pages/schedule works without any auth."""
+def test_schedule_no_token_401(client):
+    """GET /api/pages/schedule requires the device Bearer token."""
     r = client.get("/api/pages/schedule")
-    assert r.status_code == 200
+    assert r.status_code == 401
 
 
 def test_bitmap_no_token_200(client):

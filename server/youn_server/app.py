@@ -121,6 +121,15 @@ def _require_device_token(request: Request) -> "Device":
     return dev
 
 
+def _require_known_device(device: str) -> str:
+    """The admin's device selector must name a device that exists and is trusted;
+    a typo would otherwise create a phantom page set on disk."""
+    dev = registry.get(device)
+    if dev is None or not dev.trusted:
+        raise HTTPException(400, f"unknown or untrusted device: {device!r}")
+    return device
+
+
 
 # ── app factory ───────────────────────────────────────────────────────
 def create_app() -> FastAPI:
@@ -437,6 +446,10 @@ def create_app() -> FastAPI:
         body: dict = Body(...),
     ) -> dict:
         _require_operator(request)
+        device = str(body.get("device", "")).strip()
+        if not device:
+            raise HTTPException(400, "device required")
+        _require_known_device(device)
         name = str(body.get("name", "")).strip()
         canvas_json = body.get("canvas_json")
         duration_minutes = int(body.get("duration_minutes", 10))
@@ -454,25 +467,32 @@ def create_app() -> FastAPI:
             raise HTTPException(400, f"render failed: {e.path}: {e.message}") from e
         except Exception as e:  # noqa: BLE001
             raise HTTPException(500, f"render failed: {e}") from e
-        entry = pages_mod.upsert_page(name, canvas_json, duration_minutes, order, bitmap)
+        entry = pages_mod.upsert_page(device, name, canvas_json, duration_minutes, order, bitmap)
         return entry.to_dict()
 
     @app.get("/api/pages")
-    async def list_pages(request: Request) -> dict:
+    async def list_pages(request: Request, device: str = Query("")) -> dict:
         _require_operator(request)
-        out = [s.to_dict() for s in pages_mod.list_pages()]
+        if not device:
+            raise HTTPException(400, "device required")
+        _require_known_device(device)
+        out = [s.to_dict() for s in pages_mod.list_pages(device)]
         return {"pages": out, "count": len(out)}
 
     @app.delete("/api/pages/{name}")
-    async def delete_page(name: str, request: Request) -> dict:
+    async def delete_page(name: str, request: Request, device: str = Query("")) -> dict:
         _require_operator(request)
-        if not pages_mod.delete_page(name):
+        if not device:
+            raise HTTPException(400, "device required")
+        _require_known_device(device)
+        if not pages_mod.delete_page(device, name):
             raise HTTPException(404, "unknown page")
         return {"deleted": name}
 
     @app.get("/api/pages/schedule")
-    async def get_schedule() -> dict:
-        entries = pages_mod.build_schedule_from_disk()
+    async def get_schedule(request: Request) -> dict:
+        dev = _require_device_token(request)
+        entries = pages_mod.build_schedule_from_disk(dev.device_id)
         sched_md = pages_mod.compute_schedule_md(entries)
         current_index, seconds_until_next_page = pages_mod.schedule_position(entries, time.time())
         return {
@@ -569,11 +589,14 @@ def create_app() -> FastAPI:
         request: Request,
         image: UploadFile = File(...),
         page: str = Form(""),
+        device: str = Form(""),
     ) -> dict:
         _require_operator(request)
 
+        device = device.strip()
+        _require_known_device(device)
         page = page.strip()
-        sources = pages_mod.list_pages()
+        sources = pages_mod.list_pages(device)
         existing = [s.name for s in sources]
         if not page or page not in existing:
             raise HTTPException(400, detail={
@@ -603,9 +626,9 @@ def create_app() -> FastAPI:
             bitmap = render_canvas_to_bitmap(canvas_json)
         except RenderError as e:
             raise HTTPException(400, f"render failed: {e.path}: {e.message}") from e
-        entry = pages_mod.upsert_page(page, canvas_json, source.duration_minutes,
+        entry = pages_mod.upsert_page(device, page, canvas_json, source.duration_minutes,
                                       source.order, bitmap)
-        log.info("upload bound page=%s md5=%s upload=%s", page, entry.md5, upload_id)
+        log.info("upload bound device=%s page=%s md5=%s upload=%s", device, page, entry.md5, upload_id)
         # PageEntry.to_dict() yields md5/duration_minutes/order/name; the caller
         # asked in terms of a page, so say `page` as well.
         return {"page": page, **entry.to_dict()}

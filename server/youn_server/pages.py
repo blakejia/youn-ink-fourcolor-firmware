@@ -44,9 +44,14 @@ class PageSource:
     canvas_json: dict
     duration_minutes: int
     order: int
+    # Ownership lives in the directory name, not in the file: to_dict() keeps its
+    # original keys, so the on-disk page format does not change.
+    device: str = ""
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("device", None)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "PageSource":
@@ -80,11 +85,23 @@ class PageEntry:
 
 
 # ─── helpers ──────────────────────────────────────────────────────────
-def _page_path(name: str) -> Path:
-    safe = "".join(c for c in name if c.isalnum() or c in "._-")
-    if not safe:
-        raise ValueError(f"invalid page name: {name!r}")
-    return settings.data_dir / "pages" / f"{safe}.json"
+def _safe_component(value: str, what: str) -> str:
+    safe = "".join(c for c in value if c.isalnum() or c in "._-")
+    if not safe or safe != value:
+        raise ValueError(f"invalid {what}: {value!r}")
+    return safe
+
+
+def _page_dir(device: str) -> Path:
+    return settings.data_dir / "pages" / _safe_component(device, "device")
+
+
+def _page_path(device: str, name: str) -> Path:
+    return _page_dir(device) / f"{_safe_component(name, 'page name')}.json"
+
+
+def _source_key(device: str, name: str) -> str:
+    return f"{device}/{name}"
 
 
 def _bitmap_path(md5: str) -> Path:
@@ -111,16 +128,24 @@ def _is_page_source(p: Path) -> bool:
     )
 
 
-def _all_page_sources() -> list[PageSource]:
+def _all_page_sources(device: Optional[str] = None) -> list[PageSource]:
+    """Walk the device directories. A page source on the flat layer is not a page
+    any more — the layout changed and there is deliberately no fallback read, so
+    two layouts can never both be live."""
     out: list[PageSource] = []
-    for p in (settings.data_dir / "pages").glob("*.json"):
-        if not _is_page_source(p):
-            continue
-        try:
-            d = json.loads(p.read_text())
-            out.append(PageSource.from_dict(d))
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            log.warning("bad page source %s: %s", p, e)
+    root = settings.data_dir / "pages"
+    dirs = [_page_dir(device)] if device else sorted(p for p in root.glob("*") if p.is_dir())
+    for d in dirs:
+        for p in d.glob("*.json"):
+            if not _is_page_source(p):
+                continue
+            try:
+                src = PageSource.from_dict(json.loads(p.read_text()))
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                log.warning("bad page source %s: %s", p, e)
+                continue
+            src.device = d.name
+            out.append(src)
     out.sort(key=lambda s: (s.order, s.name))
     return out
 
@@ -137,74 +162,53 @@ def _all_bitmap_metas() -> list[dict]:
     return out
 
 
-# ─── CRUD ─────────────────────────────────────────────────────────────
-def upsert_page(
-    name: str,
-    canvas_json: dict,
-    duration_minutes: int,
-    order: int,
-    bitmap_bytes: bytes,
-) -> PageEntry:
-    """Save the source + bitmap, update refcounts, return the entry."""
+def upsert_page(device, name, canvas_json, duration_minutes, order, bitmap_bytes) -> PageEntry:
     if len(bitmap_bytes) != 30000:
         raise ValueError(f"bitmap must be 30000 bytes, got {len(bitmap_bytes)}")
-
     md5 = hashlib.md5(bitmap_bytes).hexdigest()
+    key = _source_key(device, name)
     src = PageSource(name=name, canvas_json=canvas_json,
                      duration_minutes=duration_minutes, order=order)
-
-    src_path = _page_path(name)
+    src_path = _page_path(device, name)
     src_path.parent.mkdir(parents=True, exist_ok=True)
     src_path.write_text(json.dumps(src.to_dict(), ensure_ascii=False, indent=2))
-
     bpath = _bitmap_path(md5)
     bmpath_meta = _bitmap_meta_path(md5)
     if not bpath.exists():
         bpath.write_bytes(bitmap_bytes)
         bmpath_meta.write_text(json.dumps({
-            "md5": md5,
-            "sources": [name],
-            "rendered_at": int(time.time()),
-            "refcount": 0,
+            "md5": md5, "sources": [key],
+            "rendered_at": int(time.time()), "refcount": 0,
         }))
-    # A page belongs to exactly one bitmap: drop the name from every other
-    # bitmap meta before recording the new reference. Without this, a page
-    # replaced twice within one rendered_at second leaves two bitmaps
-    # claiming it, and the schedule tie-break (max rendered_at, then md5)
-    # can point the device at the superseded bitmap.
+    # A page belongs to exactly one bitmap: drop it from every other meta.
     for meta in _all_bitmap_metas():
-        if meta.get("md5") != md5 and name in meta.get("sources", []):
-            _drop_source_reference(meta["md5"], source_name=name)
-    _record_source_reference(md5, source_name=name)
-    log.info("page upserted name=%s md5=%s duration=%dmin order=%d",
-             name, md5, duration_minutes, order)
+        if meta.get("md5") != md5 and key in meta.get("sources", []):
+            _drop_source_reference(meta["md5"], source_name=key)
+    _record_source_reference(md5, source_name=key)
+    log.info("page upserted device=%s name=%s md5=%s duration=%dmin order=%d",
+             device, name, md5, duration_minutes, order)
     return PageEntry(md5=md5, duration_minutes=duration_minutes, order=order, name=name)
 
 
-def delete_page(name: str) -> bool:
-    """Remove the source page and decrement its bitmap refcount."""
-    src_path = _page_path(name)
+def delete_page(device: str, name: str) -> bool:
+    src_path = _page_path(device, name)
     if not src_path.exists():
         return False
-    try:
-        src = PageSource.from_dict(json.loads(src_path.read_text()))
-    except (json.JSONDecodeError, KeyError, ValueError):
-        src_path.unlink()
-        return True
+    key = _source_key(device, name)
     md5_to_drop: Optional[str] = None
     for meta in _all_bitmap_metas():
-        if name in meta.get("sources", []):
+        if key in meta.get("sources", []):
             md5_to_drop = meta["md5"]
             break
     src_path.unlink()
     if md5_to_drop:
-        _drop_source_reference(md5_to_drop, source_name=name)
-    log.info("page deleted name=%s bitmap=%s", name, md5_to_drop)
+        _drop_source_reference(md5_to_drop, source_name=key)
+    log.info("page deleted device=%s name=%s bitmap=%s", device, name, md5_to_drop)
     return True
 
 
-def list_pages() -> list[PageSource]:
-    return _all_page_sources()
+def list_pages(device: Optional[str] = None) -> list[PageSource]:
+    return _all_page_sources(device)
 
 
 def get_bitmap(md5: str) -> Optional[bytes]:
@@ -289,22 +293,19 @@ def load_schedule() -> Optional[dict]:
         return None
 
 
-def build_schedule_from_disk() -> list[PageEntry]:
-    """Snapshot the current source pages into schedule entries."""
+def build_schedule_from_disk(device: str) -> list[PageEntry]:
+    """Snapshot one device's source pages into schedule entries."""
     out: list[PageEntry] = []
-    for src in _all_page_sources():
-        candidates: list[tuple[float, str]] = []
-        for meta in _all_bitmap_metas():
-            if src.name in meta.get("sources", []):
-                candidates.append((meta.get("rendered_at", 0), meta["md5"]))
+    metas = _all_bitmap_metas()
+    for src in _all_page_sources(device):
+        key = _source_key(device, src.name)
+        candidates = [(m.get("rendered_at", 0), m["md5"]) for m in metas
+                      if key in m.get("sources", [])]
         if not candidates:
             continue
         candidates.sort(reverse=True)
-        md5 = candidates[0][1]
-        out.append(PageEntry(
-            md5=md5, duration_minutes=src.duration_minutes,
-            order=src.order, name=src.name,
-        ))
+        out.append(PageEntry(md5=candidates[0][1], duration_minutes=src.duration_minutes,
+                             order=src.order, name=src.name))
     out.sort(key=lambda e: e.order)
     return out
 
