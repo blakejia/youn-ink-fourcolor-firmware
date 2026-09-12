@@ -527,7 +527,8 @@ Expected: 构建无错误；首页 200。浏览器打开 `http://10.0.0.90:9002/
 - [ ] **Step 5: Commit**
 
 ```bash
-git add frontend/src/api.js frontend/src/pages/Images.jsx frontend/src/App.jsx frontend/dist
+git add frontend/src/api.js frontend/src/pages/Images.jsx frontend/src/App.jsx
+# frontend/dist is gitignored (.gitignore:31) - it is a build artifact, not source.
 git commit -m "feat(web): upload replaces a page's picture, and must name the page"
 ```
 
