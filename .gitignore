@@ -66,3 +66,5 @@ server/firmware/
 
 # Rust build output (device_signature_rs component)
 firmware/main/rust/target/
+server/data/devices.db
+server/data/notifications.jsonl
