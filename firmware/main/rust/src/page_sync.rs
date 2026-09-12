@@ -339,9 +339,9 @@ pub fn parse_schedule(body: &[u8]) -> Option<ParsedSchedule> {
     Some(out)
 }
 
-/// One sync: fetch the schedule, apply the server's position answer, download
-/// what is missing. True when a fresh schedule was applied (even if some
-/// bitmap is still missing — the uncommitted md5 forces a retry next wake).
+/// One sync: fetch the schedule and apply the server's position answer. No
+/// bitmap is downloaded here — the paint path fetches the one page it needs.
+/// True when a fresh schedule was applied, which commits its md5.
 pub fn sync_once() -> bool {
     // PSRAM, not the stack: this buffer is as large as the whole task stack
     // (the C++ original kept it in a file-scope static for the same reason).
@@ -365,9 +365,10 @@ pub fn sync_once() -> bool {
     ok
 }
 
-/// Apply a fetched `/api/pages/schedule` body. Returns false when the body
-/// does not parse; a partial bitmap set still returns true (the table holds
-/// what arrived, the md5 stays uncommitted, the next wake retries).
+/// Apply a fetched `/api/pages/schedule` body. Returns false only when the
+/// body does not parse. No bitmap is downloaded here: the page that gets
+/// painted is fetched on demand by the paint path, so the table may well hold
+/// entries with a null bitmap.
 fn sync_schedule(body: &[u8]) -> bool {
     let Some(parsed) = parse_schedule(body) else {
         log_w!("PageSync", "schedule json unusable (missing schedule_md5/pages)");
@@ -388,9 +389,10 @@ fn sync_schedule(body: &[u8]) -> bool {
             new_policy.poll_s, new_policy.sleep_poll_s, new_policy.screen_active);
     }
 
-    // 99% path: the bitmap set is unchanged — but the server's position still
+    // 99% path: the schedule is unchanged — but the server's position still
     // moved on, so the index/wake answer is picked up and any manual override
-    // is released even when nothing is re-downloaded.
+    // is released here. No bitmaps are involved either way: whatever the paint
+    // path needs it fetches on demand itself.
     let unchanged = with_table(|t| t.have_schedule_md5 && t.schedule_md5 == new_md5);
     if unchanged {
         with_table(|t| {
@@ -407,10 +409,17 @@ fn sync_schedule(body: &[u8]) -> bool {
         new_pages[i].md5 = parsed.pages[i].md5;
     }
 
-    // Reuse cached bitmaps with the same md5, download the rest.
-    let mut downloaded = 0;
+    // Carry over bitmaps already in RAM for the same md5 (a re-sync within one
+    // wake), and download NOTHING. The page that is going to be painted is
+    // fetched on demand by `ensure_bitmap`, which is also where a failure is
+    // handled: it leaves the RTC record stale so the next wake retries.
+    //
+    // Premise: the awake window (8-16 s) is far shorter than a page's dwell
+    // (>= 10 min), so the rotation cannot move on while we are awake — the
+    // other pages' bitmaps would never be used before the sleep clears them.
+    let mut carried = 0;
     for i in 0..new_count {
-        let reused = with_table(|t| {
+        let carried_slot = with_table(|t| {
             for j in 0..t.count {
                 if t.pages[j].is_ram() && t.pages[j].md5 == new_pages[i].md5 {
                     let bmp = t.pages[j].bitmap;
@@ -420,26 +429,11 @@ fn sync_schedule(body: &[u8]) -> bool {
             }
             None
         });
-        if let Some(bmp) = reused {
+        if let Some(bmp) = carried_slot {
             new_pages[i].bitmap = bmp;
-            continue;
-        }
-        // +1 for the wrapper's terminator.
-        let slot = unsafe { shim::rf_alloc(PAGE_BITMAP_SIZE + 1) };
-        if slot.is_null() {
-            log_e!("PageSync", "bitmap alloc failed");
-            continue;
-        }
-        if download_bitmap(&new_pages[i].md5, slot) {
-            new_pages[i].bitmap = slot;
-            downloaded += 1;
-        } else {
-            log_w!("PageSync", "bitmap download failed: {:?}", core::str::from_utf8(&new_pages[i].md5).unwrap_or("?"));
-            unsafe { shim::rf_free(slot) };
+            carried += 1;
         }
     }
-
-    let all_ready = new_pages[..new_count].iter().all(|p| p.is_ram());
 
     with_table(|t| {
         t.free_pages();
@@ -448,19 +442,18 @@ fn sync_schedule(body: &[u8]) -> bool {
         t.server_index = new_index.min(new_count.saturating_sub(1));
         t.next_wake_s = new_wake_s;
         t.override_index = None;
-        if all_ready {
-            // Only commit the schedule md5 once every bitmap is on RAM: the old
-            // code stored it unconditionally, so a failed download was skipped
-            // forever by the "unchanged" fast path.
-            t.schedule_md5 = new_md5;
-            t.have_schedule_md5 = true;
-        }
+        // Commit unconditionally: the schedule was parsed and its md5s are
+        // recorded. "Do not commit while the page you need is missing" is now
+        // enforced where the page is actually fetched (paint_if_changed ->
+        // ensure_bitmap): a failed fetch never reaches rf_panel_mark_pending,
+        // so the RTC record stays stale and the next wake retries.
+        t.schedule_md5 = new_md5;
+        t.have_schedule_md5 = true;
     });
 
-    log_i!("PageSync", "schedule updated: {} pages, {} downloaded{}",
+    log_i!("PageSync", "schedule updated: {} pages ({} carried from cache)",
         new_count,
-        downloaded,
-        if all_ready { "" } else { " (retrying missing bitmaps)" }
+        carried
     );
     true
 }
@@ -477,8 +470,8 @@ fn target_index() -> Option<usize> {
 }
 
 /// Make sure page `idx` has its bitmap in RAM, downloading it on demand.
-/// Null when out of range or unreachable (the next wake retries via the
-/// uncommitted schedule md5).
+/// Null when out of range or unreachable (nothing is recorded as displayed,
+/// so the next wake tries again).
 fn ensure_bitmap(idx: usize, md5: &[u8; MD5_LEN]) -> *mut u8 {
     let slot = with_table(|t| {
         if idx < t.count { t.pages[idx].bitmap } else { core::ptr::null_mut() }
@@ -809,7 +802,7 @@ pub extern "C" fn page_sync_prev() {
     prev();
 }
 
-/// One sync: fetch + parse + download what is missing. True on success.
+/// One sync: fetch + parse + apply the schedule. True on success.
 #[unsafe(no_mangle)]
 pub extern "C" fn page_sync_sync_once() -> bool {
     sync_once()
@@ -1105,9 +1098,11 @@ mod tests {
         );
     }
 
-    /// Apply an already-scripted schedule.
+    /// Apply an already-scripted schedule and fetch the target page. `sync_once`
+    /// itself downloads nothing now, so the bitmap arrives via the paint path.
     fn setup_one_page() {
         sync_once();
+        paint_if_changed();
     }
 
     /// Script and apply a two-page schedule, markers 0xa1 / 0xb2.
@@ -1200,7 +1195,28 @@ mod tests {
     }
 
     #[test]
-    fn sync_downloads_pages_and_commits_the_schedule() {
+    fn sync_records_the_pages_but_downloads_nothing() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10), (0xb2, 5)]));
+        // No bitmap responses are scripted on purpose: a sync that fetches any
+        // would fail here instead of silently passing.
+        sync_once();
+
+        let (count, server_index, committed) =
+            with_table(|t| (t.count, t.server_index, t.have_schedule_md5));
+        assert_eq!(count, 2);
+        assert_eq!(server_index, 0, "no position in the response -> page 0");
+        assert!(committed, "the schedule was received, so its md5 is committed");
+        assert_eq!(
+            shim::host::calls_matching("http_get").len(),
+            1,
+            "schedule only: the page that will be painted is fetched by the paint path"
+        );
+    }
+
+    #[test]
+    fn the_paint_path_fetches_exactly_the_target_page() {
         let _g = shim::host::lock();
         reset_for_test();
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10), (0xb2, 5)]));
@@ -1208,31 +1224,46 @@ mod tests {
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), &bitmap_body(0xb2));
 
         sync_once();
+        assert!(paint_if_changed(), "first paint draws the target page");
 
-        let (count, server_index, committed, md5) =
-            with_table(|t| (t.count, t.server_index, t.have_schedule_md5, t.schedule_md5));
-        assert_eq!(count, 2);
-        assert_eq!(server_index, 0, "no position in the response -> page 0");
-        assert!(committed, "every bitmap arrived, so the md5 is committed");
-        assert_eq!(&md5[..2], b"11");
-        assert_eq!(page0_byte(), 0xa1, "page 0 holds its own bitmap");
-        assert_eq!(
-            with_table(|t| unsafe { *t.pages[1].bitmap }),
-            0xb2,
-            "page 1 holds its own bitmap"
+        let gets = shim::host::calls_matching("http_get");
+        assert_eq!(gets.len(), 2, "schedule + the one page being painted");
+        assert!(
+            gets.iter().any(|c| c.contains(&md5hex(0xa1))),
+            "the fetched bitmap is page 0's, not every page's"
         );
-        assert_eq!(shim::host::calls_matching("http_get").len(), 3, "schedule + 2 bitmaps");
+        assert_eq!(page0_byte(), 0xa1);
     }
 
     #[test]
-    fn unchanged_schedule_is_not_re_downloaded() {
+    fn a_glass_that_already_shows_the_target_page_fetches_nothing() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10), (0xb2, 5)]));
+        shim::host::stage_panel_record(0x50414E31, 1, md5hex(0xa1).as_bytes(), 0);
+
+        sync_once();
+        assert!(!paint_if_changed(), "the glass already shows page 0");
+        assert_eq!(
+            shim::host::calls_matching("http_get").len(),
+            1,
+            "schedule only: nothing to paint, so nothing to download"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_schedule_does_not_re_fetch_the_painted_page() {
         let _g = shim::host::lock();
         reset_for_test();
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
         sync_once();
+        assert!(paint_if_changed(), "the paint path fetched the page");
 
+        // Only now is there something cached to preserve, so this pair of
+        // assertions means what it says.
         let before = with_table(|t| t.pages[0].bitmap);
+        assert!(!before.is_null(), "the painted page's bitmap is in RAM");
         let gets_before = shim::host::calls_matching("http_get").len();
         sync_once();
 
@@ -1249,27 +1280,35 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_bitmap_keeps_the_schedule_uncommitted_for_a_retry() {
+    fn a_failed_page_fetch_records_nothing_so_the_next_wake_retries() {
         let _g = shim::host::lock();
         reset_for_test();
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10), (0xb2, 5)]));
-        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
-        shim::host::script_get(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), 500, b"");
+        shim::host::script_get(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), 500, b"");
 
         sync_once();
-
-        let (count, committed) = with_table(|t| (t.count, t.have_schedule_md5));
-        assert_eq!(count, 2);
         assert!(
-            !committed,
-            "committing here would make the 'unchanged' fast path skip the missing page forever"
+            with_table(|t| t.have_schedule_md5),
+            "the sync commits on receipt; the retry is the paint path's job now"
+        );
+        assert!(!paint_if_changed(), "no bitmap -> nothing painted");
+
+        // The retry mechanism is the RTC record: it is written only once a
+        // bitmap has landed. This assertion is what replaces the old "do not
+        // commit the schedule while a bitmap is missing" gate, so it is the
+        // one this test must pin.
+        let rec = read_panel_record();
+        assert_ne!(
+            &rec.0[8..40],
+            md5hex(0xa1).as_bytes(),
+            "a failed fetch must not be recorded as displayed"
         );
 
-        // The retry downloads only the page that is still missing.
-        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xb2)), &bitmap_body(0xb2));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
         sync_once();
-        assert!(with_table(|t| t.have_schedule_md5));
-        assert!(with_table(|t| t.pages[1].bitmap) != core::ptr::null_mut());
+        assert!(paint_if_changed(), "the retry paints once the bitmap arrives");
+        let rec = read_panel_record();
+        assert_eq!(&rec.0[8..40], md5hex(0xa1).as_bytes(), "and only then is it recorded");
     }
 
     #[test]
