@@ -63,7 +63,6 @@ set(SOURCES
     "common/server_pairing.cc"
     "rust/shim.cpp"
     "common/http_client_wrapper.cc"
-    "ui/widgets/status_bar.cc"
     "ui/renderers/rawdraw/ebook_renderer.cc"
     "ui/renderers/rawdraw/chat_renderer.cc"
     "ui/renderers/rawdraw/settings_renderer.cc"
@@ -83,7 +82,6 @@ set(SOURCES
     "ui/renderers/rawdraw/font_metrics_renderer.cc"
 
     "ui/rawdraw_ui_manager.cc"
-    "ui/epd_refresh.cc"
     "streaming/text_chunker.cc"
     "streaming/tts_streamer.cc"
     "streaming/stream_pipeline.cc"
@@ -96,10 +94,7 @@ set(INCLUDE_DIRS
     # F5: LVGL include directory kept for header compatibility, source files disabled
     "display/lvgl_display"
     "ui"
-    "ui/pages"
-    "ui/widgets"
     "ui/renderers"
-    "ui/renderers/common"
     "ui/renderers/rawdraw"
     "streaming"
     "protocols"
