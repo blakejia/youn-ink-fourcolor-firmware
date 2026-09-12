@@ -120,6 +120,7 @@ export default function CanvasEditor({ canvasJson, onChange, operatorFetch }) {
   const [pngUrl, setPngUrl] = useState(null);
   const [selectedPath, setSelectedPath] = useState(null);
   const [renderErr, setRenderErr] = useState('');
+  const [rendering, setRendering] = useState(true);
   const debounceRef = useRef(null);
   const pngUrlRef = useRef(null);
 
@@ -127,11 +128,12 @@ export default function CanvasEditor({ canvasJson, onChange, operatorFetch }) {
   useEffect(() => {
     clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(async () => {
+      setRendering(true);
       try {
-        const parsed = typeof canvasJson === 'string' ? JSON.parse(canvasJson) : canvasJson;
+        const parsedJson = typeof canvasJson === 'string' ? JSON.parse(canvasJson) : canvasJson;
         const resp = await operatorFetch('/pages/preview?debug=1', {
           method: 'POST',
-          body: { canvas_json: parsed },
+          body: { canvas_json: parsedJson },
         });
         setBounds(resp.bounds || []);
         if (pngUrlRef.current) URL.revokeObjectURL(pngUrlRef.current);
@@ -143,6 +145,8 @@ export default function CanvasEditor({ canvasJson, onChange, operatorFetch }) {
       } catch (e) {
         setRenderErr(e.message || String(e));
         setBounds([]);
+      } finally {
+        setRendering(false);
       }
     }, 350);
     return () => clearTimeout(debounceRef.current);
@@ -173,63 +177,67 @@ export default function CanvasEditor({ canvasJson, onChange, operatorFetch }) {
     const next = updateElement(parsed, strip(selected.path), mutate);
     onChange(next);
   }, [parsed, selected, onChange]);
+
+  // Screen readers get nothing from a bare colour rectangle, so label each
+  // selectable region with its tag and a hint of its content.
+  const describe = (b, i) => {
+    const node = parsed ? getAtPath(parsed, strip(b.path)) : null;
+    const props = (node && typeof node === 'object' && node.props) || {};
+    const text = typeof props.children === 'string' ? props.children.replace(/\s+/g, ' ').trim().slice(0, 20) : '';
+    return `画布元素 ${i + 1}：${b.type}${text ? ` 「${text}」` : ''}`;
+  };
+
   return (
-    <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
+    <div className="canvas-editor">
       {/* Canvas */}
-      <div
-        style={{
-          width: SCREEN_W,
-          height: SCREEN_H,
-          position: 'relative',
-          border: '1px solid var(--color-border, #ccd2da)',
-          background: '#fff',
-          flexShrink: 0,
-          imageRendering: 'pixelated',
-        }}
-      >
-        {pngUrl && (
-          <img
-            src={pngUrl}
-            alt="canvas preview"
-            style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', imageRendering: 'pixelated' }}
-            draggable={false}
-          />
-        )}
-        {bounds.map(b => (
-          <div
-            key={b.path + ':' + b.x + ',' + b.y}
-            onClick={() => setSelectedPath(b.path)}
-            title={b.path}
-            style={{
-              position: 'absolute',
-              left: b.x, top: b.y, width: b.w, height: b.h,
-              cursor: 'pointer',
-              outline: selectedPath === b.path ? '2px solid var(--color-primary, #2f6feb)' : '1px dashed rgba(47,111,235,0.35)',
-              outlineOffset: -1,
-              background: selectedPath === b.path ? 'rgba(47,111,235,0.06)' : 'transparent',
-            }}
-          />
-        ))}
-        {renderErr && (
-          <div style={{
-            position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
-            background: 'rgba(255,255,255,0.85)', color: 'var(--color-danger, #d9363e)',
-            fontSize: 12, padding: 12, textAlign: 'center',
-          }}>
-            渲染失败：{renderErr}
-          </div>
-        )}
+      <div className="canvas-editor__stage">
+        <div className="canvas-editor__screen">
+          {pngUrl && (
+            <img
+              src={pngUrl}
+              alt="画布渲染预览"
+              width={SCREEN_W}
+              height={SCREEN_H}
+              draggable={false}
+              style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', imageRendering: 'pixelated' }}
+            />
+          )}
+          {bounds.map((b, i) => (
+            <button
+              type="button"
+              key={b.path}
+              className="canvas-hit"
+              aria-label={describe(b, i)}
+              aria-pressed={selectedPath === b.path}
+              title={b.path}
+              onClick={() => setSelectedPath(b.path)}
+              style={{ left: b.x, top: b.y, width: b.w, height: b.h }}
+            />
+          ))}
+          {rendering && !renderErr && <div className="canvas-note" role="status">渲染中…</div>}
+          {renderErr && (
+            <div
+              role="alert"
+              style={{
+                position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: 'rgba(255,255,255,0.85)', color: 'var(--color-danger, #d9363e)',
+                fontSize: 12, padding: 12, textAlign: 'center',
+              }}
+            >
+              渲染失败：{renderErr}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Property panel */}
-      <div style={{ width: 280, flexShrink: 0 }}>
+      <div className="canvas-editor__panel">
         <h3 style={{ margin: '0 0 12px', fontSize: 14 }}>属性面板</h3>
-        {!selected && <div className="muted">点击画布元素查看属性</div>}
+        {!selected && <div className="muted">点击（或用 Tab 选中）画布元素查看属性</div>}
         {selected && actualNode && (
           <PropertyForm
             bound={selected}
             node={actualNode}
-            isTextPseudo={isTextPseudo}
             onMutate={applyMutate}
           />
         )}
@@ -238,7 +246,7 @@ export default function CanvasEditor({ canvasJson, onChange, operatorFetch }) {
   );
 }
 
-function PropertyForm({ bound, node, isTextPseudo, onMutate }) {
+function PropertyForm({ bound, node, onMutate }) {
   const props = node.props || {};
   const tw = String(props.tw || '');
   const style = props.style || {};
@@ -251,11 +259,13 @@ function PropertyForm({ bound, node, isTextPseudo, onMutate }) {
     return n;
   });
 
+  const isText = typeof children === 'string' || bound.type === 'text';
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10, fontSize: 13 }}>
       <div>
         <div className="muted" style={{ marginBottom: 4 }}>路径</div>
-        <div className="mono" style={{ fontSize: 11, wordBreak: 'break-all' }}>{bound.path}</div>
+        <div className="mono wrap-anywhere" style={{ fontSize: 11 }}>{bound.path}</div>
       </div>
       <div>
         <div className="muted" style={{ marginBottom: 4 }}>类型</div>
@@ -264,37 +274,38 @@ function PropertyForm({ bound, node, isTextPseudo, onMutate }) {
 
       {/* text content */}
       {typeof children === 'string' && (
-        <label style={{ display: 'block' }}>
-          <div className="muted" style={{ marginBottom: 4 }}>文本内容</div>
+        <label className="field">
+          <div className="field-label">文本内容</div>
           <textarea
+            name="text_content"
             value={children}
             onChange={(e) => onMutate(n => { n.props = n.props || {}; n.props.children = e.target.value; return n; })}
-            style={{ width: '100%', minHeight: 56, fontFamily: 'inherit' }}
+            style={{ minHeight: 56 }}
           />
         </label>
       )}
 
       {/* font size (text-bearing) */}
-      {(typeof children === 'string' || bound.type === 'text') && (
-        <label style={{ display: 'block' }}>
-          <div className="muted" style={{ marginBottom: 4 }}>字号 (px)</div>
+      {isText && (
+        <label className="field">
+          <div className="field-label">字号（px）</div>
           <input
+            name="font_size"
             type="number" min={8} max={64}
             value={twGetFontSize(tw, style)}
             onChange={(e) => setTw(t => twSetFontSize(t, parseInt(e.target.value || '16', 10)))}
-            style={{ width: '100%' }}
           />
         </label>
       )}
 
       {/* text color */}
-      {(typeof children === 'string' || bound.type === 'text') && (
-        <label style={{ display: 'block' }}>
-          <div className="muted" style={{ marginBottom: 4 }}>文字颜色</div>
+      {isText && (
+        <label className="field">
+          <div className="field-label">文字颜色</div>
           <select
+            name="text_color"
             value={style.color || '#000000'}
             onChange={(e) => setStyle('color', e.target.value)}
-            style={{ width: '100%' }}
           >
             <option value="#000000">黑</option>
             <option value="#FFFFFF">白</option>
@@ -307,32 +318,34 @@ function PropertyForm({ bound, node, isTextPseudo, onMutate }) {
       {/* img src + size */}
       {bound.type === 'img' && (
         <>
-          <label style={{ display: 'block' }}>
-            <div className="muted" style={{ marginBottom: 4 }}>图片 src</div>
+          <label className="field">
+            <div className="field-label">图片 src</div>
             <input
+              name="img_src"
               value={props.src || ''}
               onChange={(e) => onMutate(n => { n.props = n.props || {}; n.props.src = e.target.value; return n; })}
-              placeholder="data:image/...;base64,... 或 https://..."
-              style={{ width: '100%', fontSize: 11, fontFamily: 'ui-monospace,monospace' }}
+              placeholder="data:image/…;base64,… 或 https://…"
+              spellCheck={false}
+              style={{ fontSize: 11, fontFamily: 'ui-monospace,monospace' }}
             />
           </label>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <label style={{ flex: 1 }}>
-              <div className="muted" style={{ marginBottom: 4 }}>宽 (px)</div>
+          <div className="row" style={{ gap: 8, flexWrap: 'nowrap' }}>
+            <label className="field" style={{ flex: 1 }}>
+              <div className="field-label">宽（px）</div>
               <input
+                name="img_width"
                 type="number" min={1} max={SCREEN_W}
                 value={bound.w}
                 onChange={(e) => setTw(t => twSetSize(t, 'w', parseInt(e.target.value || '0', 10)))}
-                style={{ width: '100%' }}
               />
             </label>
-            <label style={{ flex: 1 }}>
-              <div className="muted" style={{ marginBottom: 4 }}>高 (px)</div>
+            <label className="field" style={{ flex: 1 }}>
+              <div className="field-label">高（px）</div>
               <input
+                name="img_height"
                 type="number" min={1} max={SCREEN_H}
                 value={bound.h}
                 onChange={(e) => setTw(t => twSetSize(t, 'h', parseInt(e.target.value || '0', 10)))}
-                style={{ width: '100%' }}
               />
             </label>
           </div>
@@ -341,9 +354,9 @@ function PropertyForm({ bound, node, isTextPseudo, onMutate }) {
 
       {/* bg color for div/span */}
       {(bound.type === 'div' || bound.type === 'span') && (
-        <label style={{ display: 'block' }}>
-          <div className="muted" style={{ marginBottom: 4 }}>背景色</div>
-          <select value={twGetBg(tw)} onChange={(e) => setTw(t => twSetBg(t, e.target.value))} style={{ width: '100%' }}>
+        <label className="field">
+          <div className="field-label">背景色</div>
+          <select name="bg_color" value={twGetBg(tw)} onChange={(e) => setTw(t => twSetBg(t, e.target.value))}>
             <option value="white">白</option>
             <option value="black">黑</option>
             <option value="yellow">黄</option>
@@ -353,13 +366,15 @@ function PropertyForm({ bound, node, isTextPseudo, onMutate }) {
       )}
 
       {/* raw tw */}
-      <label style={{ display: 'block' }}>
-        <div className="muted" style={{ marginBottom: 4 }}>tw（高级，直接编辑）</div>
+      <label className="field">
+        <div className="field-label">tw（高级，直接编辑）</div>
         <textarea
+          name="raw_tw"
           value={tw}
           onChange={(e) => onMutate(n => { n.props = n.props || {}; n.props.tw = e.target.value; return n; })}
           className="mono"
-          style={{ width: '100%', minHeight: 60, fontSize: 11 }}
+          spellCheck={false}
+          style={{ minHeight: 60, fontSize: 11 }}
         />
       </label>
     </div>
