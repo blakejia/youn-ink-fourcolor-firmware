@@ -16,9 +16,6 @@ State machine for one device connection:
       └─ TTS via audio/speech, resample 24k → 16k if needed
       └─ stream binary TTS frames; send tts_start/tts_end markers
       └─ IDLE
-
-Concurrent pushes (image_push_meta + binary) are accepted at any time and
-forwarded to the device immediately — they do NOT block the AI pipeline.
 """
 from __future__ import annotations
 
@@ -65,7 +62,6 @@ class Session:
     chat_history: list[ChatMessage] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_activity_ms: int = field(default_factory=lambda: int(time.time() * 1000))
-    pending_pushes: int = 0  # image push inflight counter
     closed: bool = False
 
     async def send_json(self, obj: dict) -> None:
@@ -152,12 +148,6 @@ class SessionManager:
         if mtype == P.MsgType.OTA_CHECK:
             # Defer to OTA module — handler injected at app boot.
             handler = getattr(self, "_ota_handler", None)
-            if handler:
-                asyncio.create_task(handler(session, msg))
-            return
-
-        if mtype == P.MsgType.LIST_IMAGES:
-            handler = getattr(self, "_image_list_handler", None)
             if handler:
                 asyncio.create_task(handler(session, msg))
             return

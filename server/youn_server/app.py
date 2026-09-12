@@ -7,13 +7,9 @@ Builds a single ASGI app exposing:
   GET        /api/devices        device registry (operator)
   POST       /api/devices/{id}/approve
   POST       /api/devices/{id}/revoke
-  POST       /api/images         multipart upload; converts + pushes via WS
-  GET        /api/images         list images known to server
-  DELETE     /api/images/{id}    remove + tell device
   POST       /api/ota            upload .bin + version + notes
   GET        /api/ota/check      latest firmware metadata
   GET        /api/ota/download/{filename}  signed download
-  POST       /api/push_image     alias of /api/images for compat with README §88
 
 All HTTP routes require an operator token via header `X-Operator-Token` when
 OPERATOR_TOKEN is set in env. WS handshake requires trust=1 in the device
@@ -62,7 +58,6 @@ from . import notify_store as ns
 
 from . import pages as pages_mod
 
-from . import image_conv
 from . import ota as ota_mod
 from . import protocol as P
 from .ai import LLMClient, TTSClient, WhisperClient
@@ -127,55 +122,6 @@ def _require_device_token(request: Request) -> "Device":
 
 
 
-# ── image storage helpers ─────────────────────────────────────────────
-def _image_path(image_id: str) -> Path:
-    return settings.images_dir / f"{image_id}.bin"
-
-
-def _image_meta_path(image_id: str) -> Path:
-    return settings.images_dir / f"{image_id}.json"
-
-
-def _device_can_push(device_id: str) -> bool:
-    dev = registry.get(device_id)
-    return dev is not None and dev.trusted
-
-
-def _push_image_to_device(session: "Session", image_id: str) -> bool:
-    """Notify an active session that an image is ready to pull."""
-    if session is None or session.closed:
-        return False
-    meta = json.loads(_image_meta_path(image_id).read_text())
-    binary = _image_path(image_id).read_bytes()
-
-    async def _do_push() -> None:
-        try:
-            session.pending_pushes += 1
-            await session.send_json(P.ok(
-                P.OutMsg.IMAGE_PUSH_META,
-                id=image_id,
-                width=image_conv.SCREEN_W,
-                height=image_conv.SCREEN_H,
-                format=meta["format"],
-                size=meta["size"],
-                title=meta.get("title", ""),
-            ))
-            # Chunked binary push — same pattern as TTS.
-            CHUNK = 8000
-            for off in range(0, len(binary), CHUNK):
-                await session.send_bytes(binary[off : off + CHUNK])
-            await session.send_json(P.ok(P.OutMsg.IMAGE_PUSH_DONE, id=image_id))
-            log.info(
-                "image pushed device=%s id=%s bytes=%d",
-                session.device_id, image_id, len(binary),
-            )
-        finally:
-            session.pending_pushes -= 1
-
-    asyncio.create_task(_do_push())
-    return True
-
-
 # ── app factory ───────────────────────────────────────────────────────
 def create_app() -> FastAPI:
     setup_logging()
@@ -187,13 +133,13 @@ def create_app() -> FastAPI:
     if not _operator_token():
         log.error(
             "OPERATOR_TOKEN is empty: every operator endpoint (/api/devices, "
-            "/api/pages, /api/images, /api/ota, /api/notifications, /mcp) is "
+            "/api/pages, /api/ota, /api/notifications, /mcp) is "
             "OPEN to anyone who can reach this port. Set OPERATOR_TOKEN in .env."
         )
     app = FastAPI(
         title="Youn Ink Server",
         version="1.0.0",
-        description="AI + image push + OTA for Youn Ink NOTE4C / 4-color EPD",
+        description="AI + OTA for Youn Ink NOTE4C / 4-color EPD",
     )
 
     # AI clients are app-scoped. For high-load deployments, replace with a pool.
@@ -202,7 +148,7 @@ def create_app() -> FastAPI:
     app.state.tts = TTSClient()
     app.state.sessions = SessionManager(app.state.whisper, app.state.llm, app.state.tts)
 
-    # Hook OTA + image list handlers into the session manager.
+    # Hook the OTA handler into the session manager.
     async def _ota_handler(session: Session, _msg: dict) -> None:
         meta = ota_mod.latest()
         if meta is None:
@@ -215,26 +161,7 @@ def create_app() -> FastAPI:
             url=f"{settings.public_http_base}/api/ota/download/{meta.filename}",
         ))
 
-    async def _image_list_handler(session: Session, _msg: dict) -> None:
-        # Lightweight: list image IDs + titles + formats.
-        out = []
-        for p in settings.images_dir.glob("*.json"):
-            try:
-                d = json.loads(p.read_text())
-            except json.JSONDecodeError:
-                continue
-            out.append({
-                "id": d["id"],
-                "title": d.get("title", ""),
-                "format": d.get("format", ""),
-                "size": d.get("size", 0),
-                "uploaded_at": d.get("uploaded_at", 0),
-            })
-        # Devices don't have a typed message for this — emit an info-ish envelope.
-        await session.send_json({"type": "image_list", "images": out})
-
     app.state.sessions._ota_handler = _ota_handler  # type: ignore[attr-defined]
-    app.state.sessions._image_list_handler = _image_list_handler  # type: ignore[attr-defined]
 
     # ── HTTP routes ──
     @app.get("/api/health")
@@ -344,81 +271,6 @@ def create_app() -> FastAPI:
         registry.approve(body.device_id)
         return {"token": token}
 
-
-    # ── image upload + push ──
-    @app.post("/api/images")
-    async def upload_image(
-        request: Request,
-        image: UploadFile = File(...),
-        format: str = Form("bwry2bpp"),
-        title: str = Form(""),
-        target_device_id: str = Form(""),
-    ) -> dict:
-        _require_operator(request)
-        if format not in ("1bpp", "bwry2bpp"):
-            raise HTTPException(400, "format must be 1bpp or bwry2bpp")
-
-        data = await image.read()
-        if len(data) > 25 * 1024 * 1024:
-            raise HTTPException(413, "image too large (>25 MB)")
-
-        try:
-            raw = image_conv.convert_bytes(data, format)  # type: ignore[arg-type]
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(400, f"convert failed: {e}") from e
-
-        image_id = secrets.token_urlsafe(8)
-        _image_path(image_id).write_bytes(raw)
-        meta = {
-            "id": image_id,
-            "title": title or image.filename or image_id,
-            "format": format,
-            "size": len(raw),
-            "uploaded_at": int(time.time()),
-            "target_device_id": target_device_id,
-        }
-        _image_meta_path(image_id).write_text(json.dumps(meta, ensure_ascii=False, indent=2))
-
-        # Try to push to a live session.
-        pushed = False
-        for s in app.state.sessions.all_sessions():
-            if target_device_id and s.device_id != target_device_id:
-                continue
-            pushed = _push_image_to_device(s, image_id) or pushed
-
-        return {"id": image_id, "size": len(raw), "format": format, "pushed": pushed}
-
-    @app.get("/api/images")
-    async def list_images(request: Request) -> dict:
-        _require_operator(request)
-        out = []
-        for p in sorted(settings.images_dir.glob("*.json")):
-            try:
-                out.append(json.loads(p.read_text()))
-            except json.JSONDecodeError:
-                continue
-        return {"images": out}
-
-    @app.delete("/api/images/{image_id}")
-    async def delete_image(image_id: str, request: Request) -> dict:
-        _require_operator(request)
-        _image_path(image_id).unlink(missing_ok=True)
-        _image_meta_path(image_id).unlink(missing_ok=True)
-        return {"deleted": image_id}
-
-    @app.post("/api/push_image")
-    async def push_image_alias(
-        request: Request,
-        image: UploadFile = File(...),
-        format: str = Form("bwry2bpp"),
-        title: str = Form(""),
-        target_device_id: str = Form(""),
-    ) -> dict:
-        # README §88 mentions this exact endpoint name.
-        return await upload_image(
-            request=request, image=image, format=format,
-            title=title, target_device_id=target_device_id,
-        )
 
     # ── OTA ──
     @app.post("/api/ota")
@@ -663,8 +515,7 @@ def create_app() -> FastAPI:
         return (settings.uploads_dir / f"{upload_id}.png",
                 settings.uploads_dir / f"{upload_id}.src.png")
 
-    # Constants are local: Task 3 deletes image_conv.py, which the scalar
-    # aliases in this file's neighbours came from.
+    # Panel geometry, kept local so the upload path needs no extra import.
     PANEL_WIDTH = 400
     PANEL_HEIGHT = 300
 

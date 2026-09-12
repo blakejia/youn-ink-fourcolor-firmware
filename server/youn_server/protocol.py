@@ -64,7 +64,6 @@ class MsgType:
     PTT_START = "ptt_start"
     PTT_STOP = "ptt_stop"
     PONG = "pong"
-    LIST_IMAGES = "list_images"
     OTA_CHECK = "ota_check"
 
 
@@ -80,8 +79,6 @@ class OutMsg:
     LLM_DONE = "llm_done"
     TTS_START = "tts_start"
     TTS_END = "tts_end"
-    IMAGE_PUSH_META = "image_push_meta"
-    IMAGE_PUSH_DONE = "image_push_done"
     OTA_AVAILABLE = "ota_available"
     ERROR = "error"
     PONG = "pong"

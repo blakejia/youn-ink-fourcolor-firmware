@@ -178,3 +178,16 @@ def test_a_transparent_upload_does_not_paint_black(client):
     # Alpha must be composited onto white, so a fully transparent picture leaves
     # the page blank. Dropping alpha instead makes it black: all 30000 differ.
     assert _diff_from_blank(pages_mod.get_bitmap(r.json()["md5"])) == 0
+
+
+@pytest.mark.parametrize("method,path", [
+    ("post", "/api/images"),
+    ("get", "/api/images"),
+    ("delete", "/api/images/deadbeef"),
+    ("post", "/api/push_image"),
+])
+def test_the_websocket_image_push_path_is_gone(client, method, path):
+    """It could never reach the panel: the firmware opens no WS and has no
+    handler for the push messages. If someone adds it back, this fails."""
+    r = getattr(client, method)(path)
+    assert r.status_code == 404
