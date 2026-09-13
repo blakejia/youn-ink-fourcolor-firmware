@@ -38,10 +38,9 @@
 
 | 端口 | 协议 | 用途 |
 | --- | --- | --- |
-| `9001` | WebSocket | ESP32 语音、LLM、TTS、同步消息 |
+| `9002` | WebSocket | ESP32 语音、LLM、TTS、同步消息 |
 | `8766` | UDP | 设备发现 |
 | `8766` | HTTP | OTA API（备用入口，见下） |
-| `8090` | HTTP | 独立管理服务，可选 |
 
 ### 安装依赖
 
@@ -54,35 +53,34 @@ pip install -r requirements.txt
 
 ### 启动服务
 
+服务由 **systemd 用户单元**托管（单元文件版本化在 `server/systemd/`）：
+
 ```bash
-export DASHSCOPE_API_KEY=你的百炼APIKey
 cd server
+cp .env.example .env    # 只需一次，填好里面的密钥
+./start.sh install      # 只需一次：装单元 + enable + 开启 linger
 ./start.sh start
 ```
+
+`install` 会开启 `loginctl enable-linger`，因此**开机自启、退出登录后继续运行**，
+崩溃也会自动拉回（`Restart=always`）。详见 `server/DEPLOY.md` §5。
 
 常用命令：
 
 ```bash
 cd server
 ./start.sh status
-./start.sh logs
+./start.sh logs         # 应用日志（data/server.log，自动轮转）
+./start.sh journal      # stdout/stderr（访问日志、traceback）
 ./start.sh restart
 ./start.sh stop
-```
-
-也可以从仓库根目录调用：
-
-```bash
-npm run server:start
-npm run server:status
-npm run server:logs
 ```
 
 ### 本地模拟设备
 
 ```bash
 cd server
-python3 mock_client.py --server ws://127.0.0.1:9001
+python3 mock_client.py --server ws://127.0.0.1:9002
 ```
 
 ## 图片和设备管理
@@ -95,13 +93,13 @@ python3 mock_client.py --server ws://127.0.0.1:9001
 常用接口：
 
 ```bash
-curl http://localhost:9001/api/health
+curl http://127.0.0.1:9002/api/health
 ```
 
 上传图片示例（替换名为 `album` 的页面）：
 
 ```bash
-curl -X POST http://localhost:9001/api/uploads \
+curl -X POST http://127.0.0.1:9002/api/uploads \
   -H "X-Operator-Token: $OPERATOR_TOKEN" \
   -F "image=@/path/to/photo.jpg" \
   -F "page=album"
@@ -159,15 +157,16 @@ ZECTRIX_EPD_PANEL_1BPP            黑白 1bpp 屏
 
 常用后端环境变量：
 
+完整且带注释的清单见 **`server/.env.example`**（它就是权威列表，照抄即可）。
+最常改的几个：
+
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DASHSCOPE_API_KEY` | 无 | 百炼 API Key，启动后端必需 |
-| `LISTEN_HOST` | `0.0.0.0` | WebSocket 监听地址 |
-| `LISTEN_PORT` | `9001` | WebSocket 端口 |
-| `DISCOVERY_PORT` | `8766` | UDP 发现端口 |
-| `PUSH_IMAGE_PORT` | `8766` | OTA/备用 HTTP API 及 UDP 发现端口 |
-| `TTS_WS_CHUNK_BYTES` | `8000` | TTS 推送分片大小 |
-| `TTS_WS_CHUNK_GAP_SEC` | `0.01` | TTS 分片发送间隔 |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` | — | 任何 OpenAI 兼容端点（ASR + LLM + TTS） |
+| `LISTEN_PORT` | `9002` | WebSocket + HTTP API 端口（9001 被本机 rerank-proxy 占用） |
+| `OPERATOR_TOKEN` | 空 | 后台/操作员 API 令牌；为空则这些接口无鉴权 |
+| `MASTER_KEY` | 空 | 设备签名密钥（HMAC），与固件一致；为空则拒绝所有配对请求 |
+| `DISCOVERY_SHARED_SECRET` | 占位 | UDP 发现应答的签名密钥 |
 
 不要提交 `.env`、数据库、日志、pid、构建目录和固件产物。
 

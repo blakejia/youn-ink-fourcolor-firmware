@@ -1,0 +1,42 @@
+[Unit]
+Description=Youn Ink server (HTTP API + WebSocket + UDP discovery)
+Documentation=file:///mnt/data/project/youn-ink-fourcolor-firmware/server/DEPLOY.md
+# This host has no root, so the service runs in the user manager with lingering
+# enabled (see `loginctl enable-linger`), which still gives start-at-boot and
+# survival after logout. User units cannot order against network-online.target,
+# so startup tolerance comes from Restart=always plus the retry limits below
+# instead.
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# The app resolves .env and data/ relative to the working directory.
+WorkingDirectory=/mnt/data/project/youn-ink-fourcolor-firmware/server
+ExecStart=/mnt/data/project/youn-ink-fourcolor-firmware/server/.venv/bin/python llmserve.py
+Environment=PYTHONUNBUFFERED=1
+
+# Crashes and stray exits both bring it back; an explicit `systemctl stop` does
+# not (systemd suppresses restarts for a requested stop).
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+# stdout/stderr go to the journal (uvicorn's access lines, tracebacks).
+# The app keeps writing its own rotating data/server.log via RotatingFileHandler;
+# pointing systemd at that same file would defeat the rotation.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=youn-ink-server
+
+# Hardening. ProtectSystem=strict makes the whole hierarchy read-only, so the
+# only writable area is the data directory (databases, pages, uploads, firmware,
+# logs). /tmp comes from PrivateTmp.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/mnt/data/project/youn-ink-fourcolor-firmware/server/data
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

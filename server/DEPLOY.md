@@ -4,7 +4,7 @@
 
 | 入口 | 端口 | 职责 |
 |---|---|---|
-| `llmserve.py` | 9001 (TCP) | 设备 WebSocket 对话 + 操作员 HTTP API + UDP Discovery |
+| `llmserve.py` | 9002 (TCP) | 设备 WebSocket 对话 + 操作员 HTTP API + UDP Discovery |
 | `push_image.py` | 8766 (TCP+UDP) | 图片上传/推送 + OTA + UDP Discovery（**与 llmserve 二选一，两个进程不能同时跑**） |
 
 > **注意**：两个入口都包含 UDP Discovery + 完整 HTTP API。跑一个就够。
@@ -28,6 +28,16 @@ cp .env.example .env
 ```
 
 ## 2. 局域网裸跑（先跑通再说）
+
+```bash
+cd server
+./start.sh install      # 只需一次：装单元、enable、开 linger
+./start.sh start
+curl http://127.0.0.1:9002/api/health
+```
+
+设备配网时服务端地址填 `http://<本机局域网 IP>:9002`。详见 §5。
+
 ## 3. 公网部署（Caddy 反代，推荐）
 
 Caddy 自动签发 Let's Encrypt 证书，无需手动管证书。
@@ -37,10 +47,10 @@ Caddy 自动签发 Let's Encrypt 证书，无需手动管证书。
 ```caddy
 your.domain.example.com {
     # WebSocket 对话
-    reverse_proxy /ws  127.0.0.1:9001
+    reverse_proxy /ws  127.0.0.1:9002
 
     # 操作员 API + 图片/OTA
-    reverse_proxy /api/*  127.0.0.1:9001
+    reverse_proxy /api/*  127.0.0.1:9002
 
     # 静态资源（如果有）
     # root * /var/www/youn
@@ -51,7 +61,7 @@ your.domain.example.com {
 **防火墙：**
 
 ```bash
-# 只放行 80（证书）、443（HTTPS/WSS）。9001/8766 不要暴露公网。
+# 只放行 80（证书）、443（HTTPS/WSS）。9002/8766 不要暴露公网。
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 sudo ufw enable
@@ -72,7 +82,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/your.domain/privkey.pem;
 
     location /ws {
-        proxy_pass http://127.0.0.1:9001;
+        proxy_pass http://127.0.0.1:9002;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -81,51 +91,56 @@ server {
     }
 
     location /api/ {
-        proxy_pass http://127.0.0.1:9001;
+        proxy_pass http://127.0.0.1:9002;
         proxy_set_header X-Real-IP $remote_addr;
         client_max_body_size 32m;   # 图片/固件上传
     }
 }
 ```
 
-## 5. systemd 单元
+## 5. systemd 服务
 
-**`/etc/systemd/system/youn-server.service`：**
+单元文件**版本化在仓库里**，`start.sh` 负责安装（符号链接进 user manager，保持单一真相源）：
 
-```ini
-[Unit]
-Description=Youn Ink Server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/youn-ink-fourcolor-firmware/server
-EnvironmentFile=/home/pi/youn-ink-fourcolor-firmware/server/.env
-ExecStart=/home/pi/youn-ink-fourcolor-firmware/server/.venv/bin/python llmserve.py
-Restart=on-failure
-RestartSec=5
-StandardOutput=append:/var/log/youn-server.log
-StandardError=append:/var/log/youn-server.log
-
-# 加固
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/home/pi/youn-ink-fourcolor-firmware/server/data
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
 ```
-
+server/systemd/youn-ink-server.service               ← 改这里
+~/.config/systemd/user/youn-ink-server.service       → 符号链接
+```
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now youn-server
-sudo systemctl status youn-server
+cd server
+./start.sh install      # 建链接 + enable + 开启 linger
+./start.sh start
+./start.sh status
+./start.sh logs         # 应用日志（data/server.log，10 MB × 5 自动轮转）
+./start.sh journal      # stdout/stderr（访问日志、traceback）
 ```
+
+**这台机器没有 root**，所以服务跑在 **user manager** 里，并已开启
+`loginctl enable-linger pi`：开机自启 ✓、退出登录后继续运行 ✓。
+
+几个不能改错的地方：
+
+- `WorkingDirectory` 必须是 `server/` —— 应用按工作目录解析 `.env` 和 `data/`。
+- `Restart=always` + `RestartSec=5`：崩溃和意外退出都会拉回；`systemctl stop` 不会
+  （systemd 对被显式停止的单元不再重启）。
+- **日志分两路，不要合并**：应用自己用 `RotatingFileHandler` 写 `data/server.log`；
+  stdout/stderr 交给 journal。若把 systemd 的 stdout 也 `append:` 到同一个文件，
+  轮转后 systemd 会继续写被重命名过的旧 inode，轮转等于失效。
+- `ProtectSystem=strict` 会把整个文件系统挂成只读，唯一可写区由 `ReadWritePaths`
+  指定为 `server/data`（数据库、页面、上传、固件、日志都在其中）；`PrivateTmp` 提供
+  可写 `/tmp`。
+- 单元是 `Type=simple`：`systemctl start` 在进程起来时就返回，**端口就绪还要 2–4 s**
+  （uvicorn 绑定 + MCP/session manager 初始化）。开机后立刻打开后台可能看到一次连接
+  失败，刷新即可；设备侧本来就会重试。
+
+<details>
+<summary>有 root 的机器（可选：系统级单元）</summary>
+
+复制同一份单元，把 `WantedBy=default.target` 改成 `multi-user.target`、补上
+`User=<运行用户>`，放到 `/etc/systemd/system/`，再 `sudo systemctl enable --now
+youn-ink-server`。user 单元里的 `StartLimit*` 同理保留在 `[Unit]` 段。
+</details>
 
 ## 6. 设备配对（首次）
 
@@ -135,7 +150,7 @@ sudo systemctl status youn-server
 4. **在服务器上放行**：
 
 ```bash
-curl -X POST http://127.0.0.1:9001/api/devices/<deviceId>/approve \
+curl -X POST http://127.0.0.1:9002/api/devices/<deviceId>/approve \
      -H "X-Operator-Token: $OPERATOR_TOKEN"
 ```
 
@@ -179,10 +194,13 @@ curl https://your.domain/api/ota/check
 ## 9. 日志 / 诊断
 
 ```bash
-./start.sh logs              # 实时 tail
-journalctl -u youn-server -f # systemd 模式
-curl http://127.0.0.1:9001/api/health
-curl http://127.0.0.1:9001/api/devices -H "X-Operator-Token: ..."
+./start.sh logs              # 跟随应用日志（data/server.log，10 MB × 5 自动轮转）
+./start.sh journal           # 跟随 stdout/stderr（uvicorn 访问日志、traceback）
+./start.sh status            # 单元状态（退出码跟 systemd 一致）
+journalctl --user -u youn-ink-server -f      # 同上，直接走 journalctl
+systemctl --user show youn-ink-server -p NRestarts --value   # 崩溃重启次数
+curl http://127.0.0.1:9002/api/health
+curl http://127.0.0.1:9002/api/devices -H "X-Operator-Token: ..."
 ```
 
 ## 10. 安全清单（公网必须过一遍）
@@ -190,7 +208,7 @@ curl http://127.0.0.1:9001/api/devices -H "X-Operator-Token: ..."
 - [ ] `OPERATOR_TOKEN` 已设置（否则 /api/* 无鉴权，图片/OTA 上传对全网开放）
 - [ ] `DISCOVERY_SHARED_SECRET` 已换成 32+ 字节随机值
 - [ ] `.env` 权限 `chmod 600`，不入库
-- [ ] 9001 / 8766 **不要直接暴露公网**——只放 80/443，反代到本地端口
+- [ ] 9002 / 8766 **不要直接暴露公网**——只放 80/443，反代到本地端口
 - [ ] 设备 `trust=1` 后才允许推送/OTA；未知 deviceId 不 approve 就行
 - [ ] `latest.json` + `.sig` 由服务端写入，下载时重新验签
 - [ ] HTTPS/WSS 走 Caddy 或 nginx，Let's Encrypt 证书自动续期
@@ -266,9 +284,9 @@ calc()，CSS 动画/过渡。
 
 ```bash
 ./start.sh start
-curl http://127.0.0.1:9001/api/health
+curl http://127.0.0.1:9002/api/health
 # {"status":"ok", ...}
 
 # 本地设备发现：
-python3 mock_client.py --server ws://127.0.0.1:9001/ws
+python3 mock_client.py --server ws://127.0.0.1:9002/ws
 ```

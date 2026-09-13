@@ -1,93 +1,110 @@
 #!/usr/bin/env bash
-# start.sh — manage the Youn Ink server
+# start.sh — control the Youn Ink server through its systemd --user unit.
 #
 # Usage:
-#   ./start.sh start|stop|restart|status|logs
+#   ./start.sh install | uninstall
+#   ./start.sh start | stop | restart | status
+#   ./start.sh logs | journal
 #
-# Runs llmserve.py (WS + HTTP + UDP discovery) as a background process.
-# For production, prefer systemd — see DEPLOY.md.
+# The unit is versioned at systemd/youn-ink-server.service and symlinked into
+# ~/.config/systemd/user/ by `install`, so the repo holds the single source of
+# truth. This host has no root, so the service lives in the user manager; with
+# lingering enabled that still means start-at-boot and survival after logout.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$HERE"
-
-PID_FILE="$HERE/data/server.pid"
+UNIT="youn-ink-server.service"
+UNIT_SRC="$HERE/systemd/$UNIT"
+UNIT_DST="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT"
 LOG_FILE="$HERE/data/server.log"
-VENV="$HERE/.venv"
-PYTHON="$VENV/bin/python"
 
-if [[ ! -x "$PYTHON" ]]; then
-    echo "[ERROR] venv not found at $VENV — run:"
-    echo "  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
-    exit 1
-fi
+usage() {
+    cat <<'EOF'
+Usage: ./start.sh {install|uninstall|start|stop|restart|status|logs|journal}
 
-is_running() {
-    [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+  install     symlink the unit into the user manager, enable it, enable lingering
+  uninstall   stop, disable and remove the unit
+  start       start the service
+  stop        stop the service
+  restart     restart the service
+  status      show unit status (exit code follows systemd)
+  logs        follow the application log (data/server.log, rotating)
+  journal     follow stdout/stderr (uvicorn access lines, tracebacks)
+EOF
+}
+
+require_installed() {
+    if [[ ! -e "$UNIT_DST" ]]; then
+        echo "[ERROR] $UNIT is not installed — run: ./start.sh install" >&2
+        exit 1
+    fi
 }
 
 case "${1:-}" in
-    start)
-        if is_running; then
-            echo "[INFO] already running (pid $(cat "$PID_FILE"))"
-            exit 0
-        fi
-        echo "[INFO] starting llmserve.py..."
-        nohup "$PYTHON" llmserve.py >> "$LOG_FILE" 2>&1 &
-        PID=$!
-        echo "$PID" > "$PID_FILE"
-        sleep 2
-        if ! kill -0 "$PID" 2>/dev/null; then
-            echo "[ERROR] process exited immediately; tail of log:"
-            tail -30 "$LOG_FILE"
-            rm -f "$PID_FILE"
+    install)
+        if [[ ! -x "$HERE/.venv/bin/python" ]]; then
+            echo "[ERROR] venv not found at $HERE/.venv — run:"
+            echo "  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
             exit 1
         fi
-        echo "[OK] started pid=$PID  log=$LOG_FILE"
+        mkdir -p "$(dirname "$UNIT_DST")"
+        ln -sfn "$UNIT_SRC" "$UNIT_DST"
+        systemctl --user daemon-reload
+        systemctl --user enable "$UNIT"
+        # Without lingering the user manager (and the service) dies with the last
+        # session. Needs no root for your own user.
+        if loginctl enable-linger "$(id -un)" 2>/dev/null; then
+            echo "[OK] lingering enabled for $(id -un)"
+        else
+            echo "[WARN] could not enable lingering; the service will stop at logout."
+            echo "       run as root: loginctl enable-linger $(id -un)"
+        fi
+        echo "[OK] installed: $UNIT_DST -> $UNIT_SRC"
+        echo "     start it with: ./start.sh start"
+        ;;
+
+    uninstall)
+        systemctl --user disable --now "$UNIT" 2>/dev/null || true
+        rm -f "$UNIT_DST"
+        systemctl --user daemon-reload
+        echo "[OK] removed $UNIT_DST"
+        ;;
+
+    start)
+        require_installed
+        systemctl --user start "$UNIT"
+        systemctl --user --no-pager --lines=0 status "$UNIT" | head -10
         ;;
 
     stop)
-        if ! is_running; then
-            echo "[INFO] not running"
-            rm -f "$PID_FILE"
-            exit 0
-        fi
-        PID=$(cat "$PID_FILE")
-        echo "[INFO] stopping pid=$PID..."
-        kill "$PID"
-        for _ in $(seq 1 20); do
-            if ! kill -0 "$PID" 2>/dev/null; then break; fi
-            sleep 0.5
-        done
-        if kill -0 "$PID" 2>/dev/null; then
-            echo "[WARN] did not exit gracefully; SIGKILL"
-            kill -9 "$PID"
-        fi
-        rm -f "$PID_FILE"
+        require_installed
+        systemctl --user stop "$UNIT"
         echo "[OK] stopped"
         ;;
 
     restart)
-        "$0" stop
-        "$0" start
+        require_installed
+        systemctl --user restart "$UNIT"
+        systemctl --user --no-pager --lines=0 status "$UNIT" | head -10
         ;;
 
     status)
-        if is_running; then
-            echo "[OK] running pid=$(cat "$PID_FILE")"
-            exit 0
-        else
-            echo "[INFO] not running"
-            exit 1
-        fi
+        require_installed
+        systemctl --user --no-pager status "$UNIT"
         ;;
 
     logs)
+        # The application's own rotating file (RotatingFileHandler, 10 MB x 5).
         tail -f "$LOG_FILE"
         ;;
 
+    journal)
+        # Everything the process wrote to stdout/stderr.
+        journalctl --user -u "$UNIT" -f -n 50
+        ;;
+
     *)
-        echo "Usage: $0 {start|stop|restart|status|logs}"
+        usage
         exit 2
         ;;
 esac
