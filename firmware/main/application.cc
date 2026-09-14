@@ -7,6 +7,7 @@
 #include "display.h"
 #include "settings.h"
 #include "ui/rawdraw_ui_manager.h"
+#include "ui/renderers/rawdraw/wifi_renderer.h"
 #include "wifi_manager.h"
 
 #include <esp_mac.h>
@@ -43,6 +44,21 @@ constexpr char kPowerNamespace[] = "power";
 
 
 
+// The last Wi-Fi disconnect reason, for the 网络 page's 失败原因 row. Cleared as
+// soon as any other state arrives, so a stale reason never reads as current.
+static int g_last_wifi_error = 0;
+
+/// The password the device holds for `ssid`, or empty when it has none (an open
+/// network, or credentials that were cleared). The settings page keeps it behind
+/// dots until the user asks for it: SettingsRenderer::TogglePasswordReveal.
+static std::string WifiPasswordFor(const std::string& ssid) {
+    if (ssid.empty()) return "";
+    for (const auto& item : SsidManager::GetInstance().GetSsidList()) {
+        if (item.ssid == ssid) return item.password;
+    }
+    return "";
+}
+
 // The 网络 section is a read-out; these are the values only the device knows.
 void RefreshNetworkStatusItems(rawdraw::SettingsRenderer* renderer, bool connected) {
     if (!renderer) return;
@@ -58,6 +74,15 @@ void RefreshNetworkStatusItems(rawdraw::SettingsRenderer* renderer, bool connect
     }
     renderer->SetItemValue(RF_SETTINGS_ITEM_SERVER,
                            page_sync_server_reachable() ? "可达" : "不可达");
+
+    // The network the device is on, the key it holds for it, and why the last
+    // attempt failed if it did.
+    const std::string ssid = wifi.GetSsid();
+    renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_SSID, ssid.empty() ? "--" : ssid);
+    renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_PASSWORD, WifiPasswordFor(ssid));
+    renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_ERROR,
+                           g_last_wifi_error ? rawdraw::WifiRenderer::ReasonToMessage(g_last_wifi_error)
+                                             : "—");
 }
 
 void UpdateWifiSettingsItem(rawdraw::SettingsRenderer* renderer, bool connected,
@@ -442,6 +467,11 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
                     UpdateStatusBarForUi();
                     break;
                 }
+                case RF_SETTINGS_ITEM_WIFI_PASSWORD:
+                    // 网络's second actionable row. The dots come off for as long
+                    // as the user is on the row; the renderer puts them back.
+                    sr->TogglePasswordReveal();
+                    break;
                 default:
                     break;
             }
@@ -1138,6 +1168,14 @@ void Application::UpdateWifiStatusForProvisioning(const std::string& state, int 
         status.state = rawdraw::WifiState::Error;
         status.error_code = reason;
         // error_msg will be filled by ReasonToMessage at render time
+    }
+
+    // The 网络 page shows the same reason; it goes away as soon as the device
+    // is doing anything else.
+    g_last_wifi_error = (state == "error") ? reason : 0;
+    if (rawdraw_ui_manager_) {
+        UpdateWifiSettingsItem(rawdraw_ui_manager_->GetSettingsRenderer(),
+                               wifi_connected_.load(std::memory_order_acquire));
     }
     renderer->Update(status);
     rawdraw_ui_manager_->RequestActivePageRefresh();

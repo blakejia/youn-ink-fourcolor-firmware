@@ -70,6 +70,13 @@ public:
     /// Which section the cursor is on.
     uint8_t GetFocusedSection() const { return section_; }
 
+    /// Reveal (or re-mask) the Wi-Fi password row. The row's value holds the
+    /// real key; this only decides whether the dots are drawn.
+    void TogglePasswordReveal();
+
+    /// How long a revealed password stays readable before it masks itself.
+    static constexpr int64_t kPasswordRevealUs = 30LL * 1000 * 1000;
+
     void SetFirmwareVersion(const char* version) { firmware_version_ = version; }
     void SetDeviceInfo(const char* mac, const char* chip) {
         mac_address_ = mac;
@@ -94,6 +101,12 @@ private:
     std::map<uint8_t, std::string> values_;
     std::map<uint8_t, bool> checks_;
     std::function<void(uint8_t, bool)> item_handler_;
+
+    /// Index of the password row in the current section, or -1 when the
+    /// section has none. Recomputed with `items_`.
+    int password_row_ = -1;
+    bool password_revealed_ = false;
+    int64_t password_revealed_at_us_ = 0;
 
     std::string firmware_version_;
     std::string mac_address_;

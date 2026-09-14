@@ -19,6 +19,7 @@
 
 #include "settings_renderer.h"
 #include "input.h"
+#include <esp_timer.h>
 #include "rawdraw/layout_utils.h"
 #include "rawdraw/rawdraw.h"
 #include "rawdraw/style.h"
@@ -210,6 +211,12 @@ void SettingsRenderer::Render(uint8_t* fb, int width, int height) {
     if (!fb) return;
 
     SyncItemsFromModel();
+
+    // A revealed password hides itself again once it has been up long enough,
+    // so nothing else has to remember to put the dots back.
+    if (password_revealed_ && esp_timer_get_time() - password_revealed_at_us_ > kPasswordRevealUs) {
+        password_revealed_ = false;
+    }
     const auto& theme = ThemeManager::Get();
     const PaintStyle bg_style = theme.Style(ThemeToken::BackgroundPrimary);
     const PaintStyle text_style = theme.Style(ThemeToken::TextPrimary);
@@ -380,7 +387,14 @@ void SettingsRenderer::RenderItem(uint8_t* fb, int width, int y,
     } else if (!item.value.empty()) {
         const int value_right = content_right - right_margin;
         const int max_val_w = std::max(0, value_right - (content_left + 88));
-        std::string display_value = FitTextToWidth(item.value, value_font_, max_val_w);
+        // `values_` holds the real key; the dots are made here, at the last
+        // moment, and only while the reveal has been asked for and has not
+        // aged out. `*` rather than a bullet: it is in every font we ship.
+        const bool masked = (index == password_row_ && !password_revealed_);
+        const std::string shown = masked
+                                      ? std::string(rf_settings_masked_len(item.value.size()), '*')
+                                      : item.value;
+        std::string display_value = FitTextToWidth(shown, value_font_, max_val_w);
         const int value_w = MeasureTextWidth(display_value.c_str(), value_font_);
         const int val_x = value_right - value_w;
         label_right = val_x - Style::kSpacingLG;
@@ -432,6 +446,7 @@ bool SettingsRenderer::HandleInput(const ButtonEvent& event) {
     }
 
     rf_settings_step_t st = {};
+    const uint8_t prev_section = section_;
     rf_settings_step(section_, focus_, option_, button, &st);
     const bool moved = (st.section != section_ || st.focus != focus_ || st.option != option_);
     section_ = st.section;
@@ -444,11 +459,28 @@ bool SettingsRenderer::HandleInput(const ButtonEvent& event) {
         if (item_handler_) item_handler_(st.effect_item, st.effect == RF_SETTINGS_EFFECT_TOGGLE);
     }
 
+    // Walking off the password row (or out of its section) puts the dots back:
+    // the reveal is for the moment the user is looking at the row.
+    const bool on_password = st.section == prev_section
+                             && st.focus == RF_SETTINGS_FOCUS_OPTIONS
+                             && st.option == password_row_;
+    const bool hid = password_revealed_ && !on_password;
+    if (hid) password_revealed_ = false;
+
     // Only a visible change is worth a full refresh: on this panel one costs
     // 10-25 s. A confirm that acts repaints through its own path.
-    if (!moved && !acted) return false;
+    if (!moved && !acted && !hid) return false;
     needs_full_refresh_ = true;
     return true;
+}
+
+void SettingsRenderer::TogglePasswordReveal() {
+    // The handler only fires while the cursor rests on the row, so a section
+    // without one means there is nothing to reveal.
+    if (password_row_ < 0) return;
+    password_revealed_ = !password_revealed_;
+    password_revealed_at_us_ = esp_timer_get_time();
+    needs_full_refresh_ = true;
 }
 
 void SettingsRenderer::SetItemValue(uint8_t id, const std::string& value) {
@@ -477,9 +509,11 @@ void SettingsRenderer::SyncItemsFromModel() {
 
     items_.clear();
     items_.reserve(sec.item_count);
+    password_row_ = -1;
     for (uint8_t i = 0; i < sec.item_count; ++i) {
         rf_settings_item_t it = {};
         rf_settings_get_item(section_, i, &it);
+        if (it.id == RF_SETTINGS_ITEM_WIFI_PASSWORD) password_row_ = static_cast<int>(i);
         SettingsItemDef def;
         def.label = it.label ? it.label : "";
         def.value = ValueFor(it.id);

@@ -73,6 +73,10 @@ public:
     void SetBlinking(bool blinking);
     bool IsBlinking() const { return is_blinking_; }
 
+    // Map WiFi reason code (from WIFI_EVENT_STA_DISCONNECTED) to Chinese message.
+    // Public because the Settings page shows the same text for the same code.
+    static const char* ReasonToMessage(int reason);
+
 private:
     // Render each state
     void RenderConnecting(uint8_t* fb, int width, int height);
@@ -82,9 +86,6 @@ private:
     void RenderApClientConnected(uint8_t* fb, int width, int height);
     void RenderProvisioning(uint8_t* fb, int width, int height);
     void RenderError(uint8_t* fb, int width, int height);
-
-    // Map WiFi reason code (from WIFI_EVENT_STA_DISCONNECTED) to Chinese message
-    static const char* ReasonToMessage(int reason);
 
     // Draw signal strength bars (5-bar visualization)
     void DrawSignalBars(uint8_t* fb, int width, int x, int y,

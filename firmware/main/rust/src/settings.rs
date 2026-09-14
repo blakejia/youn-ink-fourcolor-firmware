@@ -44,6 +44,21 @@ pub const ITEM_WIFI_STATE: u8 = 4;
 pub const ITEM_WIFI_IP: u8 = 5;
 pub const ITEM_WIFI_SIGNAL: u8 = 6;
 pub const ITEM_SERVER: u8 = 7;
+pub const ITEM_WIFI_SSID: u8 = 8;
+/// An Action row, unlike its neighbours: the reveal has to be asked for.
+pub const ITEM_WIFI_PASSWORD: u8 = 9;
+pub const ITEM_WIFI_ERROR: u8 = 10;
+
+/// How many dots a masked password draws at most. A longer secret is still
+/// covered, just not counted out in full on a panel the room can read.
+pub const PASSWORD_MASK_CAP: usize = 16;
+
+/// The number of masking dots for a secret of `len` bytes. Pure, so the rule
+/// ("as many dots as the password has characters, up to the cap") is asserted
+/// here rather than in the renderer.
+pub fn masked_len(len: usize) -> usize {
+    len.min(PASSWORD_MASK_CAP)
+}
 
 use Item as I;
 
@@ -56,8 +71,11 @@ const SYSTEM_ITEMS: &[Item] = &[
 const NETWORK_ITEMS: &[Item] = &[
     I { id: ITEM_WIFI_TOGGLE, label: c"Wi-Fi", kind: Kind::Toggle },
     I { id: ITEM_WIFI_STATE, label: c"连接状态", kind: Kind::Info },
+    I { id: ITEM_WIFI_SSID, label: c"Wi-Fi 名称", kind: Kind::Info },
+    I { id: ITEM_WIFI_PASSWORD, label: c"Wi-Fi 密码", kind: Kind::Action },
     I { id: ITEM_WIFI_IP, label: c"IP 地址", kind: Kind::Info },
     I { id: ITEM_WIFI_SIGNAL, label: c"信号强度", kind: Kind::Info },
+    I { id: ITEM_WIFI_ERROR, label: c"失败原因", kind: Kind::Info },
     I { id: ITEM_SERVER, label: c"服务端", kind: Kind::Info },
 ];
 
@@ -247,6 +265,13 @@ pub extern "C" fn rf_settings_section_count() -> u8 {
     SECTIONS.len() as u8
 }
 
+/// How many masking dots to draw for a password of `len` bytes. The renderer
+/// picks the glyph; the rule for how many live here.
+#[unsafe(no_mangle)]
+pub extern "C" fn rf_settings_masked_len(len: usize) -> usize {
+    masked_len(len)
+}
+
 /// # Safety
 /// `out` must point to a valid, correctly aligned struct.
 #[unsafe(no_mangle)]
@@ -358,9 +383,46 @@ mod tests {
     #[test]
     fn network_shows_the_wifi_switch_and_the_current_network_status() {
         let labels: Vec<String> = NETWORK_ITEMS.iter().map(|i| i.label.to_str().unwrap().to_string()).collect();
-        assert_eq!(labels, vec!["Wi-Fi", "连接状态", "IP 地址", "信号强度", "服务端"]);
+        assert_eq!(
+            labels,
+            vec!["Wi-Fi", "连接状态", "Wi-Fi 名称", "Wi-Fi 密码", "IP 地址", "信号强度", "失败原因", "服务端"]
+        );
+        // Two rows can be acted on: the switch, and the password reveal. Every
+        // other row is a read-out the cursor never rests on.
+        let actionable: Vec<u8> = NETWORK_ITEMS
+            .iter()
+            .filter(|i| i.kind != Kind::Info)
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(actionable, vec![ITEM_WIFI_TOGGLE, ITEM_WIFI_PASSWORD]);
         assert_eq!(NETWORK_ITEMS[0].kind, Kind::Toggle);
-        assert!(NETWORK_ITEMS[1..].iter().all(|i| i.kind == Kind::Info));
+        assert_eq!(NETWORK_ITEMS[3].kind, Kind::Action);
+    }
+
+    #[test]
+    fn boot_on_the_password_row_asks_to_reveal_it() {
+        let (c, e) = step(opts(1, 3), Button::Boot);
+        assert_eq!(e, Effect::Activate(ITEM_WIFI_PASSWORD));
+        assert_eq!(c, opts(1, 3), "revealing does not move the cursor");
+    }
+
+    #[test]
+    fn the_cursor_walks_from_the_switch_straight_to_the_password_row() {
+        // Index 1 and 2 are read-outs, so DOWN must skip them.
+        let (c, e) = step(opts(1, 0), Button::Down);
+        assert_eq!(c, opts(1, 3));
+        assert_eq!(e, Effect::None);
+    }
+
+    // ── the masked password ─────────────────────────────────────────────
+
+    #[test]
+    fn the_mask_is_as_long_as_the_password_up_to_the_cap() {
+        assert_eq!(masked_len(0), 0);
+        assert_eq!(masked_len(8), 8);
+        assert_eq!(masked_len(11), 11, "titi10-102 shows eleven dots");
+        assert_eq!(masked_len(PASSWORD_MASK_CAP), PASSWORD_MASK_CAP);
+        assert_eq!(masked_len(64), PASSWORD_MASK_CAP, "a long secret is capped, not counted out");
     }
 
     #[test]
@@ -439,11 +501,13 @@ mod tests {
 
     #[test]
     fn the_cursor_skips_info_rows_and_stops_at_the_last_option() {
-        // 网络: option 0 is the toggle, 1..4 are info read-outs.
+        // 网络: 0 is the toggle, 1–2 are read-outs, 3 is the password reveal,
+        // and everything after that is a read-out again.
         let (c, _) = step(opts(1, 0), Button::Down);
-        assert_eq!(c.option, 0, "nothing after the toggle can be confirmed");
+        assert_eq!(c.option, 3, "the read-outs between the two options are skipped");
         assert_eq!(first_selectable(&SECTIONS[1]), Some(0));
-        assert_eq!(next_selectable(&SECTIONS[1], 0), None);
+        assert_eq!(next_selectable(&SECTIONS[1], 0), Some(3));
+        assert_eq!(next_selectable(&SECTIONS[1], 3), None, "the password is the last option");
     }
 
     #[test]
@@ -531,10 +595,11 @@ mod tests {
 
     #[test]
     fn a_section_with_only_info_rows_never_takes_the_cursor() {
-        // 网络's info rows sit after the toggle; asking for the option after it
-        // must not land on one.
-        let (c, _) = step(opts(1, 0), Button::Down);
-        assert_eq!(c.option, 0);
+        // The read-outs past the last option are no more reachable than the
+        // ones between: DOWN from the password row stays where it is, and the
+        // row it stays on is not an Info row.
+        let (c, _) = step(opts(1, 3), Button::Down);
+        assert_eq!(c.option, 3);
         assert!(NETWORK_ITEMS[c.option as usize].kind != Kind::Info);
     }
 }

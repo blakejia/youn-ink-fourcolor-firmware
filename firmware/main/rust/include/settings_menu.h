@@ -10,6 +10,7 @@
 // (`SetItemValue`), and the application runs the effect the menu asks for
 // (`SetItemHandler`) — the menu itself never restarts, sleeps or toggles.
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -74,7 +75,15 @@ enum {
     RF_SETTINGS_ITEM_WIFI_IP = 5,
     RF_SETTINGS_ITEM_WIFI_SIGNAL = 6,
     RF_SETTINGS_ITEM_SERVER = 7,
+    RF_SETTINGS_ITEM_WIFI_SSID = 8,
+    /* An Action row: BOOT on it reveals (or re-masks) the password. */
+    RF_SETTINGS_ITEM_WIFI_PASSWORD = 9,
+    RF_SETTINGS_ITEM_WIFI_ERROR = 10,
 };
+
+/* How many masking dots to draw for a password of `len` bytes; the renderer
+ * picks the glyph. */
+size_t rf_settings_masked_len(size_t len);
 
 #ifdef __cplusplus
 }
