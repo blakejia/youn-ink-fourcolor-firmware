@@ -69,6 +69,8 @@ void rf_settings_step(uint8_t section, uint8_t focus, uint8_t option, uint8_t bu
 enum {
     RF_SETTINGS_ITEM_RESTART = 0,
     RF_SETTINGS_ITEM_RESET_NETWORK = 1,
+    /* Retired as a row while 系统 hides 省电模式; the number stays reserved so
+     * the ids below it never move. The application still handles it. */
     RF_SETTINGS_ITEM_SLEEP = 2,
     RF_SETTINGS_ITEM_WIFI_TOGGLE = 3,
     RF_SETTINGS_ITEM_WIFI_STATE = 4,
@@ -79,11 +81,33 @@ enum {
     /* An Action row: BOOT on it reveals (or re-masks) the password. */
     RF_SETTINGS_ITEM_WIFI_PASSWORD = 9,
     RF_SETTINGS_ITEM_WIFI_ERROR = 10,
+    /* Wi-Fi credentials and the pairing: set up again from the provisioning
+     * page, code and all. */
+    RF_SETTINGS_ITEM_RESET_DEVICE = 11,
 };
 
 /* How many masking dots to draw for a password of `len` bytes; the renderer
  * picks the glyph. */
 size_t rf_settings_masked_len(size_t len);
+
+/* Does this id wipe something? The renderer colours the row with this. */
+uint8_t rf_settings_is_destructive(uint8_t id);
+
+/* Nothing is armed. */
+#define RF_SETTINGS_CONFIRM_NONE 0xFF
+
+typedef struct {
+    uint8_t armed_id;     /* RF_SETTINGS_ITEM_* or RF_SETTINGS_CONFIRM_NONE */
+    uint8_t act;          /* 1 = run the effect now */
+    uint8_t _pad[6];
+    uint64_t armed_at_ms; /* keep between calls */
+} rf_settings_confirm_t;
+
+/* One press on a destructive row: the first arms it, a second one inside the
+ * window acts (`act` = 1). Pressing another row, or pressing after the window,
+ * arms that row instead. The caller owns the two state fields. */
+void rf_settings_confirm(uint8_t armed_id, uint64_t armed_at_ms, uint8_t pressed_id,
+                         uint64_t now_ms, rf_settings_confirm_t* out);
 
 #ifdef __cplusplus
 }

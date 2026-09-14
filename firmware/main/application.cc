@@ -48,6 +48,11 @@ constexpr char kPowerNamespace[] = "power";
 // soon as any other state arrives, so a stale reason never reads as current.
 static int g_last_wifi_error = 0;
 
+// Which destructive settings row is armed and since when, for the two-press
+// confirm. The window rule itself is settings.rs::confirm_step.
+static uint8_t g_reset_armed_id = RF_SETTINGS_CONFIRM_NONE;
+static uint64_t g_reset_armed_at_ms = 0;
+
 /// The password the device holds for `ssid`, or empty when it has none (an open
 /// network, or credentials that were cleared). The settings page keeps it behind
 /// dots until the user asks for it: SettingsRenderer::TogglePasswordReveal.
@@ -438,18 +443,52 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
         // this is the only place that knows how to restart, clear credentials,
         // sleep or toggle the radio.
         sr->SetItemHandler([this, sr](uint8_t id, bool /*toggle*/) {
+            // Any press retires a pending "press again" prompt; a destructive
+            // press below puts it back if it is still only armed.
+            sr->SetItemValue(RF_SETTINGS_ITEM_RESET_NETWORK, "");
+            sr->SetItemValue(RF_SETTINGS_ITEM_RESET_DEVICE, "");
+
+            // The two resets wipe something, so they ask twice: the first press
+            // arms (settings.rs::confirm_step owns the window), the second runs.
+            if (rf_settings_is_destructive(id)) {
+                rf_settings_confirm_t c = {};
+                const uint64_t now_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000);
+                rf_settings_confirm(g_reset_armed_id, g_reset_armed_at_ms, id, now_ms, &c);
+                g_reset_armed_id = c.armed_id;
+                g_reset_armed_at_ms = c.armed_at_ms;
+                if (!c.act) {
+                    ESP_LOGW(kTag, "Settings: %u armed; press again to confirm", (unsigned)id);
+                    sr->SetItemValue(id, "再按一次确认");
+                    return;
+                }
+                ESP_LOGW(kTag, "Settings: %u confirmed", (unsigned)id);
+            }
+
             switch (id) {
                 case RF_SETTINGS_ITEM_RESTART:
                     ESP_LOGW(kTag, "Settings: restart requested");
                     esp_restart();
                     break;
                 case RF_SETTINGS_ITEM_RESET_NETWORK:
-                    ESP_LOGW(kTag, "Reset network: clearing WiFi credentials and pairing token");
+                    // Wi-Fi only: the pairing (base_url + token, the `server`
+                    // namespace) survives, so re-provisioning reconnects without
+                    // asking for a code again.
+                    ESP_LOGW(kTag, "Reset network: clearing WiFi credentials, keeping pairing");
+                    SsidManager::GetInstance().Clear();
+                    esp_restart();
+                    break;
+                case RF_SETTINGS_ITEM_RESET_DEVICE:
+                    // Everything the user set up: Wi-Fi and the pairing. The
+                    // device comes back needing the provisioning page and a code.
+                    ESP_LOGW(kTag, "Reset device: clearing WiFi credentials and pairing token");
                     SsidManager::GetInstance().Clear();
                     server_pairing_clear();
                     esp_restart();
                     break;
                 case RF_SETTINGS_ITEM_SLEEP:
+                    // No row emits this while 系统 hides 省电模式 (the automatic
+                    // sleep policy still puts the device down). Kept, with the
+                    // entry point, so bringing the row back is one line.
                     ESP_LOGI(kTag, "Manual sleep requested from settings");
                     EnterManualSleep();
                     break;

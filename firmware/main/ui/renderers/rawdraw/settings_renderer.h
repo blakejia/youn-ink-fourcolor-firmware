@@ -43,6 +43,9 @@ struct SettingsItemDef {
     std::string value;
     SettingsItemType type = SettingsItemType::Normal;
     bool checked = false;
+    /// Wipes something: drawn in the danger colour, and the application asks
+    /// twice before running it.
+    bool danger = false;
 };
 
 /**

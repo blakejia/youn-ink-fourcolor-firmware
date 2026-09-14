@@ -38,6 +38,8 @@ pub struct Section {
 
 pub const ITEM_RESTART: u8 = 0;
 pub const ITEM_RESET_NETWORK: u8 = 1;
+/// Retired as a row while 系统 hides 省电模式. The number stays reserved so the
+/// ids below it never move; `application.cc` still handles the id.
 pub const ITEM_SLEEP: u8 = 2;
 pub const ITEM_WIFI_TOGGLE: u8 = 3;
 pub const ITEM_WIFI_STATE: u8 = 4;
@@ -48,6 +50,35 @@ pub const ITEM_WIFI_SSID: u8 = 8;
 /// An Action row, unlike its neighbours: the reveal has to be asked for.
 pub const ITEM_WIFI_PASSWORD: u8 = 9;
 pub const ITEM_WIFI_ERROR: u8 = 10;
+/// Wi-Fi credentials *and* the pairing: the device has to be set up again from
+/// the provisioning page, code and all.
+pub const ITEM_RESET_DEVICE: u8 = 11;
+
+/// Rows that wipe something and therefore ask twice before running. The
+/// renderer draws them in the danger colour, the application arms and confirms
+/// them, and both read the list from here.
+pub const DESTRUCTIVE: &[u8] = &[ITEM_RESET_NETWORK, ITEM_RESET_DEVICE];
+
+pub fn is_destructive(id: u8) -> bool {
+    DESTRUCTIVE.contains(&id)
+}
+
+/// How long a first press stays armed.
+pub const CONFIRM_WINDOW_MS: u64 = 10_000;
+
+/// One press on a destructive row: `(armed row, when it was armed, run it now)`.
+/// Pressing the armed row again inside the window runs it; pressing anything
+/// else (or pressing after the window) arms that row instead, so a stray click
+/// can never be the second half of a pair it did not start.
+pub fn confirm_step(
+    armed: Option<u8>,
+    armed_at_ms: u64,
+    pressed: u8,
+    now_ms: u64,
+) -> (Option<u8>, u64, bool) {
+    let fresh = armed == Some(pressed) && now_ms.saturating_sub(armed_at_ms) <= CONFIRM_WINDOW_MS;
+    (Some(pressed), now_ms, fresh)
+}
 
 /// How many dots a masked password draws at most. A longer secret is still
 /// covered, just not counted out in full on a panel the room can read.
@@ -65,7 +96,7 @@ use Item as I;
 const SYSTEM_ITEMS: &[Item] = &[
     I { id: ITEM_RESTART, label: c"重启", kind: Kind::Action },
     I { id: ITEM_RESET_NETWORK, label: c"重置网络", kind: Kind::Action },
-    I { id: ITEM_SLEEP, label: c"省电模式", kind: Kind::Action },
+    I { id: ITEM_RESET_DEVICE, label: c"重置设备", kind: Kind::Action },
 ];
 
 const NETWORK_ITEMS: &[Item] = &[
@@ -272,6 +303,50 @@ pub extern "C" fn rf_settings_masked_len(len: usize) -> usize {
     masked_len(len)
 }
 
+/// Does `id` wipe something? The renderer colours the row with this.
+#[unsafe(no_mangle)]
+pub extern "C" fn rf_settings_is_destructive(id: u8) -> u8 {
+    if is_destructive(id) { 1 } else { 0 }
+}
+
+/// `rf_settings_confirm_t`. Keep in step. `armed_id == 0xFF` means nothing is
+/// armed.
+#[repr(C)]
+pub struct CConfirm {
+    pub armed_id: u8,
+    pub act: u8,
+    pub _pad: [u8; 6],
+    pub armed_at_ms: u64,
+}
+
+/// One press on a destructive row. The caller keeps `armed_id`/`armed_at_ms`
+/// between calls and runs the effect when `act` comes back 1.
+///
+/// # Safety
+/// `out` must point to a valid, correctly aligned struct.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rf_settings_confirm(
+    armed_id: u8,
+    armed_at_ms: u64,
+    pressed_id: u8,
+    now_ms: u64,
+    out: *mut CConfirm,
+) {
+    if out.is_null() {
+        return;
+    }
+    let armed = if armed_id == 0xFF { None } else { Some(armed_id) };
+    let (next, at, act) = confirm_step(armed, armed_at_ms, pressed_id, now_ms);
+    unsafe {
+        *out = CConfirm {
+            armed_id: next.unwrap_or(0xFF),
+            act: if act { 1 } else { 0 },
+            _pad: [0; 6],
+            armed_at_ms: at,
+        };
+    }
+}
+
 /// # Safety
 /// `out` must point to a valid, correctly aligned struct.
 #[unsafe(no_mangle)]
@@ -374,10 +449,56 @@ mod tests {
     }
 
     #[test]
-    fn system_holds_restart_and_reset_network() {
+    fn system_holds_restart_and_the_two_resets() {
         let labels: Vec<String> = SYSTEM_ITEMS.iter().map(|i| i.label.to_str().unwrap().to_string()).collect();
-        assert_eq!(&labels[..2], &["重启", "重置网络"]);
-        assert!(SYSTEM_ITEMS[0..2].iter().all(|i| i.kind == Kind::Action));
+        assert_eq!(labels, vec!["重启", "重置网络", "重置设备"]);
+        assert!(SYSTEM_ITEMS.iter().all(|i| i.kind == Kind::Action));
+        // 省电模式 is hidden for now; the entry point it drove is still wired.
+        assert!(SYSTEM_ITEMS.iter().all(|i| i.id != ITEM_SLEEP));
+    }
+
+    #[test]
+    fn only_the_two_resets_are_destructive() {
+        let dangerous: Vec<u8> = SECTIONS
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .filter(|i| is_destructive(i.id))
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(dangerous, vec![ITEM_RESET_NETWORK, ITEM_RESET_DEVICE]);
+        assert!(!is_destructive(ITEM_RESTART));
+        assert!(!is_destructive(ITEM_WIFI_PASSWORD));
+    }
+
+    // ── the two-press confirm ───────────────────────────────────────────
+
+    #[test]
+    fn the_first_press_arms_and_the_second_inside_the_window_acts() {
+        let (armed, at, acts) = confirm_step(None, 0, ITEM_RESET_DEVICE, 1_000);
+        assert!(!acts, "the first press only arms");
+        assert_eq!(armed, Some(ITEM_RESET_DEVICE));
+        assert_eq!(at, 1_000);
+
+        let (again, _, acts) = confirm_step(armed, at, ITEM_RESET_DEVICE, 5_000);
+        assert!(acts, "the second press inside the window runs it");
+        assert_eq!(again, Some(ITEM_RESET_DEVICE), "the arm is kept for its own timeout");
+    }
+
+    #[test]
+    fn a_press_after_the_window_arms_again_instead_of_running() {
+        let (armed, at, _) = confirm_step(None, 0, ITEM_RESET_DEVICE, 1_000);
+        let (next, next_at, acts) = confirm_step(armed, at, ITEM_RESET_DEVICE, 1_000 + CONFIRM_WINDOW_MS + 1);
+        assert!(!acts, "a stale arm must not run anything");
+        assert_eq!(next, Some(ITEM_RESET_DEVICE));
+        assert_eq!(next_at, 1_000 + CONFIRM_WINDOW_MS + 1);
+    }
+
+    #[test]
+    fn pressing_another_row_re_arms_rather_than_running_the_armed_one() {
+        let (armed, at, _) = confirm_step(None, 0, ITEM_RESET_NETWORK, 1_000);
+        let (next, _, acts) = confirm_step(armed, at, ITEM_RESET_DEVICE, 2_000);
+        assert!(!acts, "RESET_NETWORK was armed; RESET_DEVICE is not a confirmation of it");
+        assert_eq!(next, Some(ITEM_RESET_DEVICE));
     }
 
     #[test]

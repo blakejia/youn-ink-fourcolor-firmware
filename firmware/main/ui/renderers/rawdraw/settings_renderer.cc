@@ -341,7 +341,9 @@ void SettingsRenderer::RenderItem(uint8_t* fb, int width, int y,
     const auto& theme = ThemeManager::Get();
     const PaintStyle text_style = theme.Style(ThemeToken::TextPrimary);
     const PaintStyle selected_style = theme.Component(ComponentRole::SettingsSelected);
-    const Color action_color = TokenInkOnPaper(item.label == "关机" ? ThemeToken::Danger : ThemeToken::Accent);
+    // The two resets wipe something; the model says which rows those are, so
+    // this is not a list of labels kept in step by hand.
+    const Color action_color = TokenInkOnPaper(item.danger ? ThemeToken::Danger : ThemeToken::Accent);
     // The selected setting row uses a compact left rail instead of a full
     // filled background, so row content must stay readable on white paper.
     const Color fg_color = text_style.fg;
@@ -518,6 +520,7 @@ void SettingsRenderer::SyncItemsFromModel() {
         def.label = it.label ? it.label : "";
         def.value = ValueFor(it.id);
         def.checked = checks_[it.id];
+        def.danger = rf_settings_is_destructive(it.id) != 0;
         switch (it.kind) {
             case RF_SETTINGS_KIND_ACTION:
                 def.type = SettingsItemType::Action;
