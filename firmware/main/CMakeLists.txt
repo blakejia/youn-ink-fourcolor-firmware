@@ -180,7 +180,15 @@ set(RUST_SOURCES
     "${RUST_DIR}/src/notify.rs"
     "${RUST_DIR}/src/json.rs"
     "${RUST_DIR}/src/log.rs"
-    "${RUST_DIR}/src/shim.rs")
+    "${RUST_DIR}/src/shim.rs"
+    # The modules below were added after this list was written and were never
+    # registered, so editing them did not rebuild the library: an incremental
+    # build quietly linked the previous Rust code.
+    "${RUST_DIR}/src/input.rs"
+    "${RUST_DIR}/src/lifecycle.rs"
+    "${RUST_DIR}/src/pairing.rs"
+    "${RUST_DIR}/src/power.rs"
+    "${RUST_DIR}/src/settings.rs")
 
 # DEVICE_MASTER_KEY is baked into the archive, so it has to take part in
 # dependency tracking: without this stamp, changing -DDEVICE_MASTER_KEY would
