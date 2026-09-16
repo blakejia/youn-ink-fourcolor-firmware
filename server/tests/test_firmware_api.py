@@ -51,6 +51,7 @@ def test_endpoints_refuse_when_no_token_is_configured(client, monkeypatch):
     monkeypatch.delenv("OPERATOR_TOKEN", raising=False)
     monkeypatch.setattr(settings, "operator_token", "")
     assert client.get("/api/firmware").status_code == 503
+    assert client.get("/api/firmware/build:xiaozhi.bin/download").status_code == 503
     assert client.post("/api/firmware", files={"file": ("x.bin", HEADER)}).status_code == 503
 
 
@@ -70,7 +71,7 @@ def test_upload_then_list_then_download_round_trip(client):
 
     d = client.get(f"/api/firmware/{item['id']}/download", headers={"X-Operator-Token": TOKEN})
     assert d.status_code == 200
-    assert d.content == HEADER + b"payload"
+    assert d.headers["content-type"] == "application/octet-stream"
     assert d.headers["x-sha256"] == hashlib.sha256(HEADER + b"payload").hexdigest()
 
 
@@ -95,5 +96,15 @@ def test_upload_rejects_an_oversized_image(client):
 
 def test_download_rejects_traversal_and_unknown_ids(client):
     h = {"X-Operator-Token": TOKEN}
+    # 正控：真实存在的上传件必须下载成功。没有这条，下面那几个 404 断言
+    # 会被"路由缺失/守卫缺失"同样满足，测试就失去鉴别力。
+    item = client.post(
+        "/api/firmware", files={"file": ("ok.bin", HEADER)}, headers=h
+    ).json()
+    assert client.get(f"/api/firmware/{item['id']}/download", headers=h).status_code == 200
+
     for bad in ("upload:..%2F..%2Fetc%2Fpasswd", "upload:nope.bin", "bogus:x"):
-        assert client.get(f"/api/firmware/{bad}/download", headers=h).status_code == 404
+        r = client.get(f"/api/firmware/{bad}/download", headers=h)
+        assert r.status_code == 404
+        # 断言 handler 自己的 detail，才能与 FastAPI 路由缺失的 "Not Found" 区分开
+        assert r.json()["detail"] == "firmware not found"
