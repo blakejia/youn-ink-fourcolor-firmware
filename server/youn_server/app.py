@@ -798,7 +798,7 @@ def create_app() -> FastAPI:
         from fastapi.staticfiles import StaticFiles
 
         app.mount("/assets", StaticFiles(directory=str(dist_dir / "assets")), name="spa-assets")
-        for _spa_path in ("/", "/login", "/devices", "/pages", "/images", "/ota"):
+        for _spa_path in ("/", "/login", "/devices", "/pages", "/images", "/ota", "/serial"):
             app.get(_spa_path, response_class=FileResponse, include_in_schema=False)(
                 lambda _p=_spa_path: FileResponse(str(dist_dir / "index.html"))
             )

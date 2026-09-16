@@ -61,6 +61,23 @@ export const api = {
     }
     return res.json();
   },
+  firmwareList: async () => (await request('/firmware')).items ?? [],
+  // request() 对非 JSON 响应直接返回 Response，这里取字节
+  firmwareBytes: (id) => request(`/firmware/${encodeURIComponent(id)}/download`).then((r) => r.arrayBuffer()),
+  uploadFirmware: async (file) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    const headers = {};
+    const token = getToken();
+    if (token) headers['X-Operator-Token'] = token;
+    const res = await fetch(`${BASE}/firmware`, { method: 'POST', body: fd, headers });
+    if (!res.ok) {
+      let d = res.statusText;
+      try { d = (await res.json()).detail || d; } catch (e) {}
+      throw new Error(d);
+    }
+    return res.json();
+  },
   otaCheck: async () => {
     // operator view of latest firmware (device-facing /ota/check needs Bearer)
     const j = await request('/ota');

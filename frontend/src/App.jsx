@@ -10,12 +10,14 @@ import Devices from './pages/Devices.jsx';
 import Pages from './pages/Pages.jsx';
 import Images from './pages/Images.jsx';
 import Ota from './pages/Ota.jsx';
+import Serial from './pages/Serial.jsx';
 
 const NAV = [
   { to: '/devices', label: '设备管理' },
   { to: '/pages', label: '页组管理' },
   { to: '/images', label: '替换页面画面' },
   { to: '/ota', label: 'OTA' },
+  { to: '/serial', label: '串口 / 固件' },
 ];
 
 function DeviceSelector() {
@@ -143,6 +145,7 @@ export const routes = [
       { path: 'pages', element: <Pages /> },
       { path: 'images', element: <Images /> },
       { path: 'ota', element: <Ota /> },
+      { path: 'serial', element: <Serial /> },
     ],
   },
   { path: '*', element: <Navigate to={isAuthed() ? '/devices' : '/login'} replace /> },
