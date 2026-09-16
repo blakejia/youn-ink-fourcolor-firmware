@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     images_dir: Path = Field(default=Path("./data/images"))
     firmware_dir: Path = Field(default=Path("./data/firmware"))
     uploads_dir: Path = Field(default=Path("./data/uploads"))
+    # 浏览器手动刷写用的固件仓库。与 firmware_dir（OTA 频道）严格分离：
+    # 上传件若落进 OTA 目录，设备会经 /api/ota/check 当正式更新拉走并自动刷。
+    serial_firmware_dir: Path = Field(default=Path("./data/serial-firmware"))
 
     # ── Logging ──
     log_level: str = Field(default="INFO")
@@ -80,7 +83,7 @@ class Settings(BaseSettings):
     canvas_min_page_duration_minutes: int = Field(default=10)
 
     def resolve_paths(self, base: Path) -> None:
-        for field in ("data_dir", "devices_db", "images_dir", "firmware_dir", "uploads_dir", "log_dir"):
+        for field in ("data_dir", "devices_db", "images_dir", "firmware_dir", "uploads_dir", "log_dir", "serial_firmware_dir"):
             p = getattr(self, field)
             if not p.is_absolute():
                 setattr(self, field, (base / p).resolve())
@@ -92,7 +95,7 @@ def _load_settings() -> Settings:
     # so a systemd unit launching `python llmserve.py` writes into server/data.
     base = Path(os.environ.get("YOUN_SERVER_BASE", Path.cwd())).resolve()
     s.resolve_paths(base)
-    for d in (s.data_dir, s.images_dir, s.firmware_dir, s.uploads_dir, s.log_dir):
+    for d in (s.data_dir, s.images_dir, s.firmware_dir, s.uploads_dir, s.log_dir, s.serial_firmware_dir):
         d.mkdir(parents=True, exist_ok=True)
     return s
 
