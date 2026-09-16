@@ -803,31 +803,46 @@ export class LineDecoder {
   constructor() {
     this.decoder = new TextDecoder('utf-8', { fatal: false });
     this.pending = '';
+    // 上一条记录以孤立 \r 结束在缓冲区末尾 ⇒ 下一包开头的 \n 是同一个断行的另一半，
+    // 必须吞掉，否则跨 USB 包断开的 CRLF 会多出一个空行（约每 64 行一次）。
+    this.sawCR = false;
   }
 
   /** @param {Uint8Array} bytes @returns {string[]} 完整行 */
   push(bytes) {
     this.pending += this.decoder.decode(bytes, { stream: true });
+    if (this.sawCR && this.pending.startsWith('\n')) this.pending = this.pending.slice(1);
+    this.sawCR = false;
     const out = [];
     let idx;
     while ((idx = this.pending.search(/[\r\n]/)) !== -1) {
       const line = this.pending.slice(0, idx);
+      const isCR = this.pending[idx] === '\r';
       // CRLF 是一个断行，不是两个：否则每行后面都会多一个空行
-      let next = idx + 1;
-      if (this.pending[idx] === '\r' && this.pending[next] === '\n') next += 1;
+      const joined = isCR && this.pending[idx + 1] === '\n';
+      const next = joined ? idx + 2 : idx + 1;
       this.pending = this.pending.slice(next);
+      // 孤立 \r 且它就是缓冲区最后一个字符 ⇒ 下一包开头的 \n 属同一断行
+      this.sawCR = isCR && !joined && this.pending.length === 0;
       out.push(clean(line));
     }
     return out;
   }
 
   flush() {
-    if (!this.pending) return [];
+    if (!this.pending) {
+      this.sawCR = false;
+      return [];
+    }
     const line = clean(this.pending);
     this.pending = '';
+    this.sawCR = false;
     return [line];
   }
 }
+
+const BYTE_ENCODER = new TextEncoder();
+const byteLength = (s) => BYTE_ENCODER.encode(s).length;
 
 function clean(line) {
   return line.replace(ANSI, '').replace(CTRL, '');
@@ -843,7 +858,7 @@ export class RingBuffer {
   push(lines) {
     for (const l of lines) {
       this.lines.push(l);
-      this.bytes += l.length + 1;
+      this.bytes += byteLength(l) + 1;
     }
     this.enforce();
   }
@@ -858,7 +873,7 @@ export class RingBuffer {
       (this.bytes > RING_BYTE_CAP && this.lines.length > 1)
     ) {
       const dropped = this.lines.shift();
-      this.bytes -= dropped.length + 1;
+      this.bytes -= byteLength(dropped) + 1;
       this.truncated = true;
     }
   }
@@ -963,7 +978,13 @@ export const OTADATA_OFFSET = 0xd000;
 export const OTADATA_SIZE = 0x2000;
 export const APP_PARTITION_SIZE = 0x3f0000;
 
-// otadata 的两条槽位记录，各 32 字节：ota_seq(u32) seq_label[20] ota_state(u32) crc(u32)
+// 单条槽位记录 32 字节：ota_seq(u32) seq_label[20] ota_state(u32) crc(u32)。
+// ⚠️ 两条记录**各占一个 4 KiB 扇区**，不是连续的两条 32 字节：
+// ESP-IDF 的 bootloader_common_read_otadata() 从 ota_select_map + SPI_SEC_SIZE
+// 读第二条；写入侧 rewrite_ota_seq() 整扇区擦除后只写 32 字节，所以 0x20.. 恒为
+// 0xFF。按记录长度步进会永远只看到第一条记录，从第二次 OTA 起的每轮交替都判错槽
+// —— 那正是"刷了但没生效"的根因（评审实测并给出 ESP-IDF 出处）。
+const SECTOR_SIZE = OTADATA_SIZE / 2; // 0x1000
 const ENTRY_SIZE = 32;
 const ERASED = 0xffffffff;
 
@@ -973,7 +994,7 @@ const ERASED = 0xffffffff;
  * 展示，并允许用户在 UI 里手动覆盖 —— 这是 spec「已知风险」里写明的那一条。
  */
 export function parseOtadata(bytes) {
-  if (!bytes || bytes.byteLength < ENTRY_SIZE * 2) {
+  if (!bytes || bytes.byteLength < SECTOR_SIZE + ENTRY_SIZE) {
     return {
       slotIndex: 0,
       ...SLOTS[0],
@@ -984,7 +1005,7 @@ export function parseOtadata(bytes) {
   }
   const entries = [0, 1].map((i) => ({
     index: i,
-    seq: new DataView(bytes.buffer, bytes.byteOffset + i * ENTRY_SIZE, ENTRY_SIZE).getUint32(0, true),
+    seq: new DataView(bytes.buffer, bytes.byteOffset + i * SECTOR_SIZE, ENTRY_SIZE).getUint32(0, true),
   }));
   const valid = entries.filter((e) => e.seq !== ERASED && e.seq !== 0);
   if (valid.length === 0) {
