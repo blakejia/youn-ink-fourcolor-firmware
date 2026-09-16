@@ -63,8 +63,10 @@ pub fn is_destructive(id: u8) -> bool {
     DESTRUCTIVE.contains(&id)
 }
 
-/// How long a first press stays armed.
-pub const CONFIRM_WINDOW_MS: u64 = 10_000;
+/// How long a first press stays armed. Five seconds: long enough to press
+/// twice deliberately, short enough that the row is not left armed while the
+/// user walks away from it.
+pub const CONFIRM_WINDOW_MS: u64 = 5_000;
 
 /// One press on a destructive row: `(armed row, when it was armed, run it now)`.
 /// Pressing the armed row again inside the window runs it; pressing anything
@@ -89,6 +91,54 @@ pub const PASSWORD_MASK_CAP: usize = 16;
 /// here rather than in the renderer.
 pub fn masked_len(len: usize) -> usize {
     len.min(PASSWORD_MASK_CAP)
+}
+
+/// Which Wi-Fi name the settings page shows: the one the station is associated
+/// with when there is one, and otherwise the saved one the device would try
+/// next.
+///
+/// A device that is not connected still knows where it is meant to connect, so
+/// an unconfigured-looking row is a lie — and it is the one row a user checks
+/// before taking the device somewhere else. The password row follows this name,
+/// which is how the saved key stays visible while the radio is down.
+pub fn shown_ssid<'a>(connected: &'a str, saved: &'a str) -> &'a str {
+    if connected.is_empty() { saved } else { connected }
+}
+
+/// The Wi-Fi row's own state: the switch is a control, not a mirror.
+///
+/// The row used to draw the connection *and* take its direction from it. With
+/// the radio down that made both halves of one press invisible: the switch
+/// already read OFF, so the confirm asked for ON, and the redraw asked the
+/// connection again and drew OFF. Nothing moved, and the other direction was
+/// unreachable — the reported "cannot turn it on or off".
+///
+/// `Unknown` is the honest state before the user has spoken, and after the
+/// device changes the radio on its own (the config AP, the sleep teardown):
+/// until then the connection is the only thing that knows anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WifiSwitch {
+    /// Nobody has said; the switch shows the connection.
+    Unknown,
+    On,
+    Off,
+}
+
+/// What one confirm on the row asks for: the opposite of what it shows.
+pub fn wifi_switch_next(shown: bool) -> bool {
+    !shown
+}
+
+/// What the switch draws. Once the user has spoken that is the answer, even
+/// while the radio is still coming up: the connection has its own row
+/// (`连接状态`) and its own failure reason, and a switch that mirrors the radio
+/// cannot be used to turn the radio on.
+pub fn wifi_switch_shown(intent: WifiSwitch, connected: bool) -> bool {
+    match intent {
+        WifiSwitch::Unknown => connected,
+        WifiSwitch::On => true,
+        WifiSwitch::Off => false,
+    }
 }
 
 use Item as I;
@@ -309,6 +359,60 @@ pub extern "C" fn rf_settings_is_destructive(id: u8) -> u8 {
     if is_destructive(id) { 1 } else { 0 }
 }
 
+/// Which name the 网络 section's `Wi-Fi 名称` row draws: `connected` when the
+/// station is associated, else `saved` (the head of the device's saved list).
+/// Either may be NULL or empty; the caller keeps ownership of both, and one of
+/// the two pointers comes back — nothing is allocated.
+///
+/// # Safety
+/// Each non-NULL pointer must be NUL-terminated and stay valid for as long as
+/// the returned pointer is used.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rf_settings_shown_ssid(
+    connected: *const core::ffi::c_char,
+    saved: *const core::ffi::c_char,
+) -> *const core::ffi::c_char {
+    use core::ffi::CStr;
+
+    let connected_empty = connected.is_null()
+        || { unsafe { CStr::from_ptr(connected) }.to_bytes().is_empty() };
+    if connected_empty { saved } else { connected }
+}
+
+/// `rf_settings_wifi_switch_t`. Keep in step.
+pub const RF_SETTINGS_WIFI_SWITCH_UNKNOWN: u8 = 0;
+pub const RF_SETTINGS_WIFI_SWITCH_ON: u8 = 1;
+pub const RF_SETTINGS_WIFI_SWITCH_OFF: u8 = 2;
+
+/// What a confirm on a toggle row asks for, given what the row drew. The
+/// renderer calls this and hands the answer to the item handler, so the
+/// handler never has to infer a direction from the connection — which is how
+/// the press came to be a no-op in both directions.
+#[unsafe(no_mangle)]
+pub extern "C" fn rf_settings_wifi_switch_next(shown: u8) -> u8 {
+    if wifi_switch_next(shown != 0) { 1 } else { 0 }
+}
+
+/// What the switch draws: the user's intent once there is one, else the
+/// connection. `intent` is a `rf_settings_wifi_switch_t`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rf_settings_wifi_switch_shown(intent: u8, connected: u8) -> u8 {
+    let intent = match intent {
+        RF_SETTINGS_WIFI_SWITCH_ON => WifiSwitch::On,
+        RF_SETTINGS_WIFI_SWITCH_OFF => WifiSwitch::Off,
+        _ => WifiSwitch::Unknown,
+    };
+    if wifi_switch_shown(intent, connected != 0) { 1 } else { 0 }
+}
+
+/// How long the confirm window is, in milliseconds, for the prompt the panel
+/// shows. Exposed so the sentence on the row cannot drift from the rule in
+/// `confirm_step`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rf_settings_confirm_window_ms() -> u64 {
+    CONFIRM_WINDOW_MS
+}
+
 /// `rf_settings_confirm_t`. Keep in step. `armed_id == 0xFF` means nothing is
 /// armed.
 #[repr(C)]
@@ -493,6 +597,19 @@ mod tests {
         assert_eq!(next_at, 1_000 + CONFIRM_WINDOW_MS + 1);
     }
 
+    /// The window is the user's rule, so it is pinned with literals: a second
+    /// press just inside it acts, just outside it only arms again.
+    #[test]
+    fn the_confirm_window_is_five_seconds() {
+        let (armed, at, _) = confirm_step(None, 0, ITEM_RESET_NETWORK, 0);
+        let (_, _, acts) = confirm_step(armed, at, ITEM_RESET_NETWORK, 4_999);
+        assert!(acts, "4.999 s is inside the window");
+
+        let (armed, at, _) = confirm_step(None, 0, ITEM_RESET_NETWORK, 0);
+        let (_, _, acts) = confirm_step(armed, at, ITEM_RESET_NETWORK, 5_001);
+        assert!(!acts, "5.001 s is outside the window");
+    }
+
     #[test]
     fn pressing_another_row_re_arms_rather_than_running_the_armed_one() {
         let (armed, at, _) = confirm_step(None, 0, ITEM_RESET_NETWORK, 1_000);
@@ -518,6 +635,61 @@ mod tests {
         assert_eq!(actionable, vec![ITEM_WIFI_TOGGLE, ITEM_WIFI_PASSWORD]);
         assert_eq!(NETWORK_ITEMS[0].kind, Kind::Toggle);
         assert_eq!(NETWORK_ITEMS[3].kind, Kind::Action);
+    }
+
+    // ── what the 网络 rows show ─────────────────────────────────────────
+
+    /// The reported complaint: with the radio down the SSID and password rows
+    /// read "--", so the one place a user checks before taking the device
+    /// somewhere else answered nothing.
+    #[test]
+    fn an_unconnected_device_still_shows_the_saved_network() {
+        assert_eq!(shown_ssid("", "yi02"), "yi02");
+        assert_eq!(shown_ssid("", ""), "", "nothing saved either: the row is empty");
+    }
+
+    #[test]
+    fn a_live_connection_wins_over_the_saved_name() {
+        assert_eq!(shown_ssid("cafe-guest", "yi02"), "cafe-guest");
+        assert_eq!(shown_ssid("cafe-guest", ""), "cafe-guest");
+    }
+
+    // ── the Wi-Fi row's own state ───────────────────────────────────────
+
+    #[test]
+    fn a_press_flips_the_row_whatever_the_radio_is_doing() {
+        assert!(wifi_switch_next(false), "OFF -> ON");
+        assert!(!wifi_switch_next(true), "ON -> OFF");
+    }
+
+    /// The reported bug, as a test: with no connection the row read OFF, the
+    /// confirm asked for ON, and the redraw read the connection again and drew
+    /// OFF — a press that went nowhere, in the one direction that could have
+    /// brought the radio back.
+    #[test]
+    fn turning_the_row_on_does_not_need_a_connection() {
+        let shown = wifi_switch_shown(WifiSwitch::Unknown, false);
+        assert!(!shown, "nothing connected yet, the row reads OFF");
+
+        let target = wifi_switch_next(shown);
+        assert!(target, "confirming an OFF row asks for ON");
+        assert!(
+            wifi_switch_shown(WifiSwitch::On, false),
+            "the row must show what was asked, not what the radio is doing"
+        );
+    }
+
+    /// And the other half: a row the user switched off stays off while the
+    /// radio is still finishing a connection it started a moment ago.
+    #[test]
+    fn a_switch_off_row_does_not_read_on_when_the_radio_connects() {
+        assert!(!wifi_switch_shown(WifiSwitch::Off, true));
+    }
+
+    #[test]
+    fn the_connection_answers_only_before_the_user_does() {
+        assert!(wifi_switch_shown(WifiSwitch::Unknown, true));
+        assert!(!wifi_switch_shown(WifiSwitch::Unknown, false));
     }
 
     #[test]
@@ -645,6 +817,22 @@ mod tests {
     }
 
     // ── the C side ──────────────────────────────────────────────────────
+
+    #[test]
+    fn the_switch_codes_the_c_side_sends_are_the_ones_this_side_means() {
+        // The C side keeps the intent as a byte, so this mapping *is* the
+        // contract: get it wrong and a switched-off radio draws as ON.
+        assert_eq!(rf_settings_wifi_switch_shown(RF_SETTINGS_WIFI_SWITCH_OFF, 1), 0);
+        assert_eq!(rf_settings_wifi_switch_shown(RF_SETTINGS_WIFI_SWITCH_ON, 0), 1);
+        assert_eq!(rf_settings_wifi_switch_shown(RF_SETTINGS_WIFI_SWITCH_UNKNOWN, 1), 1);
+        assert_eq!(
+            rf_settings_wifi_switch_shown(0xEE, 0),
+            0,
+            "an unknown code falls back to the connection"
+        );
+        assert_eq!(rf_settings_wifi_switch_next(0), 1);
+        assert_eq!(rf_settings_wifi_switch_next(1), 0);
+    }
 
     fn step_c(section: u8, focus: u8, option: u8, button: u8) -> CStep {
         let mut d = CStep {

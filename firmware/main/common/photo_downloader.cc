@@ -12,6 +12,7 @@
 #include "photo_storage.h"
 
 #include <esp_log.h>
+#include <esp_crt_bundle.h>
 #include <esp_http_client.h>
 #include <cJSON.h>
 
@@ -69,6 +70,10 @@ static int http_get(const char* url, int timeout_ms) {
     config.event_handler = http_event_handler;
     config.timeout_ms = timeout_ms;
     config.disable_auto_redirect = false;
+    // HTTPS 必须显式指定服务器校验方式，否则 esp-tls 直接拒绝建连
+    // （"No server verification option set…" → SSL_SETUP_FAILED，一个字节都不发）。
+    // 同 main/common/http_client_wrapper.cc 的修法。
+    config.crt_bundle_attach = esp_crt_bundle_attach;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
@@ -105,6 +110,10 @@ static int http_post(const char* url) {
     config.url = url;
     config.method = HTTP_METHOD_POST;
     config.timeout_ms = 5000;
+    // HTTPS 必须显式指定服务器校验方式，否则 esp-tls 直接拒绝建连
+    // （"No server verification option set…" → SSL_SETUP_FAILED，一个字节都不发）。
+    // 同 main/common/http_client_wrapper.cc 的修法。
+    config.crt_bundle_attach = esp_crt_bundle_attach;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
@@ -198,6 +207,10 @@ static int download_photo_binary(const char* photo_id, uint8_t* out_buf, uint32_
     config.url = url;
     config.method = HTTP_METHOD_GET;
     config.timeout_ms = 30000;  // 30s for large downloads
+    // HTTPS 必须显式指定服务器校验方式，否则 esp-tls 直接拒绝建连
+    // （"No server verification option set…" → SSL_SETUP_FAILED，一个字节都不发）。
+    // 同 main/common/http_client_wrapper.cc 的修法。
+    config.crt_bundle_attach = esp_crt_bundle_attach;
 
     // Custom handler that writes directly to our buffer
     int written = 0;

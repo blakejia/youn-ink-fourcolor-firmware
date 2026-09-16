@@ -58,6 +58,7 @@ from . import pairing as pairing_mod
 from . import notify_store as ns
 
 from . import pages as pages_mod
+from . import page_upload
 
 from . import ota as ota_mod
 from . import serial_firmware as serial_fw
@@ -401,6 +402,9 @@ def create_app() -> FastAPI:
         if n is None:
             return Response(status_code=204)
         try:
+            # dither=False：通知是纯文字画布，文字的灰度反锯齿若走
+            # Floyd-Steinberg 会被抖成稀疏黑白点（细笔画看着又糊又断）。
+            # 吸附成黑白二值化，笔画是实心的。
             bitmap = render_canvas_to_bitmap({
                 "default": [{"type": "div", "props": {
                     "tw": "flex flex-col p-[16px] gap-[8px] bg-white",
@@ -412,7 +416,7 @@ def create_app() -> FastAPI:
                                                   "style": {"color": "#000000"},
                                                   "children": n.body}},
                     ]}}]
-            })
+            }, dither=False)
         except Exception:
             ns.get_store().mark_error(n.id)
             raise HTTPException(500, "render failed")
@@ -442,17 +446,6 @@ def create_app() -> FastAPI:
         return {"notifications": [asdict(n) for n in items]}
 
     # ── Canvas Loop ──
-
-    def _compute_screen_active() -> bool:
-        tz = ZoneInfo(settings.canvas_timezone)
-        now = datetime.now(tz)
-        s = datetime.strptime(settings.canvas_sleep_start, "%H:%M").time()
-        e = datetime.strptime(settings.canvas_sleep_end, "%H:%M").time()
-        t = now.time()
-        # Window crossing midnight is common: treat start <= t < end, with wrap.
-        if s <= e:
-            return not (s <= t < e)
-        return not (t >= s or t < e)
 
     @app.post("/api/pages")
     async def create_page(
@@ -534,7 +527,7 @@ def create_app() -> FastAPI:
                 "min_page_duration_minutes": settings.canvas_min_page_duration_minutes,
             },
             "pages": [e.to_dict() for e in entries],
-            "screen_active": _compute_screen_active(),
+            "screen_active": pages_mod.screen_active_now(),
         }
 
     @app.get("/api/pages/bitmap/{md5}.bin")
@@ -549,64 +542,7 @@ def create_app() -> FastAPI:
         )
 
     # ── upload → page binding ────────────────────────────────────────
-    _UPLOAD_ID_RE = re.compile(r"[0-9a-f]{32}")
-    _UPLOAD_MAX_PIXELS = 4000 * 4000
-
-    def _upload_paths(upload_id: str) -> tuple[Path, Path]:
-        if not _UPLOAD_ID_RE.fullmatch(upload_id):
-            raise ValueError(f"invalid upload id: {upload_id!r}")
-        return (settings.uploads_dir / f"{upload_id}.png",
-                settings.uploads_dir / f"{upload_id}.src.png")
-
-    # Panel geometry, kept local so the upload path needs no extra import.
-    PANEL_WIDTH = 400
-    PANEL_HEIGHT = 300
-
-    def _normalize_upload(data: bytes) -> bytes:
-        """Fit the picture inside the panel, letterboxed on white.
-
-        The renderer never upscales (`min(box/iw, 1.0)`), so the stored file has
-        to be the size the page will draw: anything larger would be scaled down
-        again at render time, anything smaller would sit tiny in the middle.
-        """
-        img = Image.open(io.BytesIO(data))
-        # Dimensions are known after open(); check the cap before load() so a
-        # huge PNG is rejected without decoding it into memory.
-        if img.width * img.height > _UPLOAD_MAX_PIXELS:
-            raise ValueError(f"image too large: {img.width}x{img.height}")
-        img.load()
-        if "A" in img.getbands() or "transparency" in img.info:
-            # Composite alpha onto white: convert("RGB") alone would paint
-            # transparent pixels black, contradicting the white letterbox.
-            base = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            img = Image.alpha_composite(base, img.convert("RGBA")).convert("RGB")
-        elif img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        scale = min(PANEL_WIDTH / img.width, PANEL_HEIGHT / img.height, 1.0)
-        nw, nh = max(1, int(img.width * scale)), max(1, int(img.height * scale))
-        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
-        sheet = Image.new("RGB", (PANEL_WIDTH, PANEL_HEIGHT), (255, 255, 255))
-        sheet.paste(img, ((PANEL_WIDTH - nw) // 2, (PANEL_HEIGHT - nh) // 2))
-        out = io.BytesIO()
-        sheet.save(out, format="PNG")
-        return out.getvalue()
-
-    def _canvas_for_upload(upload_id: str) -> dict:
-        """One contain-fitted image, drawn at panel size.
-
-        The renderer sizes a node from its own `w-[Npx]`/`h-[Npx]` tw token or
-        its `style.width/height` — `w-full`/`h-full` are not parsed and an
-        unsized img measures 0x0, which pastes a single pixel. So the img gets
-        the same explicit `style` the existing pages use
-        (`server/data/pages/NOTE4C-3400FC/logo-1024.json`). The stored file is already
-        panel-sized and letterboxed on white, so this draws 1:1."""
-        return {"default": [{"type": "div", "props": {
-            "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
-            "children": [{"type": "img",
-                          "props": {"src": f"uploads://{upload_id}",
-                                    "style": {"width": f"{PANEL_WIDTH}px",
-                                              "height": f"{PANEL_HEIGHT}px"}}}]}}]}
-
+    # ── upload → page binding ────────────────────────────────────────
     @app.post("/api/uploads")
     async def upload_to_page(
         request: Request,
@@ -619,44 +555,36 @@ def create_app() -> FastAPI:
         device = device.strip()
         _require_known_device(device)
         page = page.strip()
-        sources = pages_mod.list_pages(device)
-        existing = [s.name for s in sources]
-        if not page or page not in existing:
+        # 空页名走"未知页"分支并列出可替换的页（旧契约，端点的既有测试钉着它）；
+        # 只有名字非法才报 invalid page name。
+        if not page:
             raise HTTPException(400, detail={
                 "detail": "unknown page: uploads must name a page to replace",
-                "pages": existing,
+                "pages": [s.name for s in pages_mod.list_pages(device)],
             })
         if not pages_mod.is_safe_component(page):
             raise HTTPException(400, f"invalid page name: {page!r}")
 
         data = await image.read()
-        if len(data) > 25 * 1024 * 1024:
-            raise HTTPException(400, "image too large")
         try:
-            normalized = _normalize_upload(data)
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(400, f"not a usable image: {e}") from e
-
-        # Same snapshot as the validation above: re-scanning here could lose the
-        # page to a concurrent delete and raise StopIteration (a 500).
-        source = next(s for s in sources if s.name == page)
-        upload_id = secrets.token_hex(16)
-        settings.uploads_dir.mkdir(parents=True, exist_ok=True)
-        norm_path, orig_path = _upload_paths(upload_id)
-        orig_path.write_bytes(data)          # keep the original for re-cropping
-        norm_path.write_bytes(normalized)    # what the canvas will draw
-
-        canvas_json = _canvas_for_upload(upload_id)
-        try:
-            bitmap = render_canvas_to_bitmap(canvas_json)
+            # 与 MCP 的 upload_image_as_page 是同一份实现（youn_server.page_upload）：
+            # 归一化尺寸、像素/字节上限、canvas_json 形状、时长与顺序的继承规则
+            # 都在那里，避免 HTTP 与 MCP 两条路径的语义漂移。
+            bound = page_upload.bind_image_to_page(device, page, data, create=False)
+        except page_upload.UnknownPage as e:
+            raise HTTPException(400, detail={
+                "detail": "unknown page: uploads must name a page to replace",
+                "pages": e.known,
+            }) from e
         except RenderError as e:
             raise HTTPException(400, f"render failed: {e.path}: {e.message}") from e
-        entry = pages_mod.upsert_page(device, page, canvas_json, source.duration_minutes,
-                                      source.order, bitmap)
-        log.info("upload bound device=%s page=%s md5=%s upload=%s", device, page, entry.md5, upload_id)
-        # PageEntry.to_dict() yields md5/duration_minutes/order/name; the caller
-        # asked in terms of a page, so say `page` as well.
-        return {"page": page, **entry.to_dict()}
+        except ValueError as e:
+            msg = str(e)
+            raise HTTPException(400, "image too large" if msg == "image too large"
+                                else f"not a usable image: {msg}") from e
+        log.info("upload bound device=%s page=%s md5=%s upload=%s",
+                 device, page, bound["md5"], bound["upload_id"])
+        return bound
 
     # ── WebSocket ──
     @app.websocket("/ws")

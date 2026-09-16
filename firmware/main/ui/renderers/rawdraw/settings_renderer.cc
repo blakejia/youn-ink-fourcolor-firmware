@@ -458,7 +458,18 @@ bool SettingsRenderer::HandleInput(const ButtonEvent& event) {
     bool acted = false;
     if (st.effect == RF_SETTINGS_EFFECT_ACTIVATE || st.effect == RF_SETTINGS_EFFECT_TOGGLE) {
         acted = true;
-        if (item_handler_) item_handler_(st.effect_item, st.effect == RF_SETTINGS_EFFECT_TOGGLE);
+        if (item_handler_) {
+            // A toggle row hands the handler the state to move *to*, not a flag
+            // saying "this was a toggle". The model owns the rule (the opposite
+            // of what the row drew, never a function of the connection), so the
+            // handler cannot end up guessing a direction — guessing is how a
+            // press on an OFF row came to redraw OFF and look like a dead key.
+            const bool target =
+                st.effect == RF_SETTINGS_EFFECT_TOGGLE
+                    ? rf_settings_wifi_switch_next(checks_[st.effect_item] ? 1 : 0) != 0
+                    : true;
+            item_handler_(st.effect_item, target);
+        }
     }
 
     // Walking off the password row (or out of its section) puts the dots back:

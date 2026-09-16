@@ -67,7 +67,13 @@ public:
     /// Set a toggle's state.
     void SetItemChecked(uint8_t id, bool checked);
     /// Run what the menu asked for; the application owns the effects.
-    void SetItemHandler(std::function<void(uint8_t id, bool toggle)> handler) {
+    ///
+    /// `target` is the state to move a toggle row *to* — the model computes it
+    /// from what the row drew — and `true` for an action row, which ignores it.
+    /// It is not a "this was a toggle" flag: a handler that has to infer a
+    /// direction from the connection cannot answer a press on an OFF row while
+    /// the radio is down, and the row reads as a dead key.
+    void SetItemHandler(std::function<void(uint8_t id, bool target)> handler) {
         item_handler_ = std::move(handler);
     }
     /// Which section the cursor is on.

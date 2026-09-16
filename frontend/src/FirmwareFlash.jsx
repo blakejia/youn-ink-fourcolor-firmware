@@ -13,8 +13,6 @@ const STEP_IDLE = 'idle';
 const BOOT_REGION_OFFSET = 0x0;
 const BOOT_REGION_SIZE = 0x10000;
 
-const norm4 = (s) => (s || '').trim().toUpperCase();
-const macLast4 = (mac) => (mac || '').replace(/:/g, '').slice(-4).toUpperCase();
 
 /** 空 payload 静默跳过却报成功是最坏的失败：三条写入路径共用此闸门。 */
 function assertNonEmpty(data, label) {
@@ -30,7 +28,7 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
   const [err, setErr] = useState('');
   const [step, setStep] = useState(STEP_IDLE);
   const [progress, setProgress] = useState('');
-  const [confirmText, setConfirmText] = useState('');
+  const [flashAck, setFlashAck] = useState(false);
   const [target, setTarget] = useState(null);
   const [manualSlot, setManualSlot] = useState(null);
   const [deviceInfo, setDeviceInfo] = useState(null);
@@ -155,14 +153,11 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
     return { esploader, chip, mac };
   };
 
-  const checkConfirm = (mac) => {
-    const got = norm4(confirmText);
-    const want = macLast4(mac);
-    if (!/^[0-9A-F]{4}$/.test(got)) {
-      throw new Error('请先输入设备 MAC 末四位（4 位十六进制），已中止，未写入任何字节');
-    }
-    if (got !== want) {
-      throw new Error(`确认串 ${got} 与本机设备 MAC ${mac}（末四位 ${want}）不符，已中止，未写入任何字节`);
+  // MAC 只作展示与日志，不再作为门禁（用户 2026-09-16 指示：原则上不验证 MAC 地址）。
+  // 但仍要一次明确勾选 —— 这是会写 flash 的动作，不能只靠"点过按钮"。
+  const checkConfirm = () => {
+    if (!flashAck) {
+      throw new Error('请先勾选“我已核对目标槽与固件”，已中止，未写入任何字节');
     }
   };
 
@@ -197,8 +192,8 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
       setErr('该固件服务端校验未通过（image_ok=false：首字节不是 0xE9 或大小异常），已拒绝写入，未写入任何字节');
       return;
     }
-    if (!/^[0-9A-Fa-f]{4}$/.test(norm4(confirmText))) {
-      setErr('请先输入设备 MAC 末四位（4 位十六进制），对照设备标签填写');
+    if (!flashAck) {
+      setErr('请先勾选“我已核对目标槽与固件”');
       return;
     }
     if (!backup) {
@@ -211,6 +206,7 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
     pctRef.current = -1;
     setTarget(null);
     let enteredWrite = false;
+    let writeVerified = false;
     let rollback = '用备份按相同步骤写回原槽位回滚';
     try {
       setStep('读固件');
@@ -228,7 +224,7 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
       setStep('打开串口');
       const { esploader, chip, mac } = await openSession(say);
       setDeviceInfo({ chip, mac });
-      checkConfirm(mac);
+      checkConfirm();
 
       setStep('读 otadata 判定目标槽');
       const otaBytes = await readRaw(esploader, OTADATA_OFFSET, OTADATA_SIZE);
@@ -261,6 +257,7 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
       // "MD5 of file does not match data in flash!"），成功消息只在此后出现。
       say('写入 MD5 校验通过（设备端 flashMd5sum 与本地一致）。');
 
+      writeVerified = true;
       setStep('复位');
       await esploader.after('hard_reset');
       setStep(STEP_IDLE);
@@ -268,7 +265,9 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
       await closePort();
       say('刷写结束：设备已复位，端口已释放。若要验证，去「串口监视」页签重新打开串口看开机日志。');
     } catch (e) {
-      setErr(abortMessage(e, enteredWrite, rollback));
+      setErr(writeVerified
+        ? `写入已完成并通过 MD5 校验，仅后续步骤（复位/释放端口）失败：${e.message}。设备里的内容已经是新的 —— 断电重插或按 RESET 让它跑起来即可，不要去写什么备份。`
+        : abortMessage(e, enteredWrite, rollback));
       setStep(STEP_IDLE);
       setProgress('');
       await closePort();
@@ -278,8 +277,8 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
   // 高级：重置启动选择回 ota_0。先备份 otadata 再全 FF 写回。
   const resetBoot = async () => {
     if (!resetAck) { setErr('请先勾选“确认重置启动选择”'); return; }
-    if (!/^[0-9A-Fa-f]{4}$/.test(norm4(confirmText))) {
-      setErr('请先输入设备 MAC 末四位（4 位十六进制）');
+    if (!flashAck) {
+      setErr('请先勾选“我已核对目标槽与固件”');
       return;
     }
     const ok = window.confirm('将清空 otadata（启动选择回落到 ota_0）。仍要继续吗？');
@@ -288,10 +287,11 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
     setProgress('');
     pctRef.current = -1;
     let enteredWrite = false;
+    let writeVerified = false;
     try {
       setStep('打开串口');
       const { mac, esploader } = await openSession(say);
-      checkConfirm(mac);
+      checkConfirm();
       setStep('备份 otadata');
       const ota = await readRaw(esploader, OTADATA_OFFSET, OTADATA_SIZE, 'otadata 备份读取');
       downloadBytes(ota, `otadata-backup-${mac.replace(/:/g, '')}-${Date.now()}.bin`);
@@ -308,6 +308,7 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
         reportProgress: onProgress('清空 otadata（压缩后字节）'),
         calculateMD5Hash: (image) => md5Hex(image),
       });
+      writeVerified = true;
       setStep('复位');
       await esploader.after('hard_reset');
       setStep(STEP_IDLE);
@@ -315,7 +316,9 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
       await closePort();
       say('已重置：启动选择回落到 ota_0，端口已释放。');
     } catch (e) {
-      setErr(abortMessage(e, enteredWrite, '用刚下载的 otadata 备份写回 0xd000 回滚'));
+      setErr(writeVerified
+        ? `otadata 已重写并通过 MD5 校验，仅后续步骤（复位/释放端口）失败：${e.message}。断电重插或按 RESET 即可，不要用备份回滚。`
+        : abortMessage(e, enteredWrite, '用刚下载的 otadata 备份写回 0xd000 回滚'));
       setStep(STEP_IDLE);
       setProgress('');
       await closePort();
@@ -328,8 +331,8 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
     const f = fullFileRef.current?.files?.[0];
     if (!f) { setErr('请先选择本地完整镜像 .bin'); return; }
     if (!fullAck) { setErr('请先勾选“确认完整镜像风险”'); return; }
-    if (!/^[0-9A-Fa-f]{4}$/.test(norm4(confirmText))) {
-      setErr('请先输入设备 MAC 末四位（4 位十六进制）');
+    if (!flashAck) {
+      setErr('请先勾选“我已核对目标槽与固件”');
       return;
     }
     const ok = window.confirm(
@@ -341,6 +344,7 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
     setProgress('');
     pctRef.current = -1;
     let enteredWrite = false;
+    let writeVerified = false;
     try {
       setStep('读本地镜像');
       const data = new Uint8Array(await f.arrayBuffer());
@@ -358,7 +362,7 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
       }
       setStep('打开串口');
       const { mac, esploader } = await openSession(say);
-      checkConfirm(mac);
+      checkConfirm();
       setStep('备份 bootloader 区');
       const bl = await readRaw(esploader, BOOT_REGION_OFFSET, BOOT_REGION_SIZE, 'boot 区备份读取');
       downloadBytes(bl, `bl-pt-otadata-backup-${mac.replace(/:/g, '')}-${Date.now()}.bin`);
@@ -376,6 +380,7 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
         calculateMD5Hash: (image) => md5Hex(image),
       });
       say('写入 MD5 校验通过（设备端 flashMd5sum 与本地一致）。');
+      writeVerified = true;
       setStep('复位');
       await esploader.after('hard_reset');
       setStep(STEP_IDLE);
@@ -383,7 +388,9 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
       await closePort();
       say('完整镜像写入结束：设备已复位，端口已释放。去「串口监视」看开机日志确认。');
     } catch (e) {
-      setErr(abortMessage(e, enteredWrite, '用 bl-pt-otadata 备份写回 0x0 回滚，应用分区备份另需写回原槽位'));
+      setErr(writeVerified
+        ? `完整镜像已写入并通过 MD5 校验，仅后续步骤（复位/释放端口）失败：${e.message}。断电重插或按 RESET 即可，不要用备份回滚。`
+        : abortMessage(e, enteredWrite, '用 bl-pt-otadata 备份写回 0x0 回滚，应用分区备份另需写回原槽位'));
       setStep(STEP_IDLE);
       setProgress('');
       await closePort();
@@ -404,7 +411,7 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
       <Banner>{err}</Banner>
       <p className="muted">
         默认只写<strong>活动 OTA 槽的应用分区</strong>（bootloader / 分区表 / NVS 不碰），
-        刷前自动读出当前固件并下载为备份。写入前需输入设备 MAC 末四位确认。
+        刷前自动读出当前固件并下载为备份。写入前需勾选确认已核对目标槽与固件（设备 MAC 会显示出来供你核对，但不作强制校验）。
         刷写进行中时页签切换与离开本页会被拦下（避免半写变砖）。
       </p>
 
@@ -451,16 +458,17 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
       )}
 
       <div className="row" style={{ marginTop: 12, alignItems: 'flex-end' }}>
-        <label className="field" style={{ flex: '0 0 180px' }}>
-          <div className="field-label">输入设备 MAC 末四位以确认</div>
-          <input
-            value={confirmText}
-            onChange={(e) => setConfirmText(e.target.value)}
-            disabled={busy}
-            placeholder="例：3400"
-            autoComplete="off"
-            spellCheck={false}
-          />
+        <label className="field" style={{ flex: '0 0 auto' }}>
+          <div className="field-label">写入前确认</div>
+          <span>
+            <input
+              type="checkbox"
+              checked={flashAck}
+              onChange={(e) => setFlashAck(e.target.checked)}
+              disabled={busy}
+            />{' '}
+            我已核对目标槽与固件
+          </span>
         </label>
         <label className="field" style={{ flex: '0 0 auto' }}>
           <div className="field-label">备份</div>

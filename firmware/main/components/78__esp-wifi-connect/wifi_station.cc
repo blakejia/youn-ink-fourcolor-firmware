@@ -859,9 +859,25 @@ void WifiStation::HandleScanResult() {
 
     if (connect_queue_.empty()) {
         ESP_LOGI(TAG, "No AP found, next scan in %d seconds", scan_current_interval_microseconds_ / 1000 / 1000);
-        esp_timer_start_once(timer_handle_, scan_current_interval_microseconds_);
-        UpdateScanInterval();
-        return;
+        // A hidden SSID never matches here: it is absent from a plain scan
+        // result, and even with show_hidden it arrives with an empty name, so a
+        // device whose network is hidden would scan forever. Other devices
+        // connect because they probe for the known name outright — do the same
+        // and try the saved default directly, with no channel and no BSSID, so
+        // the driver's directed probe is what finds it.
+        if (ssid_list.empty()) {
+            esp_timer_start_once(timer_handle_, scan_current_interval_microseconds_);
+            UpdateScanInterval();
+            return;
+        }
+        const SsidItem& saved = ssid_list.front();
+        ESP_LOGI(TAG, "Trying saved SSID '%s' directly (hidden SSID support)", saved.ssid.c_str());
+        WifiApRecord direct = {};
+        direct.ssid = saved.ssid;
+        direct.password = saved.password;
+        direct.channel = 0;
+        direct.authmode = WIFI_AUTH_OPEN;
+        connect_queue_.push_back(direct);
     }
 
     StartConnect();
@@ -881,7 +897,10 @@ void WifiStation::StartConnect() {
     bzero(&wifi_config, sizeof(wifi_config));
     strcpy((char *)wifi_config.sta.ssid, ap_record.ssid.c_str());
     strcpy((char *)wifi_config.sta.password, ap_record.password.c_str());
-    if (remember_bssid_) {
+    // A record from the scan carries a channel and a BSSID; the hidden-SSID
+    // fallback has neither (channel stays 0), and pinning an all-zero BSSID
+    // would stop the directed probe from finding anything.
+    if (remember_bssid_ && ap_record.channel != 0) {
         wifi_config.sta.channel = ap_record.channel;
         memcpy(wifi_config.sta.bssid, ap_record.bssid, 6);
         wifi_config.sta.bssid_set = true;

@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <esp_log.h>
+#include <esp_crt_bundle.h>
 #include <esp_http_client.h>
 
 static const char *kTag = "HttpWrap";
@@ -91,6 +92,13 @@ static int do_request(esp_http_client_method_t method, const char *url,
     config.user_data = &ctx;
     config.timeout_ms = timeout_ms;
     config.disable_auto_redirect = false;
+    // HTTPS 必须显式指定服务器校验方式，否则 esp-tls/mbedTLS 直接拒绝建连：
+    //   "No server verification option set in esp_tls_cfg_t structure"
+    //   → ESP_ERR_MBEDTLS_SSL_SETUP_FAILED（一个字节都不会发出去）
+    // 线上域名是 Let's Encrypt 签发的 *.1024.center，公共 CA 即可验过；
+    // 证书包由 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y（DEFAULT_FULL）提供。
+    // 写法与 main/components/78__esp-ml307/src/esp/esp_ssl.cc:71 一致。
+    config.crt_bundle_attach = esp_crt_bundle_attach;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {

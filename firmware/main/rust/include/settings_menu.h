@@ -93,6 +93,34 @@ size_t rf_settings_masked_len(size_t len);
 /* Does this id wipe something? The renderer colours the row with this. */
 uint8_t rf_settings_is_destructive(uint8_t id);
 
+/* Which name the 网络 section's `Wi-Fi 名称` row draws: `connected` when the
+ * station is associated, else `saved` (the head of the device's saved list).
+ * Either may be NULL or empty. One of the two pointers comes back; nothing is
+ * allocated, and the caller keeps ownership of both. */
+const char* rf_settings_shown_ssid(const char* connected, const char* saved);
+
+/* The Wi-Fi row's own state. The switch is a control, not a mirror of the
+ * radio: once the user has spoken, that is what it shows, because the
+ * connection has its own row (连接状态) and its own failure reason. A switch
+ * that mirrors the radio cannot be used to turn the radio on.
+ *
+ * UNKNOWN is before the user has spoken, and after the device moves the radio
+ * itself (the config AP, the sleep teardown). */
+typedef enum {
+    RF_SETTINGS_WIFI_SWITCH_UNKNOWN = 0, /* show the connection */
+    RF_SETTINGS_WIFI_SWITCH_ON = 1,
+    RF_SETTINGS_WIFI_SWITCH_OFF = 2,
+} rf_settings_wifi_switch_t;
+
+/* What a confirm on the Wi-Fi row asks for, given the state the row drew. The
+ * renderer computes this and hands the answer to the item handler, so the
+ * handler never has to infer a direction from the connection — inferring it is
+ * what made the press a no-op in both directions while the radio was down. */
+uint8_t rf_settings_wifi_switch_next(uint8_t shown);
+
+/* What the switch draws: the intent once there is one, else the connection. */
+uint8_t rf_settings_wifi_switch_shown(uint8_t intent, uint8_t connected);
+
 /* Nothing is armed. */
 #define RF_SETTINGS_CONFIRM_NONE 0xFF
 
@@ -102,6 +130,10 @@ typedef struct {
     uint8_t _pad[6];
     uint64_t armed_at_ms; /* keep between calls */
 } rf_settings_confirm_t;
+
+/* How long the confirm window is, in milliseconds, so the prompt the panel
+ * shows can name the same number the rule enforces. */
+uint64_t rf_settings_confirm_window_ms(void);
 
 /* One press on a destructive row: the first arms it, a second one inside the
  * window acts (`act` = 1). Pressing another row, or pressing after the window,

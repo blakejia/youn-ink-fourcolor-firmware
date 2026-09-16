@@ -48,6 +48,13 @@ constexpr char kPowerNamespace[] = "power";
 // soon as any other state arrives, so a stale reason never reads as current.
 static int g_last_wifi_error = 0;
 
+// What the user asked the Wi-Fi switch to be — or UNKNOWN before they have said
+// anything, and after the device moves the radio itself (the config AP). The
+// switch draws this rather than the connection, so a press is answered by the
+// row's own state and never by a radio that is not there yet. The rule lives in
+// settings.rs (`wifi_switch_shown`); this is only where the C side keeps it.
+static uint8_t g_wifi_switch_intent = RF_SETTINGS_WIFI_SWITCH_UNKNOWN;
+
 // Which destructive settings row is armed and since when, for the two-press
 // confirm. The window rule itself is settings.rs::confirm_step.
 static uint8_t g_reset_armed_id = RF_SETTINGS_CONFIRM_NONE;
@@ -80,11 +87,20 @@ void RefreshNetworkStatusItems(rawdraw::SettingsRenderer* renderer, bool connect
     renderer->SetItemValue(RF_SETTINGS_ITEM_SERVER,
                            page_sync_server_reachable() ? "可达" : "不可达");
 
-    // The network the device is on, the key it holds for it, and why the last
-    // attempt failed if it did.
-    const std::string ssid = wifi.GetSsid();
-    renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_SSID, ssid.empty() ? "--" : ssid);
-    renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_PASSWORD, WifiPasswordFor(ssid));
+    // The network the device is set up for (the one it is on, else the saved
+    // one), the key it holds for it, and why the last attempt failed if it did.
+    // The saved list is what the device would connect to next, so the page can
+    // still answer "which network is this set up for?" with the radio down —
+    // the rows used to read "--" and empty, which is exactly what a user
+    // checks before taking the device somewhere else. The password row follows
+    // this name, so the saved key stays visible too (still dotted).
+    const std::string live = wifi.GetSsid();
+    const auto& saved_list = SsidManager::GetInstance().GetSsidList();
+    const char* saved = saved_list.empty() ? "" : saved_list.front().ssid.c_str();
+    const char* chosen = rf_settings_shown_ssid(live.c_str(), saved);
+    const std::string shown = chosen ? chosen : "";
+    renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_SSID, shown.empty() ? "--" : shown);
+    renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_PASSWORD, WifiPasswordFor(shown));
     renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_ERROR,
                            g_last_wifi_error ? rawdraw::WifiRenderer::ReasonToMessage(g_last_wifi_error)
                                              : "—");
@@ -93,7 +109,13 @@ void RefreshNetworkStatusItems(rawdraw::SettingsRenderer* renderer, bool connect
 void UpdateWifiSettingsItem(rawdraw::SettingsRenderer* renderer, bool connected,
                             const char* value = nullptr) {
     if (!renderer) return;
-    renderer->SetItemChecked(RF_SETTINGS_ITEM_WIFI_TOGGLE, connected);
+    // The switch draws what the user asked for, not what the radio is doing —
+    // the "连接状态" row below it is the connection's own report. Deriving the
+    // switch from `connected` meant a press with the radio down redrew the
+    // state it already had, so the row looked dead in both directions.
+    renderer->SetItemChecked(
+        RF_SETTINGS_ITEM_WIFI_TOGGLE,
+        rf_settings_wifi_switch_shown(g_wifi_switch_intent, connected ? 1 : 0) != 0);
     renderer->SetItemValue(RF_SETTINGS_ITEM_WIFI_STATE,
                            value ? value : (connected ? "已连接" : "未连接"));
     RefreshNetworkStatusItems(renderer, connected);
@@ -373,6 +395,10 @@ void Application::Initialize(bool quiet) {
             case NetworkEvent::WifiConfigModeEnter:
                 ESP_LOGI(kTag, "WiFi config mode entered: %s", data.c_str());
                 wifi_connected_.store(false, std::memory_order_release);
+                // The device is driving the radio now, so the switch goes back
+                // to reporting it: an intent from before the config AP would
+                // otherwise read as ON while the station is down.
+                g_wifi_switch_intent = RF_SETTINGS_WIFI_SWITCH_UNKNOWN;
                 Application::GetInstance().TransitionLifecycle(
                     kLifecycleApProvision, "config AP entered");
                 // 开机/无 base_url 路径也要注册回调，否则 ap_client_connected/
@@ -442,7 +468,7 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
         // What each row does. The menu's shape and its navigation are Rust;
         // this is the only place that knows how to restart, clear credentials,
         // sleep or toggle the radio.
-        sr->SetItemHandler([this, sr](uint8_t id, bool /*toggle*/) {
+        sr->SetItemHandler([this, sr](uint8_t id, bool target) {
             // Any press retires a pending "press again" prompt; a destructive
             // press below puts it back if it is still only armed.
             sr->SetItemValue(RF_SETTINGS_ITEM_RESET_NETWORK, "");
@@ -457,8 +483,15 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
                 g_reset_armed_id = c.armed_id;
                 g_reset_armed_at_ms = c.armed_at_ms;
                 if (!c.act) {
-                    ESP_LOGW(kTag, "Settings: %u armed; press again to confirm", (unsigned)id);
-                    sr->SetItemValue(id, "再按一次确认");
+                    // The prompt names the window it obeys, and takes the
+                    // number from the rule itself (settings.rs) so the two
+                    // cannot drift apart.
+                    const unsigned window_s = (unsigned)(rf_settings_confirm_window_ms() / 1000);
+                    char prompt[32];
+                    snprintf(prompt, sizeof(prompt), "%u 秒内再按一次", window_s);
+                    ESP_LOGW(kTag, "Settings: %u armed; press again within %u s to confirm",
+                             (unsigned)id, window_s);
+                    sr->SetItemValue(id, prompt);
                     return;
                 }
                 ESP_LOGW(kTag, "Settings: %u confirmed", (unsigned)id);
@@ -493,14 +526,28 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
                     EnterManualSleep();
                     break;
                 case RF_SETTINGS_ITEM_WIFI_TOGGLE: {
+                    // The renderer asked the model what this press means and
+                    // handed us the answer, so the direction is never inferred
+                    // from the connection. Inferring it is what made the row
+                    // look dead: with the radio down the switch read OFF, the
+                    // press asked for ON, and the redraw read the connection
+                    // again and drew OFF.
                     auto& wifi = WifiManager::GetInstance();
-                    if (wifi_connected_.load(std::memory_order_acquire) || wifi.IsConnected()) {
-                        ESP_LOGI(kTag, "Wi-Fi setting toggled OFF");
+                    g_wifi_switch_intent = target ? RF_SETTINGS_WIFI_SWITCH_ON
+                                                  : RF_SETTINGS_WIFI_SWITCH_OFF;
+                    if (target) {
+                        ESP_LOGI(kTag, "Wi-Fi setting turned ON");
+                        if (!wifi.IsConnected()) {
+                            // Restart a stalled attempt: StartStation() returns
+                            // early while the station is already active, so a
+                            // second press would otherwise do nothing at all.
+                            wifi.StopStation();
+                            wifi.StartStation();
+                        }
+                    } else {
+                        ESP_LOGI(kTag, "Wi-Fi setting turned OFF");
                         wifi.StopStation();
                         wifi_connected_.store(false, std::memory_order_release);
-                    } else {
-                        ESP_LOGI(kTag, "Wi-Fi setting toggled ON");
-                        wifi.StartStation();
                     }
                     UpdateWifiSettingsItem(sr, wifi_connected_.load(std::memory_order_acquire));
                     UpdateStatusBarForUi();

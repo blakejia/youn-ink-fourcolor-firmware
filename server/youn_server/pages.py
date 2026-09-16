@@ -25,6 +25,8 @@ import json
 import logging
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional
 
@@ -269,6 +271,22 @@ def _drop_source_reference(md5: str, source_name: str) -> None:
         except FileNotFoundError:
             pass
         log.info("bitmap dropped (refcount=0) md5=%s source=%s", md5, source_name)
+
+
+def screen_active_now() -> bool:
+    """屏此刻是否活跃（不在睡眠窗口内）。
+
+    原本是 app.py 里 create_app() 的闭包，MCP 的 get_schedule 也要用它 ——
+    搬到这里，HTTP 与 MCP 共用同一份窗口判定（跨午夜的窗口按 s <= t < e
+    与回绕两种情况处理）。
+    """
+    tz = ZoneInfo(settings.canvas_timezone)
+    t = datetime.now(tz).time()
+    s_ = datetime.strptime(settings.canvas_sleep_start, "%H:%M").time()
+    e_ = datetime.strptime(settings.canvas_sleep_end, "%H:%M").time()
+    if s_ <= e_:
+        return not (s_ <= t < e_)
+    return not (t >= s_ or t < e_)
 
 
 # ─── schedule ─────────────────────────────────────────────────────────

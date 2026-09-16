@@ -14,6 +14,7 @@
 
 #include "holiday_fetcher.h"
 #include <esp_log.h>
+#include <esp_crt_bundle.h>
 #include <esp_http_client.h>
 #include <nvs_flash.h>
 #include <nvs.h>
@@ -267,6 +268,10 @@ bool Fetch(int year) {
     config.event_handler = HttpEvent;
     config.timeout_ms = 10000;
     config.disable_auto_redirect = false;
+    // HTTPS 必须显式指定服务器校验方式，否则 esp-tls 直接拒绝建连
+    // （"No server verification option set…" → SSL_SETUP_FAILED，一个字节都不发）。
+    // 同 main/common/http_client_wrapper.cc 的修法。
+    config.crt_bundle_attach = esp_crt_bundle_attach;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {

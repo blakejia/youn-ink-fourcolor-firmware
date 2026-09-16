@@ -1,0 +1,27 @@
+{
+  "name": "llm-usage",
+  "canvas_json": {
+    "default": [
+      {
+        "type": "div",
+        "props": {
+          "tw": "flex flex-col w-full h-full items-center justify-center bg-white",
+          "children": [
+            {
+              "type": "img",
+              "props": {
+                "src": "uploads://deaa80c8c295ad8c5c34dda1d7e55b9b",
+                "style": {
+                  "width": "400px",
+                  "height": "300px"
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "duration_minutes": 10,
+  "order": 0
+}
