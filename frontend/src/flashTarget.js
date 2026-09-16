@@ -12,7 +12,13 @@ export const OTADATA_OFFSET = 0xd000;
 export const OTADATA_SIZE = 0x2000;
 export const APP_PARTITION_SIZE = 0x3f0000;
 
-// otadata 的两条槽位记录，各 32 字节：ota_seq(u32) seq_label[20] ota_state(u32) crc(u32)
+// otadata 的两条槽位记录各自独占一个 4 KiB 扇区，**不是**连续两条 32 字节：
+// ESP-IDF 的 bootloader_common_read_otadata() 从 ota_select_map + SPI_SEC_SIZE
+// 读第二条；写入侧 rewrite_ota_seq() 整扇区擦除后只写 32 字节，0x20.. 恒为 0xFF。
+// 按记录长度步进会永远只看到第一条，从第二次 OTA 起交替就判错槽：
+//   ota_0 → OTA 到 ota_1（seq=2，扇区 0）→ OTA 回 ota_0（seq=3，扇区 1）
+// 按 32 步进会读到过期的 seq=2 报 ota_1，而 bootloader 启动的是 ota_0。
+const SECTOR_SIZE = OTADATA_SIZE / 2; // 0x1000
 const ENTRY_SIZE = 32;
 const ERASED = 0xffffffff;
 
@@ -22,7 +28,7 @@ const ERASED = 0xffffffff;
  * 展示，并允许用户在 UI 里手动覆盖 —— 这是 spec「已知风险」里写明的那一条。
  */
 export function parseOtadata(bytes) {
-  if (!bytes || bytes.byteLength < ENTRY_SIZE * 2) {
+  if (!bytes || bytes.byteLength < SECTOR_SIZE + ENTRY_SIZE) {
     return {
       slotIndex: 0,
       ...SLOTS[0],
@@ -33,7 +39,7 @@ export function parseOtadata(bytes) {
   }
   const entries = [0, 1].map((i) => ({
     index: i,
-    seq: new DataView(bytes.buffer, bytes.byteOffset + i * ENTRY_SIZE, ENTRY_SIZE).getUint32(0, true),
+    seq: new DataView(bytes.buffer, bytes.byteOffset + i * SECTOR_SIZE, ENTRY_SIZE).getUint32(0, true),
   }));
   const valid = entries.filter((e) => e.seq !== ERASED && e.seq !== 0);
   if (valid.length === 0) {
