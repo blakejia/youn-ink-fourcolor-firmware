@@ -111,6 +111,8 @@ curl -X POST http://127.0.0.1:9002/api/uploads \
 http://192.168.4.1
 ```
 
+- 串口 / 固件：后台 `/serial` 页用浏览器直连本机串口（WebSerial）读设备日志，用 esptool-js 刷写活动 OTA 槽，刷前自动备份。必须用桌面 Chrome/Edge 89+ 或 Firefox 151+，且页面需在设备所插的那台机器上打开。
+
 ## 固件
 
 固件位于 `firmware/`，基于 ESP-IDF。默认面向 ZecTrix ESP32-S3 4.2 寸墨水屏，支持四色 BWRY 屏，也保留 1bpp 黑白屏配置。

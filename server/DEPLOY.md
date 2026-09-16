@@ -214,7 +214,32 @@ curl http://127.0.0.1:9002/api/devices -H "X-Operator-Token: ..."
 - [ ] HTTPS/WSS 走 Caddy 或 nginx，Let's Encrypt 证书自动续期
 - [ ] 日志轮转（`RotatingFileHandler` 已配，10 MB × 5）
 
-## 11. Canvas Loop（画板页组）
+## 11. 串口固件仓库（浏览器刷写用）
+
+刷写本身完全在浏览器里（WebSerial + esptool-js 直连本机串口），服务端
+只做固件仓库：给 `/serial` 页提供下载字节流，不开串口、不跑 esptool。
+
+```bash
+# 仓库列表（含构建产物 build:xiaozhi.bin + 手动上传件）
+curl http://127.0.0.1:9002/api/firmware -H "X-Operator-Token: $OPERATOR_TOKEN"
+# 下载某件（sha256 在 X-SHA256 响应头里）
+curl -OJ http://127.0.0.1:9002/api/firmware/build:xiaozhi.bin/download \
+     -H "X-Operator-Token: $OPERATOR_TOKEN"
+# 上传一件（首字节须为 ESP 镜像魔数 0xE9，且不大于应用分区 0x3F0000）
+curl -X POST http://127.0.0.1:9002/api/firmware \
+     -H "X-Operator-Token: $OPERATOR_TOKEN" \
+     -F "firmware=@some-app.bin"
+```
+存储在 `data/serial-firmware/`（上传件按 `<毫秒时间戳>-<净化名>.bin` 落盘，
+另带同名 `.sha256`），构建产物 `firmware/build/xiaozhi.bin` 若存在则以
+`build:xiaozhi.bin`（`source: "build"`）一并列出。
+**它与 OTA 的 `data/firmware/` 严格分离**：上传件若落进 OTA 目录，设备会经
+`/api/ota/check` 把它当正式更新拉走并自动刷——手动刷写的半成品绝不能出现在那里。
+
+这三个端点是 **fail-closed**：未配置 `OPERATOR_TOKEN` 时一律 503，
+而不是像其它 operator 接口那样放行（否则刷写素材对全网开放）。
+
+## 12. Canvas Loop（画板页组）
 
 设备侧新增 `page_sync` 模块后，服务端需要向设备暴露 `/api/pages/schedule` 和
 `/api/pages/bitmap/{md5}.bin`。设备每 `poll_interval_minutes` 轮询一次 schedule，
