@@ -647,19 +647,18 @@ export default function Serial() {
   return (
     <div>
       <h1>串口 / 固件</h1>
-      <p className="hint">
+      <p className="muted">
         串口由<strong>你的浏览器</strong>直接打开（WebSerial），不经服务端。
         所以本页必须运行在<strong>设备所插的那台机器</strong>上，且使用桌面
         Chrome / Edge 89+ 或 Firefox 151+。
       </p>
 
-      <div role="tablist" aria-label="串口工具">
+      <div className="row" role="group" aria-label="串口工具">
         {TABS.map((t) => (
           <button
             key={t.id}
             type="button"
-            role="tab"
-            aria-selected={tab === t.id}
+            aria-pressed={tab === t.id}
             className={tab === t.id ? 'btn' : 'btn secondary'}
             onClick={() => setTab(t.id)}
           >
@@ -684,7 +683,7 @@ export default function Serial() {
 import React from 'react';
 
 export default function SerialConsole() {
-  return <p className="hint">串口监视（待实现）</p>;
+  return <p className="muted">串口监视（待实现）</p>;
 }
 ```
 
@@ -694,7 +693,7 @@ export default function SerialConsole() {
 import React from 'react';
 
 export default function FirmwareFlash() {
-  return <p className="hint">固件刷写（待实现）</p>;
+  return <p className="muted">固件刷写（待实现）</p>;
 }
 ```
 
@@ -1033,6 +1032,12 @@ git commit -m "feat(web): 刷写目标槽判定（otadata 解析）与写入参�
 
 ## Task 6: 串口监视组件
 
+> **Ruling G（评审 T3 时发现，同样适用于本任务）**：表单控件必须按仓库既有结构写 ——
+> `<label className="field"><div className="field-label">标题</div><input/></label>`
+> （见 `frontend/src/pages/Ota.jsx:49-51`、`Devices.jsx:121-123`）。裸 `<label>文字<input/></label>`
+> 不会命中 `.field > input` 的样式。另外：不存在的 `className="hint"` 应写 `.muted`；
+> 不存在的 `className="log"` 应写 `.mono`（`.log` 从来不存在，只有 `.logout`）。
+
 **Files:**
 - Modify: `frontend/src/SerialConsole.jsx`（替换 Task 3 的占位）
 - Modify: `frontend/package.json`（本任务不加依赖，仅此说明：esptool-js 在 Task 7 加）
@@ -1186,7 +1191,7 @@ export default function SerialConsole() {
   return (
     <div>
       <Banner>{err}</Banner>
-      <p className="hint">
+      <p className="muted">
         打开串口会<strong>复位设备一次</strong>；监视期间设备不会进深睡，关闭本页即恢复。
       </p>
 
@@ -1221,7 +1226,7 @@ export default function SerialConsole() {
 
       <pre
         ref={preRef}
-        className="log"
+        className="mono"
         style={{ maxHeight: 420, overflow: 'auto', whiteSpace: 'pre-wrap' }}
         onScroll={(e) => {
           const el = e.currentTarget;
@@ -1230,7 +1235,7 @@ export default function SerialConsole() {
       >
         {text}
       </pre>
-      <p className="hint">
+      <p className="muted">
         缓冲上限 {RING_LINE_CAP} 行；暂停只停渲染，读取仍在继续（否则设备侧写日志会被拖住）。
       </p>
     </div>
@@ -1271,6 +1276,12 @@ git commit -m "feat(web): 串口监视组件（中文解码、暂停只停渲染
 ---
 
 ## Task 7: 固件刷写组件
+
+> **Ruling G（评审 T3 时发现，同样适用于本任务）**：表单控件必须按仓库既有结构写 ——
+> `<label className="field"><div className="field-label">标题</div><input/></label>`
+> （见 `frontend/src/pages/Ota.jsx:49-51`、`Devices.jsx:121-123`）。裸 `<label>文字<input/></label>`
+> 不会命中 `.field > input` 的样式。另外：不存在的 `className="hint"` 应写 `.muted`；
+> 不存在的 `className="log"` 应写 `.mono`（`.log` 从来不存在，只有 `.logout`）。
 
 **Files:**
 - Modify: `frontend/src/FirmwareFlash.jsx`（替换占位）
@@ -1451,7 +1462,7 @@ export default function FirmwareFlash() {
   return (
     <div>
       <Banner>{err}</Banner>
-      <p className="hint">
+      <p className="muted">
         默认只写<strong>活动 OTA 槽的应用分区</strong>（bootloader / 分区表 / NVS 不碰），
         刷前自动读出当前固件并下载为备份。写入前需输入设备 MAC 末四位确认。
       </p>
@@ -1480,7 +1491,7 @@ export default function FirmwareFlash() {
       </div>
 
       {target && (
-        <p className="hint">
+        <p className="muted">
           目标：<strong>{target.slotName} @0x{target.offset.toString(16)}</strong>
           {' '}（{target.evidence}）
         </p>
@@ -1521,8 +1532,8 @@ export default function FirmwareFlash() {
         </div>
       )}
 
-      <pre ref={logRef} className="log" style={{ maxHeight: 320, overflow: 'auto' }}>{log}</pre>
-      <p className="hint">写入完成前不要关页面、不要拔线。</p>
+      <pre ref={logRef} className="mono" style={{ maxHeight: 320, overflow: 'auto' }}>{log}</pre>
+      <p className="muted">写入完成前不要关页面、不要拔线。</p>
     </div>
   );
 }
