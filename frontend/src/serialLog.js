@@ -24,7 +24,12 @@ export class LineDecoder {
 
   /** @param {Uint8Array} bytes @returns {string[]} 完整行 */
   push(bytes) {
-    this.pending += this.decoder.decode(bytes, { stream: true });
+    const chunk = this.decoder.decode(bytes, { stream: true });
+    // 零长度块（Streams / WebSerial 的 reader.read() 允许给出 0 字节的 value）不改变任何状态：
+    // 若照常往下走就会清掉 sawCR，夹在孤立 \r 与下一包 \n 之间的空块会把幽灵空行放回来。
+    // 此时 pending 要么为空（无挂起状态可动），要么留着无断行的残行，直接返回即可。
+    if (chunk.length === 0) return [];
+    this.pending += chunk;
     // 上一包以孤立 \r 结尾、这一包以 \n 开头 ⇒ 它们是同一个 CRLF，吞掉这个 \n，
     // 否则 USB 分块边界随机时每拆一次就多一个空行（ESP-IDF 日志行以 CRLF 结尾）。
     if (this.sawCR && this.pending[0] === '\n') this.pending = this.pending.slice(1);
@@ -35,11 +40,11 @@ export class LineDecoder {
       const line = this.pending.slice(0, idx);
       const isCR = this.pending[idx] === '\r';
       // CRLF 是一个断行，不是两个：否则每行后面都会多一个空行
-      let next = idx + 1;
-      if (isCR && this.pending[next] === '\n') next += 1;
-      // 孤立 \r 正好落在缓冲区末尾 ⇒ 它可能与下一包的 \n 组成 CRLF，留给下一包裁决
-      this.sawCR = isCR && next === this.pending.length;
+      const joined = isCR && this.pending[idx + 1] === '\n';
+      const next = joined ? idx + 2 : idx + 1;
       this.pending = this.pending.slice(next);
+      // 孤立 \r 且它就是缓冲区最后一个字符 ⇒ 下一包开头的 \n 属同一断行
+      this.sawCR = isCR && !joined && this.pending.length === 0;
       out.push(clean(line));
     }
     return out;
