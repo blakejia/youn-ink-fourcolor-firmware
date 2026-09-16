@@ -60,6 +60,18 @@ export default function SerialConsole() {
     const el = preRef.current;
     if (el && stickRef.current) el.scrollTop = el.scrollHeight;
   }, [text]);
+  // 关端口的唯一出口：先 await cancel，再解开 readable 的锁，最后 close，每步兜底。
+  // ⚠️ 顺序不能错：cancel 没轮完（读循环 finally 里的 releaseLock 还没执行）就 close，
+  // readable 仍处于 locked，Chrome/Blink 会拒绝关闭（AbortClose）——端口留在打开态，
+  // 设备不恢复深睡，下一次 open() 报 already open。
+  const closePort = async () => {
+    const r = readerRef.current;
+    const p = portRef.current;
+    try { await r?.cancel(); } catch (e) { /* 已经断了 */ }
+    try { r?.releaseLock(); } catch (e) { /* 锁已解开 */ }
+    try { await p?.close(); } catch (e) { /* 可能已关闭或已断线 */ }
+  };
+
 
   // 读循环异常/流结束后的统一收敛：吐半行 → 关端口 → 状态复位。
   // 不收敛的话界面会卡在"显示断开（看着还开着）却再无数据"，只能靠用户手点断开。
@@ -74,8 +86,9 @@ export default function SerialConsole() {
         if (!pausedRef.current) scheduleRender();
       }
     } catch (e) { /* 无内容可刷 */ }
-    try { await r?.cancel(); } catch (e) { /* 已经断了 */ }
-    try { await port?.close(); } catch (e) { /* 已经关了/已消失 */ }
+    // 先 cancel + 解锁再 close：此时读循环的 reader 还拿着锁（finally 还没跑），
+    // 不解锁就 close 会被 Blink 拒绝（AbortClose）。
+    await closePort();
     if (portRef.current === port) portRef.current = null;
     if (r && readerRef.current === r) readerRef.current = null;
     setOpen(false);
@@ -152,12 +165,8 @@ export default function SerialConsole() {
     setBusy(true);
     try {
       epochRef.current++;
-      try {
-        await readerRef.current?.cancel();
-      } catch (e) { /* 已经断了 */ }
-      try {
-        await portRef.current?.close();
-      } catch (e) { /* 已经断了 */ }
+      // cancel → 解锁 → close 全在 closePort 里按顺序 await，每步有兜底。
+      await closePort();
       // 解码器会把以孤立 \r 结尾的半行挂起：停止时必须 flush 出来，否则丢一行。
       // flush 之后此实例不再复用 —— 直接换新。
       try {
@@ -183,7 +192,6 @@ export default function SerialConsole() {
     if (!supported || !serial) return undefined;
     const onDisconnect = async (e) => {
       if (portRef.current && e.target === portRef.current) {
-        const port = portRef.current;
         // 先递增世代：随后报错醒来的旧读循环按 guard 跳过，不覆盖下面的提示。
         epochRef.current++;
         // 设备掉线同样先把挂起的半行刷出来（此实例不再复用，直接换新）。
@@ -195,11 +203,9 @@ export default function SerialConsole() {
             if (!pausedRef.current) scheduleRender();
           }
         } catch (err2) { /* 无内容可刷 */ }
-        // 浏览器在设备消失时未必自动关闭端口：补一次 close，否则端口永远关不掉
-        //（设备不恢复深睡；下次 open 还会 InvalidStateError）。端口已关闭时 close()
-        // 以 InvalidStateError 拒绝，吞掉即可，无副作用。
-        try { await port.close(); } catch (err3) { /* 已关闭/已消失 */ }
-        try { await readerRef.current?.cancel(); } catch (err4) { /* 已经断了 */ }
+        // 浏览器在设备消失时未必自动关闭端口：补一次 cancel → 解锁 → close
+        //（顺序见 closePort，错了会被 Blink 拒绝；端口已关闭时 close() 抛 InvalidStateError，吞掉即可）。
+        await closePort();
         portRef.current = null;
         readerRef.current = null;
         setErr('设备已断开（USB 掉线或设备进入深睡）。不会自动重连 —— 点「打开串口并复位设备」重连。');
@@ -212,13 +218,12 @@ export default function SerialConsole() {
 
   // 卸载即恢复深睡：不走 busy 门控，直接关（busy 飞行中卸载也必须关掉端口）。
   useEffect(() => () => {
-    epochRef.current++;
-    const r = readerRef.current;
-    const p = portRef.current;
+    // cleanup 不能 async：closePort 先同步抓到 reader/port 再按顺序关，
+    // 尾巴上 .catch 兜底，不让同步抛出的异常逃进 React 错误边界。
+    const done = closePort();
     portRef.current = null;
     readerRef.current = null;
-    if (r) r.cancel().catch(() => {});
-    if (p) p.close().catch(() => {});
+    done.catch(() => {});
   }, []);
 
   const download = () => {
