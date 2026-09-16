@@ -74,3 +74,7 @@ server/data/notifications.jsonl
 server/data/pages/*.bin
 server/data/uploads/
 server/data/images/
+
+# 避免把含密钥的 .env 备份提交进仓库
+.env.bak*
+*.env.bak*
