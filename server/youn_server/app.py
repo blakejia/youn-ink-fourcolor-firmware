@@ -25,6 +25,7 @@ import json
 import logging
 import re
 import secrets
+import hashlib
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -59,6 +60,7 @@ from . import notify_store as ns
 from . import pages as pages_mod
 
 from . import ota as ota_mod
+from . import serial_firmware as serial_fw
 from . import protocol as P
 from .ai import LLMClient, TTSClient, WhisperClient
 from .config import settings, setup_logging
@@ -84,6 +86,16 @@ def _require_operator(request: Request) -> None:
     provided = request.headers.get("X-Operator-Token", "")
     if not secrets.compare_digest(provided.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="bad operator token")
+
+def _require_operator_strict(request: Request) -> None:
+    """固件仓库专用：未配置令牌时**拒绝**，而不是放行。
+
+    与 _require_operator 的 fail-open 语义刻意相反 —— 本仓库承载设备映像，
+    且后台域名公网可达；没有令牌等于把刷写素材暴露给任何人。
+    """
+    if not _operator_token():
+        raise HTTPException(status_code=503, detail="operator token not configured")
+    _require_operator(request)
 
 # ── pairing (device auth) ───────────────────────────────────────────
 _pairing_store = pairing_mod.PairingStore(settings.devices_db)
@@ -737,6 +749,45 @@ def create_app() -> FastAPI:
         finally:
             session.closed = True
             await app.state.sessions.unregister(session.session_id)
+    # ── Serial firmware repository (operator, fail-closed) ──
+    # Serial flashing itself happens entirely in the browser (WebSerial +
+    # esptool-js); the server only hands out image bytes. No port is opened,
+    # no esptool runs here.
+    @app.get("/api/firmware")
+    async def list_firmware(request: Request) -> dict:
+        _require_operator_strict(request)
+        return {"items": [i.to_json() for i in serial_fw.list_items()]}
+
+    @app.get("/api/firmware/{item_id:path}/download")
+    async def download_firmware(item_id: str, request: Request) -> Response:
+        _require_operator_strict(request)
+        p = serial_fw.resolve_item(item_id)
+        if p is None:
+            raise HTTPException(status_code=404, detail="firmware not found")
+        data = p.read_bytes()
+        return Response(
+            content=data,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Length": str(len(data)),
+                "X-SHA256": hashlib.sha256(data).hexdigest(),
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.post("/api/firmware")
+    async def upload_firmware(
+        request: Request,
+        file: UploadFile = File(...),
+    ) -> dict:
+        _require_operator_strict(request)
+        data = await file.read()
+        try:
+            item = serial_fw.save_upload(file.filename or "firmware.bin", data)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return item.to_json()
+
     # ── Web admin UI (Vite build output) ──
     # Explicit index routes (NOT a "/" StaticFiles mount): the MCP root mount
     # below matches every path, so a second "/" mount would be dead code.
