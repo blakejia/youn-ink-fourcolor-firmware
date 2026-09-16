@@ -90,6 +90,15 @@ def _item_from_path(p: Path, item_id: str, source: str) -> FirmwareItem:
     )
 
 
+def _is_upload_name_ok(name: str) -> bool:
+    """upload: 后半段的唯一合法性判据（list_items 与 resolve_item 共用）。
+
+    list_items 用的是磁盘原始文件名，二次净化会让 id 无法往返
+    （``a b.bin`` → ``ab.bin``，甚至解析到另一个文件），含非法字符的名字一律拒绝。
+    """
+    return bool(name) and name not in (".", "..") and "/" not in name and "\\" not in name and "\x00" not in name
+
+
 def list_items() -> list[FirmwareItem]:
     items: list[FirmwareItem] = []
     if BUILD_ARTIFACT.is_file():
@@ -97,6 +106,11 @@ def list_items() -> list[FirmwareItem]:
     d = settings.serial_firmware_dir
     if d.is_dir():
         for p in sorted(d.glob("*.bin")):
+            if not _is_upload_name_ok(p.name):
+                continue
+            # 与 resolve_item 共用同一判据：能列出 ⇒ 一定能解析（双向复用，不在两处各写一套）。
+            if resolve_item(f"upload:{p.name}") is None:
+                continue
             items.append(_item_from_path(p, f"upload:{p.name}", "upload"))
     return items
 
@@ -112,9 +126,8 @@ def resolve_item(item_id: str) -> Optional[Path]:
         return BUILD_ARTIFACT if BUILD_ARTIFACT.is_file() else None
     if item_id.startswith("upload:"):
         name = item_id[len("upload:"):]
-        # 不再净化：list_items 用的是磁盘原始名，二次净化会让 id 无法往返
-        # （`a b.bin` → `ab.bin`，甚至解析到另一个文件）。非法名一律拒绝。
-        if not name or name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+        # 不再净化：合法性判据见 _is_upload_name_ok（与 list_items 共用）。
+        if not _is_upload_name_ok(name):
             return None
         p = settings.serial_firmware_dir / name
         if not p.is_file():

@@ -91,14 +91,17 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
   // 此处是守卫失效时的最后一道 —— 不得静默，必须留下可查痕迹。
   // 注意：写入中途关端口会掐断刷写留下半写分区，所以 busy 时只告警、不主动掐断
   // esptool 自己的传输（端口随页面/组件销毁由浏览器回收），避免二次伤害。
+  // 非 busy 时正常释放端口，避免泄漏。busy 判断用 stepRef（cleanup 闭包拿不到最新 state）。
   useEffect(() => () => {
     onBusyChange?.(false);
     if (stepRef.current !== STEP_IDLE) {
       // eslint-disable-next-line no-console
       console.error(
         `[FirmwareFlash] 组件在“${stepRef.current}”阶段被卸载：刷写可能未完成，`
-        + '若已进入写入阶段设备可能处于半写状态 —— 不要断电，用备份回滚。',
+        + '若已进入写入阶段设备可能处于半写状态 —— 不要断电，用备份回滚。'
+        + '传输可能仍在后台完成；若设备未正常启动，用备份回滚。',
       );
+      return;
     }
     const done = closePortRef.current();
     done.catch(() => {});

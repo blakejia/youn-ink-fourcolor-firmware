@@ -71,6 +71,7 @@ def test_upload_then_list_then_download_round_trip(client):
 
     d = client.get(f"/api/firmware/{item['id']}/download", headers={"X-Operator-Token": TOKEN})
     assert d.status_code == 200
+    assert d.content == HEADER + b"payload"
     assert d.headers["content-type"] == "application/octet-stream"
     assert d.headers["x-sha256"] == hashlib.sha256(HEADER + b"payload").hexdigest()
 
