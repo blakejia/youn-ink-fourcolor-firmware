@@ -47,6 +47,24 @@ def color_index(value) -> Optional[int]:
                key=lambda kv: sum((a - b) ** 2 for a, b in zip(kv[1], rgb)))[0]
 
 
+def _tracks(inner: str) -> list[str]:
+    """`1fr,1fr` / `80px_1fr` / `minmax(50px,1fr)` → 轨道串列表。"""
+    out, depth, cur = [], 0, ""
+    for ch in inner:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch in ",_" and depth == 0:
+            out.append(cur)
+            cur = ""
+            continue
+        cur += ch
+    if cur:
+        out.append(cur)
+    return [t.strip() for t in out if t.strip()]
+
+
 def _int_of(value, what: str) -> Optional[int]:
     if value is None or value == "":
         return None
@@ -114,6 +132,13 @@ class Spec:
     truncated: bool = False
     explicit_w: bool = False
     explicit_h: bool = False
+    display: str = "flex"
+    grid_cols: list[str] = field(default_factory=list)
+    grid_rows: list[str] = field(default_factory=list)
+    col_start: Optional[int] = None
+    col_span: Optional[int] = None
+    row_start: Optional[int] = None
+    row_span: Optional[int] = None
     unknown: list[str] = field(default_factory=list)
 
 
@@ -121,7 +146,25 @@ def parse(tw: str, style: dict, path: str) -> Spec:
     sp = Spec()
     style = style or {}
     for tok in (tw or "").split():
-        if tok in ("flex", "flex-row"):
+        if tok == "grid":
+            sp.display = "grid"
+        elif tok.startswith("grid-cols-["):
+            sp.grid_cols = _tracks(tok[11:-1])
+        elif tok.startswith("grid-rows-["):
+            sp.grid_rows = _tracks(tok[11:-1])
+        elif tok.startswith("col-span-["):
+            m = _INT.search(tok)
+            sp.col_span = int(m.group(1)) if m else 1
+        elif tok.startswith("col-start-["):
+            m = _INT.search(tok)
+            sp.col_start = int(m.group(1)) if m else None
+        elif tok.startswith("row-span-["):
+            m = _INT.search(tok)
+            sp.row_span = int(m.group(1)) if m else 1
+        elif tok.startswith("row-start-["):
+            m = _INT.search(tok)
+            sp.row_start = int(m.group(1)) if m else None
+        elif tok in ("flex", "flex-row"):
             sp.direction = "row"
         elif tok == "flex-col":
             sp.direction = "column"
@@ -323,6 +366,23 @@ def parse(tw: str, style: dict, path: str) -> Spec:
         sp.line_clamp = _int_of(st["lineClamp"], path + ".style.lineClamp")
     if str(st.get("whiteSpace", "")).lower() == "nowrap":
         sp.nowrap = True
+    if str(st.get("display", "")).lower() == "grid":
+        sp.display = "grid"
+    for key, attr in (("gridTemplateColumns", "grid_cols"),
+                      ("gridTemplateRows", "grid_rows")):
+        if key in st:
+            v = st[key]
+            setattr(sp, attr, _tracks(v) if isinstance(v, str)
+                    else [str(x) for x in v])
+    for key, attr in (("gridColumnStart", "col_start"),
+                      ("gridColumnSpan", "col_span"),
+                      ("gridRowStart", "row_start"),
+                      ("gridRowSpan", "row_span")):
+        if key in st:
+            try:
+                setattr(sp, attr, int(st[key]))
+            except (TypeError, ValueError):
+                pass
     if "lineHeight" in st:
         try:
             sp.line_height = float(str(st["lineHeight"]).rstrip("px"))

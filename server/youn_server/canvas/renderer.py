@@ -37,7 +37,7 @@ class CanvasRenderer:
         if not isinstance(node, dict):
             raise RenderError(path, "节点必须是对象")
         ntype = node.get("type")
-        if ntype not in ("div", "span", "img"):
+        if ntype not in ("div", "span", "img", "table", "tr", "td"):
             raise RenderError(path, f"unsupported element type {ntype!r}")
         props = node.get("props") or {}
         spec = spec_of(node, path)
