@@ -16,7 +16,14 @@ const BOOT_REGION_SIZE = 0x10000;
 const norm4 = (s) => (s || '').trim().toUpperCase();
 const macLast4 = (mac) => (mac || '').replace(/:/g, '').slice(-4).toUpperCase();
 
-export default function FirmwareFlash() {
+/** 空 payload 静默跳过却报成功是最坏的失败：三条写入路径共用此闸门。 */
+function assertNonEmpty(data, label) {
+  if (!data || data.length === 0) {
+    throw new Error(`${label}读到 0 字节，已拒绝写入（未写入任何字节）`);
+  }
+}
+
+export default function FirmwareFlash({ onBusyChange } = {}) {
   const [supported] = useState(() => typeof navigator !== 'undefined' && !!navigator.serial);
   const [items, setItems] = useState([]);
   const [selected, setSelected] = useState('');
@@ -39,6 +46,11 @@ export default function FirmwareFlash() {
   const transportRef = useRef(null);
   const pctRef = useRef(-1);
 
+  const busy = step !== STEP_IDLE;
+  // 刷写中状态上抛：Serial.jsx 据此禁用页签切换 + useBlocker 拦路由跳转 +
+  // registerUnsavedCheck 拦设备切换。关端口的守卫在父级，卸载即掐断写坏的路径被堵死。
+  useEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
+
   const say = (s) => setLog((prev) => `${prev}${s}\n`);
 
   const load = async () => {
@@ -51,7 +63,7 @@ export default function FirmwareFlash() {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [log]);
 
-  // 刷写中关标签页 = 半写状态，必须拦住
+  // 刷写中关标签页/刷新 = 半写状态，必须拦住（SPA 内导航由 Serial.jsx 的 useBlocker 拦）。
   useEffect(() => {
     if (step === STEP_IDLE) return undefined;
     const h = (e) => { e.preventDefault(); e.returnValue = ''; };
@@ -72,13 +84,25 @@ export default function FirmwareFlash() {
   };
   const closePortRef = useRef(closePort);
   closePortRef.current = closePort;
+  const stepRef = useRef(step);
+  stepRef.current = step;
 
-  // 卸载即放端口：页签切走（本组件被卸载）时设备才能恢复深睡。
-  // cleanup 不能 async：先同步抓走引用再关，尾巴 .catch 兜底。
+  // 卸载 cleanup：正常路径下 Serial.jsx 在 busy 时根本不让本组件卸载，
+  // 此处是守卫失效时的最后一道 —— 不得静默，必须留下可查痕迹。
+  // 注意：写入中途关端口会掐断刷写留下半写分区，所以 busy 时只告警、不主动掐断
+  // esptool 自己的传输（端口随页面/组件销毁由浏览器回收），避免二次伤害。
   useEffect(() => () => {
+    onBusyChange?.(false);
+    if (stepRef.current !== STEP_IDLE) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[FirmwareFlash] 组件在“${stepRef.current}”阶段被卸载：刷写可能未完成，`
+        + '若已进入写入阶段设备可能处于半写状态 —— 不要断电，用备份回滚。',
+      );
+    }
     const done = closePortRef.current();
     done.catch(() => {});
-  }, []);
+  }, [onBusyChange]);
 
   const downloadBytes = (bytes, filename) => {
     const blob = new Blob([bytes], { type: 'application/octet-stream' });
@@ -148,14 +172,28 @@ export default function FirmwareFlash() {
     if (written >= total) say(`${label}完成 ${formatBytes(total)}`);
   };
 
-  const readRaw = async (esploader, addr, size) => {
-    const raw = await esploader.readFlash(addr, size, () => {});
-    return raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+  // readFlash(addr, size, onPacketReceived(packet, received, total))：备份读 4032 KiB
+  // 要跑很久，必须有进度，否则用户以为卡死而拔线。
+  const readRaw = async (esploader, addr, size, label) => {
+    pctRef.current = -1;
+    const onData = label ? onProgress(label) : () => {};
+    const raw = await esploader.readFlash(addr, size, (pkt, got, total) => onData(0, got, total));
+    const out = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+    assertNonEmpty(out, `${label || '读 flash'}（0x${addr.toString(16)}）`);
+    return out;
   };
+
+  const abortMessage = (e, enteredWrite, rollbackHint) => (enteredWrite
+    ? `刷写中止：${e.message}；已经进入写入阶段，设备可能处于半写状态 —— 不要断电，${rollbackHint}。`
+    : `刷写中止：${e.message}（尚未进入写入阶段，未写入任何字节）。`);
 
   const flash = async () => {
     const item = items.find((i) => i.id === selected);
     if (!item) { setErr('请先选择固件'); return; }
+    if (item.image_ok === false) {
+      setErr('该固件服务端校验未通过（image_ok=false：首字节不是 0xE9 或大小异常），已拒绝写入，未写入任何字节');
+      return;
+    }
     if (!/^[0-9A-Fa-f]{4}$/.test(norm4(confirmText))) {
       setErr('请先输入设备 MAC 末四位（4 位十六进制），对照设备标签填写');
       return;
@@ -169,10 +207,19 @@ export default function FirmwareFlash() {
     setProgress('');
     pctRef.current = -1;
     setTarget(null);
+    let enteredWrite = false;
+    let rollback = '用备份按相同步骤写回原槽位回滚';
     try {
       setStep('读固件');
       const bytes = await api.firmwareBytes(item.id);
       const data = new Uint8Array(bytes);
+      assertNonEmpty(data, `固件 ${item.name}`);
+      if (data.length > APP_PARTITION_SIZE) {
+        throw new Error(
+          `镜像 ${formatBytes(data.length)} 超过应用分区上限 ${formatBytes(APP_PARTITION_SIZE)}（4032 KiB），`
+          + '不能走 OTA 槽路径 —— 请用下方高级「完整镜像」路径（写 0x0）。已中止，未写入任何字节',
+        );
+      }
       say(`固件 ${item.name} ${formatBytes(data.length)} sha256 ${item.sha256.slice(0, 12)}…`);
 
       setStep('打开串口');
@@ -189,12 +236,14 @@ export default function FirmwareFlash() {
 
       if (backup) {
         setStep('备份当前固件');
-        const bk = await readRaw(esploader, t.offset, APP_PARTITION_SIZE);
+        const bk = await readRaw(esploader, t.offset, APP_PARTITION_SIZE, '备份读取');
         downloadBytes(bk, `backup-${mac.replace(/:/g, '')}-${t.name}-${Date.now()}.bin`);
         say(`已下载备份 ${formatBytes(bk.length)}：刷坏了可用它按相同步骤写回 0x${t.offset.toString(16)} 回滚`);
       }
+      rollback = `用备份写回 0x${t.offset.toString(16)} 回滚`;
 
       setStep('写入');
+      enteredWrite = true;
       await esploader.writeFlash({
         fileArray: [{ data, address: t.offset }],
         flashMode: FLASH_PARAMS.flashMode,
@@ -202,9 +251,12 @@ export default function FirmwareFlash() {
         flashSize: FLASH_PARAMS.flashSize,
         eraseAll: false,
         compress: true,
-        reportProgress: onProgress('写入'),
+        reportProgress: onProgress('写入（压缩后字节）'),
         calculateMD5Hash: (image) => md5Hex(image),
       });
+      // writeFlash 返回 = 设备端 flashMd5sum 与本地 MD5 比对一致（不一致时抛
+      // "MD5 of file does not match data in flash!"），成功消息只在此后出现。
+      say('写入 MD5 校验通过（设备端 flashMd5sum 与本地一致）。');
 
       setStep('复位');
       await esploader.after('hard_reset');
@@ -213,7 +265,7 @@ export default function FirmwareFlash() {
       await closePort();
       say('刷写结束：设备已复位，端口已释放。若要验证，去「串口监视」页签重新打开串口看开机日志。');
     } catch (e) {
-      setErr(`刷写中止：${e.message}；如果已经进入写入阶段，设备可能处于半写状态 —— 不要断电，用备份按相同步骤写回原槽位回滚。`);
+      setErr(abortMessage(e, enteredWrite, rollback));
       setStep(STEP_IDLE);
       setProgress('');
       await closePort();
@@ -232,15 +284,17 @@ export default function FirmwareFlash() {
     setErr('');
     setProgress('');
     pctRef.current = -1;
+    let enteredWrite = false;
     try {
       setStep('打开串口');
       const { mac, esploader } = await openSession(say);
       checkConfirm(mac);
       setStep('备份 otadata');
-      const ota = await readRaw(esploader, OTADATA_OFFSET, OTADATA_SIZE);
+      const ota = await readRaw(esploader, OTADATA_OFFSET, OTADATA_SIZE, 'otadata 备份读取');
       downloadBytes(ota, `otadata-backup-${mac.replace(/:/g, '')}-${Date.now()}.bin`);
       say(`已下载 otadata 备份 ${formatBytes(ota.length)}`);
       setStep('清空 otadata');
+      enteredWrite = true;
       await esploader.writeFlash({
         fileArray: [{ data: new Uint8Array(OTADATA_SIZE).fill(0xff), address: OTADATA_OFFSET }],
         flashMode: FLASH_PARAMS.flashMode,
@@ -248,7 +302,7 @@ export default function FirmwareFlash() {
         flashSize: FLASH_PARAMS.flashSize,
         eraseAll: false,
         compress: true,
-        reportProgress: onProgress('清空 otadata'),
+        reportProgress: onProgress('清空 otadata（压缩后字节）'),
         calculateMD5Hash: (image) => md5Hex(image),
       });
       setStep('复位');
@@ -258,7 +312,7 @@ export default function FirmwareFlash() {
       await closePort();
       say('已重置：启动选择回落到 ota_0，端口已释放。');
     } catch (e) {
-      setErr(`重置中止：${e.message}；若已进入写入阶段，不要断电，用刚下载的 otadata 备份写回 0xd000 回滚。`);
+      setErr(abortMessage(e, enteredWrite, '用刚下载的 otadata 备份写回 0xd000 回滚'));
       setStep(STEP_IDLE);
       setProgress('');
       await closePort();
@@ -275,26 +329,39 @@ export default function FirmwareFlash() {
       setErr('请先输入设备 MAC 末四位（4 位十六进制）');
       return;
     }
-    const ok = window.confirm('完整镜像会覆盖 bootloader 与分区表，写坏即变砖（需备份回滚）。仍要继续吗？');
+    const ok = window.confirm(
+      `即将把本地文件「${f.name}」（${formatBytes(f.size)}）写入目标地址 0x0（覆盖 bootloader 与分区表），`
+      + '写坏即变砖（需备份回滚）。应用分区镜像（小文件）绝不能走这条路径，只能走上面的 OTA 槽刷写。仍要继续吗？',
+    );
     if (!ok) return;
     setErr('');
     setProgress('');
     pctRef.current = -1;
+    let enteredWrite = false;
     try {
       setStep('读本地镜像');
       const data = new Uint8Array(await f.arrayBuffer());
-      say(`本地镜像 ${f.name} ${formatBytes(data.length)}`);
+      assertNonEmpty(data, `本地文件 ${f.name}`);
+      say(`本地镜像 ${f.name} ${formatBytes(data.length)} → 目标地址 0x0`);
       if (data[0] !== 0xe9) {
         throw new Error('该文件首字节不是 0xE9，不像 ESP 镜像，已中止，未写入任何字节');
+      }
+      if (data.length <= APP_PARTITION_SIZE) {
+        const ok2 = window.confirm(
+          `警告：「${f.name}」只有 ${formatBytes(data.length)}，不大于应用分区 ${formatBytes(APP_PARTITION_SIZE)}，`
+          + '看起来像应用分区镜像而非完整合并镜像 —— 写入 0x0 会毁掉 bootloader。确定它真的是写 0x0 的完整镜像吗？',
+        );
+        if (!ok2) { setStep(STEP_IDLE); setProgress(''); return; }
       }
       setStep('打开串口');
       const { mac, esploader } = await openSession(say);
       checkConfirm(mac);
       setStep('备份 bootloader 区');
-      const bl = await readRaw(esploader, BOOT_REGION_OFFSET, BOOT_REGION_SIZE);
+      const bl = await readRaw(esploader, BOOT_REGION_OFFSET, BOOT_REGION_SIZE, 'boot 区备份读取');
       downloadBytes(bl, `bl-pt-otadata-backup-${mac.replace(/:/g, '')}-${Date.now()}.bin`);
       say(`已下载 bl-pt-otadata 备份 ${formatBytes(bl.length)}`);
       setStep('写入完整镜像');
+      enteredWrite = true;
       await esploader.writeFlash({
         fileArray: [{ data, address: BOOT_REGION_OFFSET }],
         flashMode: FLASH_PARAMS.flashMode,
@@ -302,9 +369,10 @@ export default function FirmwareFlash() {
         flashSize: FLASH_PARAMS.flashSize,
         eraseAll: false,
         compress: true,
-        reportProgress: onProgress('写入完整镜像'),
+        reportProgress: onProgress('写入完整镜像（压缩后字节）'),
         calculateMD5Hash: (image) => md5Hex(image),
       });
+      say('写入 MD5 校验通过（设备端 flashMd5sum 与本地一致）。');
       setStep('复位');
       await esploader.after('hard_reset');
       setStep(STEP_IDLE);
@@ -312,7 +380,7 @@ export default function FirmwareFlash() {
       await closePort();
       say('完整镜像写入结束：设备已复位，端口已释放。去「串口监视」看开机日志确认。');
     } catch (e) {
-      setErr(`完整镜像刷写中止：${e.message}；如果已经进入写入阶段，设备可能变砖 —— 不要断电，用 bl-pt-otadata 备份写回 0x0 回滚。`);
+      setErr(abortMessage(e, enteredWrite, '用 bl-pt-otadata 备份写回 0x0 回滚，应用分区备份另需写回原槽位'));
       setStep(STEP_IDLE);
       setProgress('');
       await closePort();
@@ -328,14 +396,13 @@ export default function FirmwareFlash() {
     );
   }
 
-  const busy = step !== STEP_IDLE;
-
   return (
     <div>
       <Banner>{err}</Banner>
       <p className="muted">
         默认只写<strong>活动 OTA 槽的应用分区</strong>（bootloader / 分区表 / NVS 不碰），
         刷前自动读出当前固件并下载为备份。写入前需输入设备 MAC 末四位确认。
+        刷写进行中时页签切换与离开本页会被拦下（避免半写变砖）。
       </p>
 
       <div className="row" style={{ marginTop: 12, alignItems: 'flex-end' }}>
@@ -346,6 +413,7 @@ export default function FirmwareFlash() {
             {items.map((i) => (
               <option key={i.id} value={i.id}>
                 {i.source === 'build' ? '[构建产物] ' : '[上传] '}{i.name} · {formatBytes(i.size)}
+                {i.image_ok === false ? ' · 校验未通过' : ''}
               </option>
             ))}
           </select>
@@ -470,7 +538,7 @@ export default function FirmwareFlash() {
               <div className="field-label">风险确认</div>
               <span>
                 <input type="checkbox" checked={fullAck} onChange={(e) => setFullAck(e.target.checked)} disabled={busy} />
-                确认完整镜像风险
+                确认写入 0x0（覆盖 bootloader/分区表）
               </span>
             </label>
             <label className="field" style={{ flex: '0 0 auto' }}>
