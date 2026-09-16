@@ -279,13 +279,18 @@ def list_items() -> list[FirmwareItem]:
 def resolve_item(item_id: str) -> Optional[Path]:
     """把不透明 id 解析成白名单内的真实路径；解析不出返回 None。
 
-    ``safe_filename`` 已经剥掉 ``/`` 与 ``.`` 之外的字符，因此遍历串在
-    拼接前就被破坏；解析后再做一次父目录校验，双重保险（照 ota.get_file_path）。
+    **不**对 id 后半段跑 ``safe_filename``：``list_items`` 用的是磁盘原始文件名，
+    二次净化会让 id 无法往返（``a b.bin`` → ``ab.bin``，甚至解析到另一个文件），
+    含非法字符的名字一律拒绝。解析后再做父目录校验（照 ota.get_file_path）。
     """
     if item_id == BUILD_ID:
         return BUILD_ARTIFACT if BUILD_ARTIFACT.is_file() else None
     if item_id.startswith("upload:"):
-        name = safe_filename(item_id[len("upload:"):])
+        name = item_id[len("upload:"):]
+        # 不再净化：list_items 用的是磁盘原始名，二次净化会让 id 无法往返
+        # （`a b.bin` → `ab.bin`，甚至解析到另一个文件）。非法名一律拒绝。
+        if not name or name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+            return None
         p = settings.serial_firmware_dir / name
         if not p.is_file():
             return None
@@ -300,7 +305,7 @@ def save_upload(filename: str, data: bytes) -> FirmwareItem:
     d = settings.serial_firmware_dir
     d.mkdir(parents=True, exist_ok=True)
     stem = Path(safe_filename(filename)).stem or "firmware"
-    name = f"{int(time.time())}-{stem}.bin"
+    name = f"{int(time.time() * 1000)}-{stem}.bin"
     p = d / name
     p.write_bytes(data)
     sha = hashlib.sha256(data).hexdigest()
@@ -320,6 +325,12 @@ def save_upload(filename: str, data: bytes) -> FirmwareItem:
 
 Run: `cd server && .venv/bin/python -m pytest tests/test_serial_firmware.py -v`
 Expected: PASS（8 passed）
+
+> **任务执行后更正（Ruling A/B，见账本）**：`resolve_item` 对 id 二次净化会让
+> id 无法往返（`a b.bin` → `ab.bin`，实测甚至会解析到另一个文件，导致下载字节与
+> 列表的 size/sha256 不符），已改为"不净化 + 显式拒绝非法名"；`save_upload` 的命名
+> 从秒级改毫秒，避免同秒同名上传静默互覆。评审轮另补 3 条用例（原始名往返、符号
+> 链接逃逸、构建产物 size/sha256 一致），实测反向变异时会恰好变红。
 
 - [ ] **Step 6: 跑既有套件，确认没弄坏别的东西**
 
