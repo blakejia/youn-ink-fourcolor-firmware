@@ -903,7 +903,7 @@ git commit -m "feat(web): 串口日志管线纯逻辑（中文解码/CR 分行/�
 - Test: 一次性 node 脚本 `/tmp/flashtarget_check.mjs`（**不进仓库**）
 
 **Interfaces:**
-- Produces: `SLOTS = [{name:'ota_0', offset:0x20000}, {name:'ota_1', offset:0x410000}]`、`OTADATA_OFFSET=0xd000`、`OTADATA_SIZE=0x2000`、`APP_PARTITION_SIZE=0x3F0000`、`parseOtadata(bytes) -> {slotIndex, offset, slotName, seq, evidence, verified}`
+- Produces: `SLOTS = [{name:'ota_0', offset:0x20000}, {name:'ota_1', offset:0x410000}]`、`OTADATA_OFFSET=0xd000`、`OTADATA_SIZE=0x2000`、`APP_PARTITION_SIZE=0x3F0000`、`parseOtadata(bytes) -> {slotIndex, name, offset, seq, evidence, verified}`（`name` 来自 `...SLOTS[i]`，**不是** `slotName`）
 
 - [ ] **Step 1: 写一次性验证脚本（先红）**
 
@@ -1277,6 +1277,10 @@ git commit -m "feat(web): 串口监视组件（中文解码、暂停只停渲染
 
 ## Task 7: 固件刷写组件
 
+> **Ruling I（预扫漏判，已更正）**：本任务原先写的是 `target.slotName`，而 T5 的
+> `parseOtadata` 返回的是 `...SLOTS[i]` 展开出来的 **`name`** —— 下游会渲染 `undefined`。
+> 计划已统一为 `name`（T5 的接口声明同步更正）。
+
 > **Ruling G（评审 T3 时发现，同样适用于本任务）**：表单控件必须按仓库既有结构写 ——
 > `<label className="field"><div className="field-label">标题</div><input/></label>`
 > （见 `frontend/src/pages/Ota.jsx:49-51`、`Devices.jsx:121-123`）。裸 `<label>文字<input/></label>`
@@ -1409,7 +1413,7 @@ export default function FirmwareFlash() {
       const otaBytes = await esploader.readFlash(OTADATA_OFFSET, OTADATA_SIZE, () => {});
       const t = parseOtadata(new Uint8Array(otaBytes));
       setTarget(t);
-      say(`目标槽：${t.slotName} @0x${t.offset.toString(16)}（${t.evidence}）`);
+      say(`目标槽：${t.name} @0x${t.offset.toString(16)}（${t.evidence}）`);
 
       setStep('备份当前固件');
       const backup = new Uint8Array(
@@ -1418,7 +1422,7 @@ export default function FirmwareFlash() {
       const blob = new Blob([backup], { type: 'application/octet-stream' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = `backup-${mac.replace(/:/g, '')}-${t.slotName}-${Date.now()}.bin`;
+      a.download = `backup-${mac.replace(/:/g, '')}-${t.name}-${Date.now()}.bin`;
       a.click();
       URL.revokeObjectURL(a.href);
       say(`已下载备份 ${formatBytes(backup.length)}`);
@@ -1492,7 +1496,7 @@ export default function FirmwareFlash() {
 
       {target && (
         <p className="muted">
-          目标：<strong>{target.slotName} @0x{target.offset.toString(16)}</strong>
+          目标：<strong>{target.name} @0x{target.offset.toString(16)}</strong>
           {' '}（{target.evidence}）
         </p>
       )}
