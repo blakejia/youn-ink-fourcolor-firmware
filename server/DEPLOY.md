@@ -222,13 +222,13 @@ curl http://127.0.0.1:9002/api/devices -H "X-Operator-Token: ..."
 ```bash
 # 仓库列表（含构建产物 build:xiaozhi.bin + 手动上传件）
 curl http://127.0.0.1:9002/api/firmware -H "X-Operator-Token: $OPERATOR_TOKEN"
-# 下载某件（sha256 在 X-SHA256 响应头里）
-curl -OJ http://127.0.0.1:9002/api/firmware/build:xiaozhi.bin/download \
+# 下载某件（sha256 在 X-SHA256 响应头里；响应无 Content-Disposition，需 -o 显式命名）
+curl -o xiaozhi.bin http://127.0.0.1:9002/api/firmware/build:xiaozhi.bin/download \
      -H "X-Operator-Token: $OPERATOR_TOKEN"
-# 上传一件（首字节须为 ESP 镜像魔数 0xE9，且不大于应用分区 0x3F0000）
+# 上传一件（multipart 字段名为 file；首字节须为 ESP 镜像魔数 0xE9，且不大于应用分区 0x3F0000）
 curl -X POST http://127.0.0.1:9002/api/firmware \
      -H "X-Operator-Token: $OPERATOR_TOKEN" \
-     -F "firmware=@some-app.bin"
+     -F "file=@some-app.bin"
 ```
 存储在 `data/serial-firmware/`（上传件按 `<毫秒时间戳>-<净化名>.bin` 落盘，
 另带同名 `.sha256`），构建产物 `firmware/build/xiaozhi.bin` 若存在则以
