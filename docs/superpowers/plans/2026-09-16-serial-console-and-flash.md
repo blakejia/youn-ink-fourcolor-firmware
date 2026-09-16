@@ -810,7 +810,11 @@ export class LineDecoder {
 
   /** @param {Uint8Array} bytes @returns {string[]} 完整行 */
   push(bytes) {
-    this.pending += this.decoder.decode(bytes, { stream: true });
+    const chunk = this.decoder.decode(bytes, { stream: true });
+    // Streams 允许 0 字节的 read（WebSerial 就是 Streams）：空块必须幂等，
+    // 否则夹在 \r 与 \n 之间的空块会清掉挂起状态，放回一个幽灵空行。
+    if (chunk.length === 0) return [];
+    this.pending += chunk;
     if (this.sawCR && this.pending.startsWith('\n')) this.pending = this.pending.slice(1);
     this.sawCR = false;
     const out = [];
