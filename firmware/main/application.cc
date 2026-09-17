@@ -1035,18 +1035,20 @@ void Application::RunPowerCycle() {
     // interactive-cold-boot cycle (start() sets DISPLAYING on any paired boot,
     // :252-253 — the round-1 guard hit it). All three must hold.
     const bool paint_ready = page_sync_prepare_paint();
-    const bool canvas_owns_quiet_cycle =
-        IsQuietBoot() && !promoted_ && page_sync_is_displaying();
     // Do not cut the radio while a /next pull is still outstanding: the server
     // marks the notification shown the moment it answers
     // (notify_store.py::next_for), so a response stranded by a mid-flight cut
     // is never re-offered and the notification is lost for good. Prefer
     // skipping one radio cut (one paint cycle's saving) over losing one
-    // notification. Bounded: the fetch task always resolves on its own
-    // (HTTP_TIMEOUT_MS abort or an early return), and RunPowerCycle holds no
-    // lock here, so a short poll cannot wedge the cycle or invert the
-    // state -> display order. Only the pre-paint cut is guarded — the two
-    // deep-sleep/teardown cuts never return and are untouched.
+    // notification. Bounded: the fetch task always resolves on its own, and
+    // RunPowerCycle holds no lock here, so a short poll cannot wedge the
+    // cycle or invert the state -> display order.
+    // NOTE (wave 2): this wait alone does NOT save the radio — a slow fetch
+    // that outlives the budget below still faces the terminal policy, which
+    // would Sleep and tear the radio down with the response in flight. The
+    // terminal cut is held off separately: ServicePowerPolicy feeds
+    // notify_is_fetching() into in.notify_active, so decide() stays awake
+    // while the pull is outstanding.
     constexpr int kNotifySettlePollMs = 50;
     constexpr int kNotifySettleBudgetMs = 3000;
     for (int waited_ms = 0;
@@ -1055,6 +1057,15 @@ void Application::RunPowerCycle() {
         vTaskDelay(pdMS_TO_TICKS(kNotifySettlePollMs));
     }
     const bool notify_fetch_settled = !notify_is_fetching();
+    // Re-sample ownership AFTER the wait, not before: a pull that lands inside
+    // the window runs handle_next -> show_bitmap -> page_sync::stop_display(),
+    // so the notification now owns the panel (DISPLAYING false, SUSPENDED
+    // true) and paint_if_changed below is a no-op. Cutting the radio on the
+    // stale pre-wait value would buy a full Wi-Fi teardown/reconnect plus an
+    // amp power cycle with zero paint benefit, right while the user is about
+    // to answer the notification.
+    const bool canvas_owns_quiet_cycle =
+        IsQuietBoot() && !promoted_ && page_sync_is_displaying();
     if (paint_ready && canvas_owns_quiet_cycle && notify_fetch_settled) {
         StopRadioForPaint();
         radio_cut_for_paint_ = true;
@@ -1073,7 +1084,19 @@ void Application::ServicePowerPolicy() {
     Settings nvs(kPowerNamespace, true);
     rf_power_inputs_t in = {};
     in.mains = Board::GetInstance().IsPowerPresent() ? 1 : 0;
-    in.notify_active = notify_is_active() ? 1 : 0;
+    // An in-flight /next pull holds the device awake exactly like a
+    // notification on screen: the server marks the notification shown the
+    // moment it answers (notify_store.py::next_for), so sleeping here would
+    // tear the radio down with the response in flight and the fetch task
+    // would die with RAM — the notification is then never re-offered.
+    // decide() maps this to StayAwake{notify} (power.rs:47-49); the stay-awake
+    // branch restarts the station when the pre-paint cut fired. Cannot stick:
+    // every terminal path of fetch_once leaves FETCHING (success -> NOTIFYING,
+    // anything else -> IDLE), so the next re-arm re-evaluates to Sleep on its
+    // own. Deliberately NOT extended to RouteInput's notify_active: that one
+    // drives button routing (input.rs), where FETCHING must not read as
+    // "a popup is up, ack it".
+    in.notify_active = (notify_is_active() || notify_is_fetching()) ? 1 : 0;
     // CanSleepNow folds in the lifecycle gate (SyncIdle only) plus the panel/
     // audio busy bookkeeping, holds and deadlines — the three checks the old
     // EnterScheduledSleep spelled out by hand.

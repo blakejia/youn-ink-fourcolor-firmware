@@ -16,7 +16,7 @@ extern "C" {
 
 typedef struct {
     uint8_t  mains;                 // 插着 USB/充电器
-    uint8_t  notify_active;         // 通知在屏
+    uint8_t  notify_active;         // 通知在屏，或 /next 拉取在飞（均 hold 住不睡）
     uint8_t  busy;                  // SleepManager::CanSleepNow() == false
     uint8_t  sync_ok;               // 最近一次 schedule 拉取成功
     uint8_t  screen_active;         // 服务端 policy.screen_active

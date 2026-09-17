@@ -97,6 +97,12 @@ mod tests {
         assert_eq!(decide(&i), Action::StayAwake { retry_ms: 15_000, reason: "notify" });
     }
 
+    // Wave-2 wiring note: the C++ side feeds
+    // `notify_is_active() || notify_is_fetching()` into `notify_active`, so an
+    // in-flight /next pull maps to this same hold — no separate decide() arm
+    // is needed, and the stay-awake cannot stick (every fetch_once terminal
+    // path leaves FETCHING, so the next re-arm re-evaluates to Sleep).
+
     #[test]
     fn a_busy_panel_or_audio_holds_the_device_awake() {
         let i = Inputs { busy: true, ..base() };
