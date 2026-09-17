@@ -6,6 +6,7 @@
 #include <esp_event.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
+#include <esp_pm.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -75,6 +76,15 @@ extern "C" void app_main(void)
     const bool quiet_boot = (wake_cause == 1) && !is_bounce_return;
     ESP_LOGI(TAG, "Boot path: %s (wakeup cause=%d)", quiet_boot ? "quiet" : "interactive",
              wake_cause);
+    // DFS only: the USB-Serial-JTAG console must survive idle (project red
+    // line), and light sleep would tear that pad down on esp32s3. The SPI
+    // master (EPD) and I2S drivers hold their own PM locks, so their timing is
+    // unaffected — no locks are added here on purpose.
+    esp_pm_config_t pm = {};
+    pm.max_freq_mhz = 240;
+    pm.min_freq_mhz = 80;
+    pm.light_sleep_enable = false;
+    ESP_ERROR_CHECK(esp_pm_configure(&pm));
     auto& app = Application::GetInstance();
     app.Initialize(quiet_boot);
     app.Run();  // This function runs the main event loop and never returns

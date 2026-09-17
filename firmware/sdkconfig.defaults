@@ -81,3 +81,6 @@ CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=8192
 
 # esp_timer 任务栈：SNTP 同步回调/状态栏刷新等会在这条任务上跑（曾实测 3584 溢出）
 CONFIG_ESP_TIMER_TASK_STACK_SIZE=8192
+
+# DFS only (light sleep stays OFF: USB-Serial-JTAG console must survive idle)
+CONFIG_PM_ENABLE=y
