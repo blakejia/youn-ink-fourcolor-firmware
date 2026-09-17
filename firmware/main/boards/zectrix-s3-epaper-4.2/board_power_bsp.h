@@ -2,6 +2,8 @@
 #define __BOARD_POWER_BSP_H__
 
 #include <atomic>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 class ChargeStatus;
 
@@ -16,6 +18,7 @@ private:
     std::atomic<bool> led_override_blink_{false};
     std::atomic<bool> led_override_phase_{false};
     std::atomic<int> led_activity_pulses_{0};
+    TaskHandle_t led_task_{nullptr};
 
     static void PowerLedTask(void *arg);
 
