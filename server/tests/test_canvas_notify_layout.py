@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 from youn_server.canvas_render import render_canvas_to_bitmap
 from youn_server.image_conv import IDX_BLACK, IDX_RED, IDX_WHITE, IDX_YELLOW, SCREEN_H, SCREEN_W
 
@@ -67,23 +69,27 @@ def test_default_still_dithers(  ):
     assert IDX_BLACK in got and len(got) >= 2
 
 
-def test_dither_false_reduces_speckle_massively():
-    """量化对比：吸附的孤立斑點应远低于抖动。"""
-    def speckle(data):
-        idx = _idx(data); iso = nw = 0
-        for y in range(1, SCREEN_H - 1):
-            for x in range(1, SCREEN_W - 1):
-                c = idx[y][x]
-                if c == IDX_WHITE:
-                    continue
-                nw += 1
-                if (idx[y-1][x] != c and idx[y+1][x] != c
-                        and idx[y][x-1] != c and idx[y][x+1] != c):
-                    iso += 1
-        return iso / max(1, nw)
-    dithered = speckle(render_canvas_to_bitmap(_notify_canvas()))
-    snapped = speckle(render_canvas_to_bitmap(_notify_canvas(), dither=False))
-    # 绝对下限 + 相对改善：硬阈值下文字拐角本来就会有少量孤立像素，
-    # 要钉住的是"没有被抖成稀疏点"这件事（抖动时量级在 4% 上下）。
-    assert snapped < 0.025, f"吸附后斑点 {snapped:.1%} 偏高，文字仍在被抖"
-    assert snapped < dithered * 0.6, f"吸附 {snapped:.1%} vs 抖动 {dithered:.1%} 改善不足"
+def _speckle(data: bytes) -> float:
+    """孤立斑点率：某个非白像素，其上下左右四邻都不是它的颜色。"""
+    idx = _idx(data)
+    iso = nw = 0
+    for y in range(1, SCREEN_H - 1):
+        for x in range(1, SCREEN_W - 1):
+            c = idx[y][x]
+            if c == IDX_WHITE:
+                continue
+            nw += 1
+            if (idx[y-1][x] != c and idx[y+1][x] != c
+                    and idx[y][x-1] != c and idx[y][x+1] != c):
+                iso += 1
+    return iso / max(1, nw)
+
+
+@pytest.mark.parametrize("dither", [True, False])
+def test_notify_text_is_never_dithered_into_speckle(dither):
+    """文字走单色渲染（量化前即纯黑白）⇒ 开不开抖动都不该出现稀疏斑点。
+
+    改前：文字的灰度抗锯齿边被整面 Floyd–Steinberg 扩散，孤立斑点占非白像素
+    ~9%（见本文件顶部说明）；这条不变量在两种模式下都必须成立。"""
+    s = _speckle(render_canvas_to_bitmap(_notify_canvas(), dither=dither))
+    assert s < 0.025, f"dither={dither} 斑点 {s:.1%} 偏高，文字仍在被抖"

@@ -60,6 +60,11 @@ class Painter:
                                 letter_spacing=letter_spacing)
         line_h = max(1, _h // max(1, len(lines)))
         draw = ImageDraw.Draw(self.surf)
+        # 面板只有 4 色、没有灰阶 ⇒ 抗锯齿灰边不可能被表示：它只会在末尾的
+        # 整体 Floyd–Steinberg 里被扩散成一粒粒，表现为笔画毛边与笔画内空洞
+        # （实测 'LLM 用量'@32px：763 个灰像素 / 2 个洞）。改走 FreeType 的
+        # 单色（1-bit + hinting）渲染 ⇒ 量化前就是纯黑白，抖无可抖。
+        draw.fontmode = "1"
         for i, ln in enumerate(lines):
             lw = width_of(ln, font, letter_spacing)
             dx = 0
