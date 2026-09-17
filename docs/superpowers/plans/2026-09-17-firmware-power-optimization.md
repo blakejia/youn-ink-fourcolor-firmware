@@ -191,7 +191,6 @@ git commit -m "feat(power): 设备侧省电计数器（唤醒/清醒毫秒/射�
         paint_if_changed();                       // glass now shows page 0
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
         sync_once();
-        with_table(|t| { /* nothing */ });
         assert!(prepare_paint(), "same page on the glass -> no download needed");
     }
 ```
