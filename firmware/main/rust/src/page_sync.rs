@@ -547,9 +547,24 @@ fn blit_and_refresh(idx: usize, slot: *mut u8) -> bool {
 /// otherwise try to fetch it with the radio down and the page would never land.
 /// Returns false only when the page is missing and could not be fetched.
 pub fn prepare_paint() -> bool {
-    let Some(idx) = target_index() else { return true };   // empty hint: nothing to fetch
+    if SUSPENDED.load(Ordering::Acquire) {
+        return true; // canvas benched: nothing to fetch
+    }
+    let Some(idx) = target_index() else {
+        return true; // empty hint: nothing to fetch
+    };
+    let rec = read_panel_record();
     let md5 = with_table(|t| t.pages[idx].md5);
-    if !with_table(|t| t.pages[idx].bitmap.is_null()) { return true; }
+    if !with_table(|t| t.pages[idx].bitmap.is_null()) {
+        return true;
+    }
+    if record_magic_ok(&rec.0)
+        && rec.0[4] != 0
+        && record_index(&rec.0) == idx as i32
+        && rec.0[8..40] == md5
+    {
+        return true; // glass already shows it: no fetch
+    }
     !ensure_bitmap(idx, &md5).is_null()
 }
 
@@ -834,11 +849,11 @@ pub extern "C" fn page_sync_sync_once() -> bool {
 pub extern "C" fn page_sync_paint_if_changed() -> bool {
     paint_if_changed()
 }
+
 #[unsafe(no_mangle)]
 pub extern "C" fn page_sync_prepare_paint() -> bool {
     prepare_paint()
 }
-
 
 /// Seconds until the server's next page change; -1 = unknown/empty schedule.
 #[unsafe(no_mangle)]
@@ -1313,11 +1328,18 @@ mod tests {
         let _g = shim::host::lock();
         reset_for_test();
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
-        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        shim::host::script_ok(
+            &format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)),
+            &bitmap_body(0xa1),
+        );
         sync_once();
         let before = shim::host::refreshes();
         assert!(prepare_paint(), "the bitmap must be resident");
-        assert_eq!(shim::host::refreshes(), before, "prepare must not refresh the panel");
+        assert_eq!(
+            shim::host::refreshes(),
+            before,
+            "prepare must not refresh the panel"
+        );
         assert!(paint_if_changed(), "then the paint still happens");
     }
 
@@ -1326,15 +1348,35 @@ mod tests {
         let _g = shim::host::lock();
         reset_for_test();
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
-        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        // No bitmap is scripted on purpose: the glass already shows the target
+        // page, so prepare must not issue a bitmap GET at all.
+        shim::host::stage_panel_record(0x50414E31, 1, md5hex(0xa1).as_bytes(), 0);
         sync_once();
-        prepare_paint();
-        paint_if_changed();                       // glass now shows page 0
-        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
-        sync_once();
-        assert!(prepare_paint(), "same page on the glass -> no download needed");
+        assert!(
+            prepare_paint(),
+            "same page on the glass -> no download needed"
+        );
+        assert_eq!(
+            shim::host::calls_matching("http_get").len(),
+            1,
+            "schedule only: the panel-record match skips the bitmap fetch"
+        );
     }
 
+    #[test]
+    fn prepare_paint_stays_quiet_while_suspended() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
+        sync_once();
+        stop_display();
+        assert!(prepare_paint(), "suspended -> nothing to fetch");
+        assert_eq!(
+            shim::host::calls_matching("http_get").len(),
+            1,
+            "schedule only: suspended canvas issues no bitmap GET"
+        );
+    }
 
     #[test]
     fn a_changed_schedule_carries_over_the_kept_pages_bitmap() {

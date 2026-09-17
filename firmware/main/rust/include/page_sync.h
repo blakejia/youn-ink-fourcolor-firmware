@@ -39,7 +39,6 @@ bool page_sync_paint_if_changed(void);
  *  True = the page is resident (or nothing needs downloading). */
 bool page_sync_prepare_paint(void);
 
-
 /** Seconds until the server's next page change; -1 = unknown/empty schedule. */
 int32_t page_sync_next_wake_s(void);
 

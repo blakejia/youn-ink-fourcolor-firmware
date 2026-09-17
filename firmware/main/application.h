@@ -138,6 +138,12 @@ private:
     // fresh page_sync_sync_ok() — so a timer-side evaluation cannot observe
     // a half-finished cycle's state.
     bool sync_result_ok_ = false;
+    // Set when RunPowerCycle cut the radio before the paint (canvas-owned
+    // session only). The stay-awake branch of ServicePowerPolicy restarts the
+    // station and clears it — otherwise that session would live on with a
+    // stopped STA. Per-boot RAM by design: deep sleep reboots clear it, and
+    // the sleep path never returns.
+    bool radio_cut_for_paint_ = false;
 
     void RearmPowerTimer(uint32_t delay_ms);
     // esp_timer callback: run the one-shot cycle when one is due, else just

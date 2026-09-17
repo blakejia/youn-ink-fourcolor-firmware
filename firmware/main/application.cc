@@ -974,12 +974,16 @@ void Application::RunPowerCycle() {
     // the target page on demand (see page_sync.rs), so tearing the radio down
     // first would strand the update. Only cut the radio once it is resident —
     // on a failed fetch we keep it, so the existing retry semantics are intact.
-    // Quiet-boot guard is the conservative direction: duty-cycle wakes (this
-    // plan's power target) always take it; an interactive session reaching
-    // here simply keeps today's behavior (radio stays up, no regression).
+    // Guard is "the session still belongs to the canvas" (NOT IsQuietBoot:
+    // quiet_boot_ is set once in Initialize and promotion never clears it, so
+    // a quiet boot turned interactive would cut the radio with no path to
+    // restart STA — dead Wi-Fi, unsent notify acks). promoted_ is one-shot and
+    // page_sync_is_displaying() is the live canvas-ownership signal.
     const bool paint_ready = page_sync_prepare_paint();
-    if (paint_ready && IsQuietBoot()) {
+    const bool canvas_owns_session = !promoted_ && page_sync_is_displaying();
+    if (paint_ready && canvas_owns_session) {
         StopRadioForPaint();
+        radio_cut_for_paint_ = true;
     }
     page_sync_paint_if_changed();
     // The cold boot may have held the UI's first paint back for exactly this
@@ -1043,6 +1047,14 @@ void Application::ServicePowerPolicy() {
     }
 
     if (!d.sleep) {
+        // The pre-paint cutoff stopped STA for a canvas-owned session, but the
+        // policy keeps this session alive: bring the station back, or it would
+        // live on with no Wi-Fi (and notify acks could never go out). Deep
+        // sleep reboots clear the flag, so it is only ever consumed here.
+        if (radio_cut_for_paint_) {
+            radio_cut_for_paint_ = false;
+            WifiManager::GetInstance().StartStation();
+        }
         // Held awake on mains: this boot will never sleep again, so a quiet
         // boot must gain its UI and panel now — otherwise the device sits
         // awake with no screen and no way back except a power cycle (F20).
