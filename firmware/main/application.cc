@@ -354,6 +354,15 @@ void Application::Initialize(bool quiet) {
         switch (event) {
             case NetworkEvent::Connected:
                 ESP_LOGI(kTag, "WiFi connected: %s", data.c_str());
+                // Duty-cycled device: nothing interactive is served while this wake is in
+                // flight, so the radio may sleep between beacons. LATENCY: each request pays
+                // tens-to-hundreds of ms more; measured against the "no visible-latency
+                // regression" red line via the awake-ms counter (Task 1). Quiet-only
+                // (ruling): an interactive session must not pay modem-sleep latency,
+                // so a promoted boot never takes this path.
+                if (IsQuietBoot() && !promoted_.load(std::memory_order_acquire)) {
+                    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+                }
                 wifi_connected_.store(true, std::memory_order_release);
                 StartSntpClockSyncOnce();
                 StartServerPairingOnce();
