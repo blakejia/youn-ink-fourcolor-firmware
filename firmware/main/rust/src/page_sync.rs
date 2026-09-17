@@ -67,6 +67,13 @@ static SUSPENDED: AtomicBool = AtomicBool::new(false);
 static SERVER_REACHABLE: AtomicBool = AtomicBool::new(false);
 /// Whether the last [`sync_once`] succeeded (the power wiring reads it).
 static LAST_SYNC_OK: AtomicBool = AtomicBool::new(false);
+/// Task 4: what the last schedule body said about the notification queue.
+/// Lock-free (like SERVER_REACHABLE): `application.cc` reads it right after
+/// `page_sync_sync_once` returns, while `sync_schedule` may run under no or
+/// any lock — an atomic avoids a second lock order.
+/// Default true: an old server sends no field, and the first wake's sync may
+/// fail, both of which must behave exactly as today (fetch).
+static NOTIFY_PENDING: AtomicBool = AtomicBool::new(true);
 
 #[derive(Clone, Copy)]
 struct Page {
@@ -147,6 +154,7 @@ pub(crate) fn reset_for_test() {
     DISPLAYING.store(false, Ordering::Release);
     SUSPENDED.store(false, Ordering::Release);
     LAST_SYNC_OK.store(false, Ordering::Release);
+    NOTIFY_PENDING.store(true, Ordering::Release);
 }
 
 
@@ -242,6 +250,10 @@ pub struct ParsedSchedule {
     pub current_index: usize,
     /// Seconds until the server's next page change (None when absent/empty).
     pub seconds_until_next_page: Option<u32>,
+    /// Whether the server says a notification is waiting (Task 4: skip the
+    /// empty `/api/notifications/next` poll). Absent = old server = true,
+    /// i.e. behave exactly as today (fetch).
+    pub notify_pending: bool,
 }
 
 const EMPTY_PAGE: ParsedPage = ParsedPage { md5: [0; MD5_LEN], duration_s: 0 };
@@ -310,6 +322,11 @@ pub fn parse_schedule(body: &[u8]) -> Option<ParsedSchedule> {
     let seconds_until_next_page = json::member(body, 0, "seconds_until_next_page")
         .and_then(|at| json::int_value(body, at))
         .map(|v| v.max(0) as u32);
+    // Absent = old server = behave as today (fetch). A present field is
+    // honoured verbatim.
+    let notify_pending = json::member(body, 0, "notify_pending")
+        .and_then(|at| json::bool_value(body, at))
+        .unwrap_or(true);
     let mut out = ParsedSchedule {
         md5,
         pages: [EMPTY_PAGE; MAX_PAGES],
@@ -317,6 +334,7 @@ pub fn parse_schedule(body: &[u8]) -> Option<ParsedSchedule> {
         policy: parse_policy(body),
         current_index,
         seconds_until_next_page,
+        notify_pending,
     };
     json::for_each_item(body, pages_at, &mut |item| {
         if out.count >= MAX_PAGES {
@@ -382,6 +400,10 @@ fn sync_schedule(body: &[u8]) -> bool {
     let new_policy = parsed.policy;
     let new_index = parsed.current_index;
     let new_wake_s = parsed.seconds_until_next_page.unwrap_or(0);
+    // Commit the queue hint on every parsed body — including the unchanged-md5
+    // fast path below, which returns early: staleness here would pin an old
+    // answer across wakes.
+    NOTIFY_PENDING.store(parsed.notify_pending, Ordering::Release);
 
     let policy_changed = with_table(|t| {
         let prev = t.policy;
@@ -777,6 +799,13 @@ pub fn sync_ok() -> bool {
     LAST_SYNC_OK.load(Ordering::Acquire)
 }
 
+/// Task 4: what the last parsed schedule said about the notification queue
+/// (true = something is waiting, so fetch it). Defaults to true before the
+/// first successful sync and when the server sends no field (old server).
+pub fn notify_pending() -> bool {
+    NOTIFY_PENDING.load(Ordering::Acquire)
+}
+
 /// `policy.poll_interval_minutes * 60`.
 pub fn poll_s() -> u32 {
     with_table(|t| t.policy.poll_s)
@@ -865,6 +894,13 @@ pub extern "C" fn page_sync_next_wake_s() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn page_sync_sync_ok() -> bool {
     sync_ok()
+}
+
+/// Task 4: whether the last parsed schedule says a notification is waiting.
+/// True before the first successful sync and when the server sends no field.
+#[unsafe(no_mangle)]
+pub extern "C" fn page_sync_notify_pending() -> bool {
+    notify_pending()
 }
 
 /// `policy.poll_interval_minutes * 60`.
@@ -1114,6 +1150,48 @@ mod tests {
         schedule_json_with_md5(0x11, entries)
     }
 
+    /// Same as `schedule_json_with_md5` plus the Task 4 `notify_pending` flag.
+    /// `None` emits no field at all (old server), which must read as "fetch".
+    fn schedule_json_with_notify(sched_tag: u8, entries: &[(u8, u32)], pending: Option<bool>) -> Vec<u8> {
+        let pages: Vec<String> = entries
+            .iter()
+            .map(|(tag, min)| {
+                format!(r#"{{"md5":"{}","duration_minutes":{}}}"#, md5hex(*tag), min)
+            })
+            .collect();
+        let pending_field = match pending {
+            Some(true) => r#","notify_pending":true"#.to_string(),
+            Some(false) => r#","notify_pending":false"#.to_string(),
+            None => String::new(),
+        };
+        format!(
+            r#"{{"schedule_md5":"{}","pages":[{}]{}}}"#,
+            md5hex(sched_tag),
+            pages.join(","),
+            pending_field,
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn schedule_reports_whether_a_notification_is_waiting() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        assert!(parse_schedule(&schedule_json_with_notify(0x11, &[], Some(true)))
+            .unwrap().notify_pending);
+        assert!(!parse_schedule(&schedule_json_with_notify(0x11, &[], Some(false)))
+            .unwrap().notify_pending);
+        assert!(parse_schedule(&schedule_json_with_notify(0x11, &[], None))
+            .unwrap().notify_pending, "absent field = old server -> behave as today (fetch)");
+        // The application.cc gate reads the committed value, not the parse
+        // struct — pin both, including the unchanged-md5 fast path.
+        shim::host::script_ok("/api/pages/schedule", &schedule_json_with_notify(0x11, &[], Some(false)));
+        assert!(sync_once());
+        assert!(!notify_pending());
+        shim::host::script_ok("/api/pages/schedule", &schedule_json_with_notify(0x11, &[], Some(true)));
+        assert!(sync_once());
+        assert!(notify_pending());
+    }
     /// A bitmap body whose every byte is `fill`, so the framebuffer shows which
     /// page was blitted.
     fn bitmap_body(fill: u8) -> Vec<u8> {

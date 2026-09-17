@@ -45,6 +45,9 @@ int32_t page_sync_next_wake_s(void);
 /** Whether the last `page_sync_sync_once` succeeded. */
 bool page_sync_sync_ok(void);
 
+/** Task 4: whether the last parsed schedule says a notification is waiting. */
+bool page_sync_notify_pending(void);
+
 /** `policy.poll_interval_minutes * 60`. */
 uint32_t page_sync_poll_s(void);
 

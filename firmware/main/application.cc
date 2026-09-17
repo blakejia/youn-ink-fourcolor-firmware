@@ -1015,7 +1015,12 @@ void Application::RunPowerCycle() {
     // could observe a half-finished cycle.
     sync_attempted_ = true;
     sync_result_ok_ = page_sync_sync_once();
-    notify_request_next();
+    // Task 4: only when the server says something is waiting — an empty poll
+    // is a whole radio round-trip for nothing. Absent-safe: an old server
+    // sends no field, which reads as pending (behave as today: fetch).
+    if (page_sync_notify_pending()) {
+        notify_request_next();
+    }
     // Unconditional, even on an empty schedule: that call draws and records
     // the empty hint, which is what makes the canvas's display-ownership
     // claim honest.

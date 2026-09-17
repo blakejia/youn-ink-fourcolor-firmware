@@ -123,6 +123,16 @@ class NotifyStore:
                 return n
         return None
 
+    def has_pending(self, device_id: str) -> bool:
+        """True when `next_for` would return something — without marking it shown."""
+        now = time.time()
+        with self._lock:
+            self._sweep(now)
+            return any(
+                n.device_id == device_id and n.status == "pending" and not n.is_expired(now)
+                for n in self._items.values()
+            )
+
     def ack(self, notification_id: str, decision: str) -> Optional[Notification]:
         with self._lock:
             self._sweep(time.time())

@@ -552,6 +552,7 @@ def create_app() -> FastAPI:
             },
             "pages": [e.to_dict() for e in entries],
             "screen_active": pages_mod.screen_active_now(),
+            "notify_pending": ns.get_store().has_pending(dev.device_id),
             "power": power,
         }
 
