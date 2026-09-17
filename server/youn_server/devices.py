@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS devices (
     last_seen     INTEGER NOT NULL,
     ws_session_id TEXT,
     ip_address    TEXT,
-    trust         INTEGER NOT NULL DEFAULT 0
+    trust         INTEGER NOT NULL DEFAULT 0,
+    power_counters TEXT
 );
 CREATE TABLE IF NOT EXISTS device_secrets (
     device_id TEXT PRIMARY KEY,
@@ -115,7 +116,14 @@ class DeviceRegistry:
         except sqlite3.OperationalError as exc:
             if "duplicate column name" not in str(exc):
                 raise
-        # Ensure unique index on token (idempotent).
+        # Task 1 duration ledger: per-device power-counter snapshot (JSON text).
+        # ALTER is idempotent via the duplicate-column guard, like the token
+        # migration above — existing databases gain the column on next boot.
+        try:
+            self._conn.execute("ALTER TABLE devices ADD COLUMN power_counters TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_device_secrets_token ON device_secrets(token)"
         )
@@ -237,6 +245,27 @@ class DeviceRegistry:
                 """,
                 (device_id, int(time.time()), token),
             )
+
+    def set_power_counters(self, device_id: str, json_text: str) -> None:
+        """Store the device's latest power-counter snapshot (JSON text)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET power_counters = ? WHERE device_id = ?",
+                (json_text, device_id),
+            )
+
+    def get_power_counters(self, device_id: str) -> Optional[str]:
+        """Return the stored power-counter snapshot, or None when unset."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT power_counters FROM devices WHERE device_id = ?", (device_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return row["power_counters"]
+        except (IndexError, KeyError):
+            return None
 
 
     def list_all(self, only_trusted: bool = False) -> list[Device]:

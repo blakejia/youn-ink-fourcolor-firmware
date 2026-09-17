@@ -368,6 +368,21 @@ extern "C" void rf_rails_audio(int on) {
     Board::GetInstance().SetAudioRail(on != 0);
 }
 
+// Power-accounting counters for the Task 1 duration ledger: wakes, awake ms,
+// radio-on ms, schedule GETs and refresh ms. Plain RAM — a wake is a reboot,
+// so only the host test reads them back within one boot; the device ships
+// each wake's snapshot as schedule-GET query params before sleeping.
+static uint32_t g_wakes, g_awake_ms, g_radio_ms, g_http_gets, g_refresh_ms;
+extern "C" void rf_power_counters(uint32_t* w, uint32_t* a, uint32_t* r, uint32_t* g, uint32_t* f) {
+    if (w) *w = g_wakes; if (a) *a = g_awake_ms; if (r) *r = g_radio_ms;
+    if (g) *g = g_http_gets; if (f) *f = g_refresh_ms;
+}
+extern "C" void rf_power_count_wake(void)   { g_wakes++; }
+extern "C" void rf_power_add_awake_ms(uint32_t ms) { g_awake_ms += ms; }
+extern "C" void rf_power_add_radio_ms(uint32_t ms) { g_radio_ms += ms; }
+extern "C" void rf_power_count_http_get(void) { g_http_gets++; }
+extern "C" void rf_power_add_refresh_ms(uint32_t ms) { g_refresh_ms += ms; }
+
 // ───────────────────── device signature (public ABI) ─────────────────────
 
 /* Implemented in Rust. Writes mac_hex / timestamp / nonce_b64 / sig_b64, each

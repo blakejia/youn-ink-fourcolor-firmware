@@ -89,6 +89,10 @@ unsafe extern "C" {
     pub fn rf_wakeup_cause() -> c_int;
     /// Audio + amp rail. Nonzero = on.
     pub fn rf_rails_audio(on: c_int);
+    /// Power-accounting snapshot (shim.cpp owns the counters, Rust only reads).
+    /// Null pointers are ignored, so callers may read a subset.
+    pub fn rf_power_counters(wakes: *mut u32, awake_ms: *mut u32, radio_ms: *mut u32,
+                             http_gets: *mut u32, refresh_ms: *mut u32);
 }
 
 /// `abort()`, used by the panic handler.
@@ -242,6 +246,7 @@ pub(crate) mod host {
         ALLOCS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *FAIL_STREAK.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        *POWER.lock().unwrap_or_else(|e| e.into_inner()) = [0; 5];
         AUDIO_ON.store(true, std::sync::atomic::Ordering::SeqCst);
         guard
     }
@@ -318,6 +323,44 @@ pub(crate) mod host {
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_rails_audio(on: c_int) {
         AUDIO_ON.store(on != 0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Scripted power-accounting snapshot (mirrors the shim.cpp counters).
+    /// Staged by `set_counters`, read out by the `rf_power_counters` stub —
+    /// the same "Rust only reads, C owns" shape as the device side.
+    static POWER: Mutex<[u32; 5]> = Mutex::new([0; 5]);
+
+    pub fn set_counters(wakes: u32, awake_ms: u32, radio_ms: u32, http_gets: u32, refresh_ms: u32) {
+        *POWER.lock().unwrap_or_else(|e| e.into_inner()) =
+            [wakes, awake_ms, radio_ms, http_gets, refresh_ms];
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_power_counters(
+        wakes: *mut u32,
+        awake_ms: *mut u32,
+        radio_ms: *mut u32,
+        http_gets: *mut u32,
+        refresh_ms: *mut u32,
+    ) {
+        let c = *POWER.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            if !wakes.is_null() {
+                *wakes = c[0];
+            }
+            if !awake_ms.is_null() {
+                *awake_ms = c[1];
+            }
+            if !radio_ms.is_null() {
+                *radio_ms = c[2];
+            }
+            if !http_gets.is_null() {
+                *http_gets = c[3];
+            }
+            if !refresh_ms.is_null() {
+                *refresh_ms = c[4];
+            }
+        }
     }
 
     /// Any request whose URL contains `suffix` gets `status` + `body`.

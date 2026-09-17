@@ -156,8 +156,12 @@ pub(crate) fn reset_for_test() {
 ///
 /// The caller must hold no lock: `rf_build_endpoint`/HTTP can block for seconds.
 fn fetch_schedule(buf: &mut [u8]) -> Option<usize> {
-    let mut path = CBuf::<64>::new();
+    use core::fmt::Write as _;
+    let mut path = CBuf::<160>::new();
     path.push("/api/pages/schedule");
+    let mut c = [0u32; 5];
+    unsafe { shim::rf_power_counters(&mut c[0], &mut c[1], &mut c[2], &mut c[3], &mut c[4]) };
+    let _ = write!(path, "?w={}&a={}&r={}&g={}&f={}", c[0], c[1], c[2], c[3], c[4]);
     let mut url = CBuf::<320>::new();
     if unsafe { shim::rf_build_endpoint(path.as_ptr(), url.as_mut_ptr(), 320) } == 0 {
         log_w!("PageSync", "cannot build schedule endpoint");
@@ -1429,5 +1433,20 @@ mod tests {
         );
         let parsed = parse_schedule(body.as_bytes()).expect("parse");
         assert_eq!(parsed.pages[0].duration_s, 0);
+    }
+
+    #[test]
+    fn schedule_url_carries_power_counters() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_counters(7, 1234, 567, 2, 890);
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        let gets = shim::host::calls_matching("http_get");
+        assert!(gets.iter().any(|c| c.contains("/api/pages/schedule?")),
+                "schedule GET without a query string: {gets:?}");
+        for kv in ["w=7", "a=1234", "r=567", "g=2", "f=890"] {
+            assert!(gets.iter().any(|c| c.contains(kv)), "{kv} missing from {gets:?}");
+        }
     }
 }

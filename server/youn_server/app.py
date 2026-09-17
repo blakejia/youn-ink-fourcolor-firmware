@@ -508,6 +508,27 @@ def create_app() -> FastAPI:
         dev = _require_device_token(request)
         if not pages_mod.is_safe_component(dev.device_id):
             raise HTTPException(status_code=401, detail="unauthorized")
+        # Task 1 duration ledger: the device rides its power counters on the
+        # schedule GET query string (?w=&a=&r=&g=&f=). Missing keys read as 0
+        # so old firmware (bare path, no query) keeps working unchanged.
+        qp = request.query_params
+        def _u32(name: str) -> int:
+            try:
+                v = int(qp.get(name, 0))
+            except (TypeError, ValueError):
+                return 0
+            return v if v >= 0 else 0
+        power = {
+            "wakes": _u32("w"),
+            "awake_ms": _u32("a"),
+            "radio_ms": _u32("r"),
+            "http_gets": _u32("g"),
+            "refresh_ms": _u32("f"),
+        }
+        try:
+            registry.set_power_counters(dev.device_id, json.dumps(power))
+        except Exception:
+            log.warning("set_power_counters failed device=%s", dev.device_id)
         entries = pages_mod.build_schedule_from_disk(dev.device_id)
         sched_md = pages_mod.compute_schedule_md(entries)
         current_index, seconds_until_next_page = pages_mod.schedule_position(entries, time.time())
@@ -528,6 +549,7 @@ def create_app() -> FastAPI:
             },
             "pages": [e.to_dict() for e in entries],
             "screen_active": pages_mod.screen_active_now(),
+            "power": power,
         }
 
     @app.get("/api/pages/bitmap/{md5}.bin")

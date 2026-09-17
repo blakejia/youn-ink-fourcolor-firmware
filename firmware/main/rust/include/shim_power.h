@@ -47,6 +47,14 @@ int  rf_wakeup_cause(void);
 uint32_t rf_fail_streak_get(void);
 void rf_fail_streak_set(uint32_t streak);
 void rf_rails_audio(int on);   /* 音频 + 功放 */
+/* Task 1 duration ledger (shim.cpp owns the counters, Rust reads them via
+ * rf_power_counters through its own FFI decl; only the count_* writers are
+ * called from C++). */
+void rf_power_count_wake(void);
+void rf_power_add_awake_ms(uint32_t ms);
+void rf_power_add_radio_ms(uint32_t ms);
+void rf_power_count_http_get(void);
+void rf_power_add_refresh_ms(uint32_t ms);
 
 #ifdef __cplusplus
 }
