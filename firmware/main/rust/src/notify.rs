@@ -378,6 +378,22 @@ pub fn is_active() -> bool {
     state() == NOTIFYING
 }
 
+/// True while a `/next` pull is outstanding and the radio must stay up.
+///
+/// `is_active` (NOTIFYING) is false during the GET itself, so it cannot be
+/// the "do not cut the radio" signal on its own: the server marks the
+/// notification `shown` the moment it hands it out
+/// (`notify_store.py::next_for`), so a response stranded by a mid-flight
+/// radio cut is lost forever. FETCHING is set synchronously in
+/// `request_next` before the fetch task spawns — the caller (RunPowerCycle)
+/// cannot miss its own cycle's fetch — and every terminal path of
+/// `fetch_once` leaves FETCHING (success → NOTIFYING, anything else → IDLE),
+/// so this cannot stick. Prefer skipping one radio cut over losing one
+/// notification.
+pub fn is_fetching() -> bool {
+    state() == FETCHING
+}
+
 /// Non-blocking: the HTTP GET runs in a task so the button callback returns.
 pub fn request_next() {
     if state() != IDLE {
@@ -488,7 +504,12 @@ pub extern "C" fn notify_is_active() -> bool {
     is_active()
 }
 
-/// # Safety
+/// True while a `/next` pull is outstanding: the radio must stay up.
+#[unsafe(no_mangle)]
+pub extern "C" fn notify_is_fetching() -> bool {
+    is_fetching()
+}
+
 /// `decision` must be NUL-terminated.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn notify_post_ack(decision: *const core::ffi::c_char) {
@@ -563,6 +584,45 @@ mod tests {
 
         assert_eq!(state(), FETCHING, "the button callback returns while the fetch runs");
         assert_eq!(shim::host::tasks(), vec!["notify_fetch".to_string()]);
+    }
+
+    #[test]
+    fn fetching_is_visible_until_the_pull_settles() {
+        // The pre-paint radio guard (application.cc) keys on this: FETCHING
+        // must cover the whole in-flight window and nothing else — the poll
+        // between request and settle is exactly when the radio must stay up.
+        let _g = shim::host::lock();
+        reset_for_test();
+        assert!(!is_fetching(), "cold: nothing outstanding");
+
+        request_next();
+        assert!(is_fetching(), "request arms FETCHING synchronously");
+        assert!(!is_active(), "NOTIFYING must not answer for an unfinished pull");
+
+        page_sync::reset_for_test();
+        shim::host::set_fb();
+        shim::host::script_ok("/api/notifications/next", &next_body(0x5a, "settle1"));
+        fetch_once();
+        assert!(!is_fetching(), "a settled pull clears the guard");
+        assert!(is_active(), "a good pull lands on the panel");
+    }
+
+    #[test]
+    fn a_failed_pull_clears_the_guard_so_the_cycle_cannot_stick() {
+        // A stuck FETCHING would suppress every future radio cut (or, worse,
+        // stretch every wake by the full settle budget). Every abort path of
+        // fetch_once must return to IDLE.
+        let _g = shim::host::lock();
+        page_sync::reset_for_test();
+        reset_for_test();
+        shim::host::set_fb();
+        shim::host::script_get("/api/notifications/next", 204, b"");
+
+        request_next();
+        assert!(is_fetching());
+        fetch_once();
+        assert!(!is_fetching(), "an empty queue still settles the guard");
+        assert_eq!(state(), IDLE);
     }
 
     #[test]

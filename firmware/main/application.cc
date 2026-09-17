@@ -1037,7 +1037,25 @@ void Application::RunPowerCycle() {
     const bool paint_ready = page_sync_prepare_paint();
     const bool canvas_owns_quiet_cycle =
         IsQuietBoot() && !promoted_ && page_sync_is_displaying();
-    if (paint_ready && canvas_owns_quiet_cycle) {
+    // Do not cut the radio while a /next pull is still outstanding: the server
+    // marks the notification shown the moment it answers
+    // (notify_store.py::next_for), so a response stranded by a mid-flight cut
+    // is never re-offered and the notification is lost for good. Prefer
+    // skipping one radio cut (one paint cycle's saving) over losing one
+    // notification. Bounded: the fetch task always resolves on its own
+    // (HTTP_TIMEOUT_MS abort or an early return), and RunPowerCycle holds no
+    // lock here, so a short poll cannot wedge the cycle or invert the
+    // state -> display order. Only the pre-paint cut is guarded — the two
+    // deep-sleep/teardown cuts never return and are untouched.
+    constexpr int kNotifySettlePollMs = 50;
+    constexpr int kNotifySettleBudgetMs = 3000;
+    for (int waited_ms = 0;
+         notify_is_fetching() && waited_ms < kNotifySettleBudgetMs;
+         waited_ms += kNotifySettlePollMs) {
+        vTaskDelay(pdMS_TO_TICKS(kNotifySettlePollMs));
+    }
+    const bool notify_fetch_settled = !notify_is_fetching();
+    if (paint_ready && canvas_owns_quiet_cycle && notify_fetch_settled) {
         StopRadioForPaint();
         radio_cut_for_paint_ = true;
     }

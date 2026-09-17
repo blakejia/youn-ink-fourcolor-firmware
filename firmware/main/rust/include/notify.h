@@ -38,6 +38,14 @@ void notify_request_next(void);
 bool notify_is_active(void);
 
 /**
+ * @brief 是否有 /next 拉取在飞行中（FETCHING 状态）
+ *
+ * 断射频前的守卫信号：服务端交出通知即置 shown，飞行中拆射频会让响应
+ * stranded、通知永久丢失。见实现注释。
+ */
+bool notify_is_fetching(void);
+
+/**
  * @brief 提交 ack 并关闭展示（上/下键触发）
  *
  * @param decision  "agree" 或 "reject"
