@@ -648,6 +648,15 @@ void Application::ServicePromotion() {
     rf_panel_commit_hook_register();
     UpdateStatusBarForUi();
     promoted_.store(true, std::memory_order_release);
+    // Undo Task 3's quiet-cycle MAX_MODEM: this wake is interactive from here,
+    // and every request would otherwise pay modem-sleep latency. PERFORMANCE
+    // (WIFI_PS_NONE) restores a full-performance radio, matching the config-AP
+    // path's precedent (wifi_configuration_ap.cc forces PS NONE while the
+    // device drives interaction). Only quiet boots reach here (early return
+    // above), and any of those with an active station took LOW_POWER in the
+    // Connected branch, so this is exactly-undo. Dropped silently when the
+    // station is down (config AP up, Task-2 paint cut, or never connected).
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
     promote_requested_.store(false, std::memory_order_release);
     ESP_LOGI(kTag, "Boot path: promoted to interactive");
     // A promotion via the config path (F21) arrives with the AP already up
