@@ -668,11 +668,18 @@ void Application::ServicePromotion() {
     rf_panel_commit_hook_register();
     UpdateStatusBarForUi();
     promoted_.store(true, std::memory_order_release);
-    // No SetPowerSaveLevel here by design (single ownership): the Connected
-    // branch re-issues the level on every connect, reading the then-current
-    // promoted_. A downcall from this task would be silently dropped inside
-    // the Task-2 paint cut (station down 15-25 s), and the post-cut
-    // StartStation re-fires Connected, which repairs the level.
+    // Two paths, each owns one timing (do not delete either): Connected
+    // re-issues the level on every (re)connect, but a promotion landing
+    // while the station is already up and never reconnects has no later
+    // Connected to repair it — so repair here. IsConnected()
+    // (wifi_manager.h:76; impl wifi_manager.cc:198-200 requires
+    // station_active_) guards the WifiManager silent-drop on an inactive
+    // station (wifi_manager.cc:372-374): inside the Task-2 paint cut this
+    // is skipped and the post-cut StartStation re-fires Connected, which
+    // repairs the level with the then-current promoted_.
+    if (WifiManager::GetInstance().IsConnected()) {
+        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    }
     promote_requested_.store(false, std::memory_order_release);
     ESP_LOGI(kTag, "Boot path: promoted to interactive");
     // A promotion via the config path (F21) arrives with the AP already up
