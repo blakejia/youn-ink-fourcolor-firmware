@@ -945,11 +945,15 @@ void Application::RunPowerCycle() {
     // path never returns, but RAM dies with it, so no stale set survives).
     cycle_in_progress_.store(true, std::memory_order_release);
     last_cycle_ms_ = esp_timer_get_time() / 1000;
-    // Task 1 duration ledger: one count per wake, plus the awake span of
-    // this cycle. Radio-on time is booked at the sleep teardown below, where
-    // the radio actually goes off — same esp_timer ms clock throughout.
+    // Task 1 duration ledger: one count per wake here; the awake and radio
+    // spans both close at the sleep teardown below (same end instant — see
+    // F5), so awake can never read below radio for one cycle. Counters are
+    // RTC memory: this cycle's bookings land after this cycle's fetch, so
+    // each wake's GET carries the cumulative total through the previous
+    // completed cycle. Base instant kept in cycle_awake_base_ms_ (member:
+    // the policy runs in a different function).
     rf_power_count_wake();
-    const int64_t aw0 = esp_timer_get_time() / 1000;
+    cycle_awake_base_ms_ = esp_timer_get_time() / 1000;
     // The backoff streak lives in RTC memory (rf_fail_streak_*) because RAM
     // is cleared on every wake. Mark the attempt and snapshot its outcome
     // here so the policy consumes this cycle's result — never a re-read that
@@ -965,7 +969,6 @@ void Application::RunPowerCycle() {
     // frame; from here the UI paints normally (button activity would have
     // cleared the flag before this point).
     ui_boot_paint_deferred_.store(false, std::memory_order_release);
-    rf_power_add_awake_ms((uint32_t)(esp_timer_get_time() / 1000 - aw0));
     ServicePowerPolicy();
     cycle_in_progress_.store(false, std::memory_order_release);
 }
@@ -1045,13 +1048,18 @@ void Application::ServicePowerPolicy() {
              (int)in.mains, (int)in.sync_ok, gpio_get_level(CHARGE_DETECT_GPIO));
     TransitionLifecycle(kLifecycleSleep, "power policy");
     wifi_connected_.store(false, std::memory_order_release);
-    // UPPER BOUND, not exact radio-on time: cycle start (last_cycle_ms_) ->
-    // radio off, including WiFi connect + all requests. Cycle start is the
-    // only boot timestamp we own, so this over-counts by the pre-radio boot
-    // span; never quote it as "the radio was on for X". Same esp_timer ms
-    // clock as the awake booking in RunPowerCycle. Recorded before the radio
-    // goes off.
-    rf_power_add_radio_ms((uint32_t)(esp_timer_get_time() / 1000 - last_cycle_ms_));
+    // F5: both duration spans close HERE, at one shared end instant just
+    // before the radio goes off (booking must precede esp_deep_sleep_start,
+    // which never returns). awake = aw0 -> radio off, radio(upper bound) =
+    // cycle start -> radio off: same end, awake >= radio by construction,
+    // same esp_timer ms clock. awake is NOT closed in RunPowerCycle above —
+    // closing it before the policy ran left part of the cycle uncounted and
+    // could read below radio for the same cycle.
+    const int64_t teardown_ms = esp_timer_get_time() / 1000;
+    rf_power_add_awake_ms((uint32_t)(teardown_ms - cycle_awake_base_ms_));
+    // UPPER BOUND, not exact radio-on time (see header comment at aw0):
+    // includes WiFi connect + all requests; never quote as "radio was on X".
+    rf_power_add_radio_ms((uint32_t)(teardown_ms - last_cycle_ms_));
     // Amp off before audio power off (silent), then radio off.
     rf_rails_audio(0);
     esp_wifi_disconnect();

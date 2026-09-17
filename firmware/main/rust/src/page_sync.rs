@@ -531,13 +531,11 @@ fn blit_and_refresh(idx: usize, slot: *mut u8) -> bool {
     if !copied {
         return false;
     }
-    // Task 1 duration ledger: book only the request submission. The panel
-    // keeps refreshing asynchronously for seconds after this returns; that
-    // tail is panel-busy time the sleep gate already accounts for, not CPU
-    // time this wake spends — counting it as refresh_ms would double-book.
-    let t0 = unsafe { shim::rf_now_ms() };
+    // Refresh-submit accounting lives at the single C++ exit
+    // (rf_request_full_refresh in shim.cpp): canvas, empty-hint and notify
+    // paths all funnel through it. SUBMIT time only — the panel's async
+    // waveform tail is deliberately not included (see panel_ms note below).
     unsafe { shim::rf_request_full_refresh() };
-    unsafe { shim::rf_power_add_refresh_ms((shim::rf_now_ms().saturating_sub(t0)) as u32) };
     DISPLAYING.store(true, Ordering::Release);
     true
 }
@@ -1471,20 +1469,65 @@ mod tests {
     }
 
     #[test]
-    fn a_paint_books_refresh_time() {
+    fn every_refresh_path_books_submit_time_at_the_single_exit() {
+        // F2: canvas paint and the empty hint must both move f — accounting
+        // lives in rf_request_full_refresh, not per caller. (Notify's popup
+        // funnels through the same exit; its path is covered by notify tests
+        // owning refreshes(), here we pin the counter wiring.)
         let _g = shim::host::lock();
         reset_for_test();
         shim::host::set_fb();
         shim::host::set_counters(0, 0, 0, 0, 0);
+        assert_eq!(shim::host::refresh_submit_ms(), 0);
+        // 1) canvas paint path.
         scripted_schedule_with_position(0, 240, &[(0xa1, 10)]);
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
         assert!(sync_once());
         assert!(paint_if_changed(), "first paint spends one refresh request");
+        assert_eq!(shim::host::refresh_submit_ms(), 1, "canvas paint books one submit");
+        // 2) empty-hint path (direct, no schedule needed).
+        show_empty_hint();
+        assert_eq!(shim::host::refresh_submit_ms(), 2, "empty hint books one submit");
+    }
+
+    #[test]
+    fn the_snapshot_on_the_wire_is_the_staged_snapshot() {
+        // F6: pin the sampling instant — the schedule GET must carry exactly
+        // the counters staged before sync_once, not a re-read taken later.
+        // Host RTC caveat (see report): the POWER stub is process RAM, not
+        // RTC_DATA_ATTR, so this proves the wiring (sample-then-send), not
+        // the deep-sleep persistence itself — persistence is by inspection
+        // (RTC_DATA_ATTR next to g_fail_streak in shim.cpp).
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_counters(7, 1234, 567, 2, 890);
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        let gets = shim::host::calls_matching("http_get");
+        let sched = gets.iter().find(|c| c.contains("/api/pages/schedule?"))
+            .expect("schedule GET with a query string");
+        // Parse the ?w=&a=&r=&g=&f= back out of the URL and compare against
+        // a fresh counter read: the wire snapshot must equal staged state.
+        let query = sched.split('?').nth(1).unwrap_or("");
+        let mut wire = [0u32; 5];
+        for kv in query.split('&') {
+            let (k, v) = kv.split_once('=').unwrap_or(("", ""));
+            let n: u32 = v.parse().unwrap_or(999_999);
+            match k {
+                "w" => wire[0] = n,
+                "a" => wire[1] = n,
+                "r" => wire[2] = n,
+                "g" => wire[3] = n,
+                "f" => wire[4] = n,
+                _ => {}
+            }
+        }
+        // g on the wire is the pre-GET value (sampled before this cycle's
+        // own GET increments the counter); the post-sync read is one higher.
         let mut c = [0u32; 5];
         unsafe { shim::rf_power_counters(&mut c[0], &mut c[1], &mut c[2], &mut c[3], &mut c[4]) };
-        // The stub advances the scripted clock by 250 on each refresh request,
-        // so the booking is exactly the submission span the caller measured.
-        // (The stub owns the clock; wall time never leaks into the assertion.)
-        assert_eq!(c[4], 250, "a paint must book refresh_ms: {c:?}");
+        assert_eq!(&wire[..3], &c[..3], "w/a/r on the wire equal staged counters");
+        assert_eq!(wire[3] + 1, c[3], "g on the wire is staged g (this GET counted after sampling)");
+        assert_eq!(wire[4], c[4], "f on the wire equals staged f (no paint this cycle)");
     }
 }

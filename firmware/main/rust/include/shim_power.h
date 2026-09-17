@@ -49,14 +49,15 @@ void rf_fail_streak_set(uint32_t streak);
 void rf_rails_audio(int on);   /* 音频 + 功放 */
 /* Task 1 duration ledger (shim.cpp owns the counters, Rust reads them via
  * rf_power_counters through its own FFI decl; only the count_* writers are
- * called from C++). */
+ * called from C++). Counters are RTC_DATA_ATTR (survive deep sleep, zeroed
+ * on cold boot / power loss); each wake's schedule GET carries the total
+ * through the previous completed cycle. radio_ms is an UPPER BOUND
+ * (cycle start -> radio off), refresh f is SUBMIT time, not panel waveform. */
 void rf_power_count_wake(void);
 void rf_power_add_awake_ms(uint32_t ms);
 void rf_power_add_radio_ms(uint32_t ms);
-void rf_power_count_http_get(void);
-void rf_power_add_refresh_ms(uint32_t ms);
-/* Monotonic ms clock for Rust duration bookkeeping (esp_timer ms). */
-uint64_t rf_now_ms(void);
+// NOTE: no rf_power_add_refresh_ms — f is booked inside rf_request_full_refresh
+// (single exit). A second writer would let a caller double-book one submit.
 
 #ifdef __cplusplus
 }

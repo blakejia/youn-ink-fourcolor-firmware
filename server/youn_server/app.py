@@ -511,6 +511,9 @@ def create_app() -> FastAPI:
         # Task 1 duration ledger: the device rides its power counters on the
         # schedule GET query string (?w=&a=&r=&g=&f=). Missing keys read as 0
         # so old firmware (bare path, no query) keeps working unchanged.
+        # Semantics (see report F3): r is a radio-on UPPER BOUND, f is
+        # refresh-SUBMIT time — never the panel waveform. panel_ms (true
+        # waveform occupancy) is a deferred item, not measured here.
         qp = request.query_params
         def _u32(name: str) -> int:
             try:
@@ -523,7 +526,7 @@ def create_app() -> FastAPI:
             "awake_ms": _u32("a"),
             "radio_ms": _u32("r"),
             "http_gets": _u32("g"),
-            "refresh_ms": _u32("f"),
+            "refresh_submit_ms": _u32("f"),
         }
         try:
             registry.set_power_counters(dev.device_id, json.dumps(power))

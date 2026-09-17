@@ -102,6 +102,10 @@ private:
     // server's poll interval has elapsed since, and a bare policy check
     // otherwise. Written and read in the esp_timer task only.
     int64_t last_cycle_ms_ = -1;
+    // F5: the cycle-start twin of last_cycle_ms_ — the instant both duration
+    // spans (awake, radio upper bound) close against at the sleep teardown.
+    // Same writer instant, same task; read only there.
+    int64_t cycle_awake_base_ms_ = -1;
     // True while RunPowerCycle (including its terminal policy call) runs in
     // the esp_timer task. The WiFi connected path consults it before arming
     // the timer: an arm from that task mid-cycle would fire mid-cycle, which

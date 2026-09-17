@@ -91,12 +91,10 @@ unsafe extern "C" {
     pub fn rf_rails_audio(on: c_int);
     /// Power-accounting snapshot (shim.cpp owns the counters, Rust only reads).
     /// Null pointers are ignored, so callers may read a subset.
+    /// `refresh_ms` is SUBMIT time booked at the single C++ exit
+    /// (rf_request_full_refresh), never the panel waveform — see F3 note.
     pub fn rf_power_counters(wakes: *mut u32, awake_ms: *mut u32, radio_ms: *mut u32,
                              http_gets: *mut u32, refresh_ms: *mut u32);
-    /// Book `ms` of panel-refresh time (same writer style as awake/radio).
-    pub fn rf_power_add_refresh_ms(ms: u32);
-    /// Monotonic ms clock for duration bookkeeping (esp_timer on device).
-    pub fn rf_now_ms() -> u64;
 }
 
 /// `abort()`, used by the panic handler.
@@ -251,7 +249,6 @@ pub(crate) mod host {
         *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *FAIL_STREAK.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         *POWER.lock().unwrap_or_else(|e| e.into_inner()) = [0; 5];
-        *NOW_MS.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         AUDIO_ON.store(true, std::sync::atomic::Ordering::SeqCst);
         guard
     }
@@ -368,23 +365,11 @@ pub(crate) mod host {
         }
     }
 
-    #[unsafe(no_mangle)]
-    pub extern "C" fn rf_power_add_refresh_ms(ms: u32) {
-        POWER.lock().unwrap_or_else(|e| e.into_inner())[4] += ms;
-    }
-
-    /// Scripted monotonic clock (tests only): `set_now_ms` stages it, and the
-    /// refresh path reads it through the same `rf_now_ms` the device serves
-    /// from `esp_timer_get_time() / 1000`.
-    static NOW_MS: Mutex<u64> = Mutex::new(0);
-
-    pub fn set_now_ms(ms: u64) {
-        *NOW_MS.lock().unwrap_or_else(|e| e.into_inner()) = ms;
-    }
-
-    #[unsafe(no_mangle)]
-    pub extern "C" fn rf_now_ms() -> u64 {
-        *NOW_MS.lock().unwrap_or_else(|e| e.into_inner())
+    /// The `refresh_ms` slot advances only through `rf_request_full_refresh`
+    /// (mirroring the C++ single exit): tests stage the other four slots with
+    /// `set_counters` and let real paints move `refresh_ms`.
+    pub fn refresh_submit_ms() -> u32 {
+        POWER.lock().unwrap_or_else(|e| e.into_inner())[4]
     }
 
     /// Any request whose URL contains `suffix` gets `status` + `body`.
@@ -727,10 +712,10 @@ pub(crate) mod host {
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_request_full_refresh() {
         counters(|c| c.refreshes += 1);
-        // The device's refresh request returns after submission; the test
-        // clock only advances when it crosses this call, so the delta the
-        // caller books is the submission span, never wall time.
-        *NOW_MS.lock().unwrap_or_else(|e| e.into_inner()) += 250;
+        // Single exit like the device: canvas, empty-hint and notify funnels
+        // all land here. SUBMIT accounting only (a fixed 1 ms stand-in for
+        // the device's queueing span) — never the panel waveform.
+        POWER.lock().unwrap_or_else(|e| e.into_inner())[4] += 1;
         note("full_refresh");
     }
 

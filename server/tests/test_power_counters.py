@@ -46,7 +46,7 @@ def test_schedule_echoes_power_counters(client):
         "awake_ms": 1234,
         "radio_ms": 567,
         "http_gets": 2,
-        "refresh_ms": 890,
+        "refresh_submit_ms": 890,
     }
 
 
@@ -60,7 +60,7 @@ def test_schedule_without_counters_reads_as_zero(client):
         "awake_ms": 0,
         "radio_ms": 0,
         "http_gets": 0,
-        "refresh_ms": 0,
+        "refresh_submit_ms": 0,
     }
 
 
@@ -77,5 +77,5 @@ def test_power_snapshot_is_persisted(client):
         "awake_ms": 100,
         "radio_ms": 50,
         "http_gets": 1,
-        "refresh_ms": 20,
+        "refresh_submit_ms": 20,
     }

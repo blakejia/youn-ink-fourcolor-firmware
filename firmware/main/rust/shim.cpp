@@ -174,10 +174,14 @@ extern "C" void rf_timer_delete(void) {
     g_timer_cb = nullptr;
 }
 
-// Task 1 duration ledger counters. Defined here (above first use: rf_http_get
-// counts every GET at the single exit) so the device build sees them in order;
-// the reader/writer functions live next to the other power shims below.
-static uint32_t g_wakes, g_awake_ms, g_radio_ms, g_http_gets, g_refresh_ms;
+// Task 1 duration ledger: wakes, awake ms, radio-on upper bound, schedule
+// GETs, refresh submits. RTC_DATA_ATTR like g_fail_streak below — every
+// duty-cycle sleep is a reboot that clears RAM, so DRAM counters would report
+// zeros on battery. Each wake's schedule GET therefore carries the cumulative
+// total through the previous completed cycle (this cycle books after its
+// fetch). Zeroed on cold boot / power loss: RTC memory does not survive that,
+// which is the correct fresh start.
+RTC_DATA_ATTR static uint32_t g_wakes, g_awake_ms, g_radio_ms, g_http_gets, g_refresh_submit_ms;
 
 // ─────────────────────────────── http ───────────────────────────────
 
@@ -283,10 +287,17 @@ extern "C" void rf_fb_end(void) {
 }
 
 extern "C" void rf_request_full_refresh(void) {
+    // Task 1 duration ledger, single exit: canvas paints, the empty hint and
+    // notification popups all funnel through here — one place, no per-caller
+    // bookkeeping to forget. Counts SUBMITS only: the call returns once the
+    // request is queued; the panel's multi-second waveform runs asynchronously
+    // (see panel_ms note below) and is deliberately NOT included here.
+    const uint64_t t0 = (uint64_t)(esp_timer_get_time() / 1000);
     CustomLcdDisplay *d = lcd();
     if (d != nullptr) {
         d->RequestUrgentFullRefresh("canvas");
     }
+    g_refresh_submit_ms += (uint32_t)((uint64_t)(esp_timer_get_time() / 1000) - t0);
 }
 
 extern "C" void rf_draw_empty_hint(void) {
@@ -381,16 +392,14 @@ extern "C" void rf_rails_audio(int on) {
 // see the definition-site comment.
 extern "C" void rf_power_counters(uint32_t* w, uint32_t* a, uint32_t* r, uint32_t* g, uint32_t* f) {
     if (w) *w = g_wakes; if (a) *a = g_awake_ms; if (r) *r = g_radio_ms;
-    if (g) *g = g_http_gets; if (f) *f = g_refresh_ms;
+    if (g) *g = g_http_gets; if (f) *f = g_refresh_submit_ms;
 }
 extern "C" void rf_power_count_wake(void)   { g_wakes++; }
 extern "C" void rf_power_add_awake_ms(uint32_t ms) { g_awake_ms += ms; }
 extern "C" void rf_power_add_radio_ms(uint32_t ms) { g_radio_ms += ms; }
-extern "C" void rf_power_add_refresh_ms(uint32_t ms) { g_refresh_ms += ms; }
-
-extern "C" uint64_t rf_now_ms(void) {
-    return (uint64_t)(esp_timer_get_time() / 1000);
-}
+// NOTE: no rf_power_add_refresh_ms writer — f is booked ONLY inside
+// rf_request_full_refresh above (the single exit). A second writer would let
+// a caller double-book the same submit.
 
 // ───────────────────── device signature (public ABI) ─────────────────────
 
