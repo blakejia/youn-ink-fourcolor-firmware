@@ -924,10 +924,18 @@ void Application::OnPowerTimer() {
 }
 
 void Application::StopRadioForPaint() {
+    // Paired stop/start through WifiManager (wifi_manager.h:71-72,
+    // wifi_manager.cc:114-177): StopStation() clears station_active_ AND tears
+    // down the driver (WifiStation::Stop: unregister handlers, stop timers,
+    // esp_wifi_scan_stop/disconnect/stop, destroy netif — wifi_station.cc:647-693).
+    // A bare esp_wifi_stop() here would leave station_active_ true, so a later
+    // StartStation() would early-return "already active" (wifi_manager.cc:121-124)
+    // and never restart the driver. Both deep-sleep callers also route through
+    // here now (they never return, so station_active_ is never read again —
+    // no behavior change there, just one shared teardown).
+    WifiManager::GetInstance().StopStation();
     wifi_connected_.store(false, std::memory_order_release);
     rf_rails_audio(0);          // amp off before audio power off (silent)
-    esp_wifi_disconnect();
-    esp_wifi_stop();
 }
 
 void Application::RunPowerCycle() {
@@ -974,14 +982,16 @@ void Application::RunPowerCycle() {
     // the target page on demand (see page_sync.rs), so tearing the radio down
     // first would strand the update. Only cut the radio once it is resident —
     // on a failed fetch we keep it, so the existing retry semantics are intact.
-    // Guard is "the session still belongs to the canvas" (NOT IsQuietBoot:
-    // quiet_boot_ is set once in Initialize and promotion never clears it, so
-    // a quiet boot turned interactive would cut the radio with no path to
-    // restart STA — dead Wi-Fi, unsent notify acks). promoted_ is one-shot and
-    // page_sync_is_displaying() is the live canvas-ownership signal.
+    // Guard is triple (Ruling 2b): quiet boot (duty-cycle path) AND not yet
+    // promoted AND the canvas still owns the glass. IsQuietBoot alone survives
+    // promotion (a quiet boot turned interactive would cut the radio with no
+    // timely restart); !promoted_ + is_displaying alone would also fire on an
+    // interactive-cold-boot cycle (start() sets DISPLAYING on any paired boot,
+    // :252-253 — the round-1 guard hit it). All three must hold.
     const bool paint_ready = page_sync_prepare_paint();
-    const bool canvas_owns_session = !promoted_ && page_sync_is_displaying();
-    if (paint_ready && canvas_owns_session) {
+    const bool canvas_owns_quiet_cycle =
+        IsQuietBoot() && !promoted_ && page_sync_is_displaying();
+    if (paint_ready && canvas_owns_quiet_cycle) {
         StopRadioForPaint();
         radio_cut_for_paint_ = true;
     }
@@ -1047,10 +1057,13 @@ void Application::ServicePowerPolicy() {
     }
 
     if (!d.sleep) {
-        // The pre-paint cutoff stopped STA for a canvas-owned session, but the
-        // policy keeps this session alive: bring the station back, or it would
-        // live on with no Wi-Fi (and notify acks could never go out). Deep
-        // sleep reboots clear the flag, so it is only ever consumed here.
+        // Paired with StopRadioForPaint above: StopStation() cleared
+        // station_active_, so this StartStation() really restarts the driver
+        // (wifi_manager.cc:121-124 early-return no longer fires). Without it
+        // the session would live on with no Wi-Fi — and a paint in this cycle
+        // synchronously marks Display busy, so decide() returns StayAwake{busy}
+        // and this branch is exactly where the device lands. Deep-sleep
+        // reboots clear the flag, so it is only ever consumed here.
         if (radio_cut_for_paint_) {
             radio_cut_for_paint_ = false;
             WifiManager::GetInstance().StartStation();
@@ -1089,9 +1102,10 @@ void Application::ServicePowerPolicy() {
     // UPPER BOUND, not exact radio-on time (see header comment at aw0):
     // includes WiFi connect + all requests; never quote as "radio was on X".
     rf_power_add_radio_ms((uint32_t)(teardown_ms - last_cycle_ms_));
-    // Amp off before audio power off (silent), then radio off. Shared with the
-    // pre-paint cutoff above (wifi flag already cleared at the sleep entry;
-    // the repeat store inside is idempotent).
+    // Shared with the pre-paint cutoff above. StopStation() also clears the
+    // app's wifi flag and the audio rail; the sleep entry already cleared the
+    // flag, so the repeat store inside is idempotent. station_active_ is never
+    // read again on this path (no return from deep sleep).
     StopRadioForPaint();
     esp_sleep_enable_timer_wakeup((uint64_t)d.wake_s * 1000000ULL);
     esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_BUTTON_GPIO, 0);

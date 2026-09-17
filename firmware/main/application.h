@@ -149,9 +149,10 @@ private:
     // esp_timer callback: run the one-shot cycle when one is due, else just
     // re-evaluate the policy (see .cc for the two reasons).
     void OnPowerTimer();
-    // Shared radio teardown: flag + amp-silent rails off + disconnect + stop.
-    // Bare esp_wifi_* calls (no ESP_ERROR_CHECK), so a repeat call is safe
-    // (second esp_wifi_stop returns ESP_ERR_WIFI_NOT_STARTED and is ignored).
+    // Shared radio teardown, paired with the stay-awake StartStation():
+    // WifiManager::StopStation (clears station_active_ + full driver teardown)
+    // + app wifi flag + amp-silent rails off. Never a bare esp_wifi_stop here:
+    // that would orphan station_active_=true and neuter the restart.
     void StopRadioForPaint();
     // Build the UI manager and register the settings page (interactive only).
     void BuildRawDrawUi(CustomLcdDisplay* lcd);
