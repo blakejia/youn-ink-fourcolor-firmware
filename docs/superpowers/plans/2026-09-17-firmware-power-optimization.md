@@ -19,6 +19,7 @@
   4. 首屏与页面切换的画质不降 ⇒ 不做降质刷新。
 - **不做**：EPD 轨空闲切断（已是现状）、light sleep、事件驱动唤醒重排、刷新路径重构、`/api/photos*` 死代码清理。
 - 构建纪律：`rm -rf build && idf.py build`（**最终构建必须在主会话执行**，子代理构建会产生分歧二进制）；有 `undefined reference` 即失败。
+- **每个任务的修复轮必须跑一次增量 `idf.py build`（不带 `rm -rf build`）作为编译门禁** —— 2026-09-17 补：原计划的"构建只归主会话"使 Task 1 的 C++ 从未被编译，`-Werror=misleading-indentation`（`shim.cpp:394-395`）直到 Task 3 才暴露。Rust 侧 `cargo test` 不能替代 C++ 编译。
 - 推送/提交：每个任务结束提交一次；**共享分支推送要先问用户**。
 - 无电流表 ⇒ 只报「时长记账」（射频开秒数 / 清醒毫秒 / 每次唤醒请求数），**不得**声称实测 mA。
 
@@ -398,8 +399,8 @@ git commit -m "feat(power): schedule 响应携带 notify_pending（用于省掉�
             .unwrap().notify_pending);
         assert!(!parse_schedule(&schedule_json_with_notify(0x11, &[], Some(false)))
             .unwrap().notify_pending);
-        assert!(!parse_schedule(&schedule_json_with_notify(0x11, &[], None))
-            .unwrap().notify_pending, "absent field defaults to false -> no wasted request");
+        assert!(parse_schedule(&schedule_json_with_notify(0x11, &[], None))
+            .unwrap().notify_pending, "absent field = old server -> behave as today (fetch)");
     }
 ```
 
@@ -527,7 +528,7 @@ static LedAction led_decide(bool ovr, bool ovr_blink, const ChargeStatus::Snapsh
 | `ovr && !ovr_blink` | 常亮(1) |
 | `!ovr && !charging && !full && pulses>0` | 亮 120ms / 灭 180ms，且 `consume_pulse = true` |
 | `!ovr && full` | 常亮(0) |
-| `!ovr && charging` | 灭 200ms / 亮 2800ms |
+| `!ovr && charging` | **亮 200ms / 灭 2800ms**（以改前代码为准：pin0=亮；brief 原表此行写反，已由 Task 6 评审核正） |
 | 其余 | 常灭(1) |
 
 - [ ] **Step 2: 改造任务**
@@ -601,3 +602,61 @@ git commit -m "perf(power): I2C 电源钩子幂等化，不再每次读写重驱
 - [ ] 真机四条红线逐条过：网页串口工具 / 网页刷写工具 / 内容延迟 / 按键+配对+通知确认 / 画质
 - [ ] 时长记账对比表（射频开秒数、清醒占空比、每次唤醒请求数，改前 vs 改后，同设备同页面集）
 - [ ] 报告中**明确区分**「有计数器证据」与「仅真机观察」，不出现 mA 数字
+
+> **Ruling（评审后更正，2026-09-17；本条取代上面 Task 2 里的相关代码块）**
+>
+> 评审证明上面 Task 2 的两处写法有害，按此更正：
+>
+> **(1) `prepare_paint()` 必须与 `paint_if_changed()` 同口径早退** —— 否则每个"内容没变"的 duty-cycle 唤醒都会多下一次位图 GET（`paint_if_changed` 原本靠两条早退省掉这次下载：RTC 面板记录与目标 md5 匹配 `page_sync.rs:576-583`、以及 `SUSPENDED` `:557-560`）。Rust 侧改为：
+> ```rust
+> pub fn prepare_paint() -> bool {
+>     if SUSPENDED.load(Ordering::Acquire) { return true; }        // 画布不画，无需取
+>     let Some(idx) = target_index() else { return true };         // 空提示，无位图
+>     let rec = read_panel_record();
+>     let md5 = with_table(|t| t.pages[idx].md5);
+>     if !with_table(|t| t.pages[idx].bitmap.is_null()) { return true; }
+>     if record_magic_ok(&rec.0) && record_index(&rec) == idx as i32
+>         && &rec.0[8..40] == &md5[..] { return true; }            // 玻璃上已经是它 ⇒ 不取
+>     !ensure_bitmap(idx, &md5).is_null()
+> }
+> ```
+> （上面前两条早退的形状要照 `paint_if_changed` 现有实现抄，不要另造判据。）
+>
+> **(2) 断射频的守卫不能用 `IsQuietBoot()`** —— `quiet_boot_` 只在 `Initialize` 写一次（`application.cc:303`），**promotion 不清除它** ⇒ 静默启动被提升为交互会话后射频被切、且没有任何路径重启 STA（`StartStation` 只被开机 `StartNetwork` 与设置里的 Wi-Fi 开关调用）⇒ 界面无 Wi-Fi、通知确认的 ack 发不出（踩红线 3）。改为按「会话仍归画布所有」判定，并在**不睡**分支里补重启：
+> ```cpp
+>     const bool paint_ready = page_sync_prepare_paint();
+>     const bool canvas_owns_session = !promoted_ && page_sync_is_displaying();
+>     if (paint_ready && canvas_owns_session) {
+>         StopRadioForPaint();
+>         radio_cut_for_paint_ = true;
+>     }
+> ```
+> 并在 `ServicePowerPolicy` 的**不睡**分支（`application.cc:1045-1054` 一带）加上：若 `radio_cut_for_paint_` 为真则重启站点（`StartStation()`）并清标志——否则该会话将带着停掉的 STA 继续活着。
+
+> **Ruling (2b)（取代上面 Ruling (2) 的处理办法，2026-09-17）**
+>
+> 复审证明 (2) 的两处写法都不成立，按此更正：
+>
+> **(a) `StartStation()` 单独调用是空操作。** `StopRadioForPaint()` 用裸 `esp_wifi_disconnect()/esp_wifi_stop()`，绕过 `WifiManager`，其 `station_active_`（`wifi_manager.h:126`）仍为 true ⇒ `WifiManager::StartStation()` 在 `wifi_manager.cc:121-124` 早退（"Station already active"），**永不** `station_->Start()`（其他调用者都配一次 stop，例如设置里的 Wi-Fi 开关 `application.cc:541-545`）。**先读 `WifiManager` 的公开 API**，选用成对的 stop/start 让 `station_active_` 保持真实；没有现成成对 API 就在该成员上配对，**不要**一边裸调 `esp_wifi_*` 一边调 `StartStation()`。
+>
+> **(b) 守卫必须三合一。** `page_sync_start()` 在任何**已配对**开机都会置 `DISPLAYING`（`application.cc:252-253`），而 `promoted_` 只由静默启动的 promotion 设置 ⇒ 只用 `!promoted_ && page_sync_is_displaying()` 会**波及交互开机**（round-1 的 `IsQuietBoot()` 守卫反而没碰它）。正确合取式：
+> ```cpp
+> const bool canvas_owns_quiet_cycle =
+>     IsQuietBoot() && !promoted_ && page_sync_is_displaying();
+> ```
+>
+> **(c) 严重性：这不是边角路径。** 刷屏提交经 `rf_request_full_refresh` → `RequestUrgentFullRefresh` **同步**置 `SleepBusySrc::Display`（`custom_lcd_display.cc:366-367`）⇒ `rf_power_decide` 在**每次刷屏的同一周期**就返回 `StayAwake{busy}`；常亮会话从不睡 ⇒ 若恢复不成立，射频会整场停着。
+
+> **Ruling（部署偏向更正，2026-09-17）**
+>
+> Task 4 的 `notify_pending` 字段在**缺失**时必须默认 **`true`**（即"照旧发通知查询"），**不是** `false`。
+> 理由：固件先刷、服务端后更新是现实序列；缺字段若默认 false，设备在混合部署期间会**完全不拉通知** ⇒ 通知不弹 ⇒ 踩红线 3。
+> 缺字段默认 true 时，混合部署的行为与今天**逐字一致**，代价只是那段时间少省一次请求。字段存在时一律以服务端值为准。
+> 对应测试断言：`None`（不出该字段）⇒ `notify_pending == true`；`Some(false)` ⇒ 不拉；`Some(true)` ⇒ 拉。
+
+> **Ruling（Task 6 评审后，2026-09-17）**
+>
+> (a) **验收判据以代码为准**：T6 表第 5 行充电脑冲顺序原写反（实际 pin0=亮 ⇒ 亮 200ms / 灭 2800ms）。真机对照一律跑**代码推导出的表**，不跑本计划原文的措辞。
+> (b) `kLedStaticPollMs` 由 **2000ms 改 1000ms**：LED 任务是 `ChargeStatus::Tick` 的唯一周期调用者 ⇒ `IsPowerPresent()` 快照新鲜度直接决定 mains 睡眠闸门（`application.cc:1057` → `power.rs:43`）与深睡充电唤醒守卫（`:1163`/`:1225`）的余量；2000ms 把该余量从 ~1.5s 拉到 ~3.8s 且**用户可见**的插入检出延迟从 ~0.9s 拉到 ~2.4s。1000ms 把延迟压回 ~1.4s 而仍然把唤醒次数减半（tickless 关、HZ=100 ⇒ 原 500ms 轮询的省电收益本就比想象小）。
+> (c) **500ms blink 回到 `vTaskDelay(500)`**（规则性对闪烁是可见属性，被事件打断会多一次相位翻转）；**2800ms 充电尾段保留 notify 等待**（提前响应在那里是特性）。
+> (d) 真机五态对照**无法在本环境完成**（无设备）⇒ 作为**收尾真机清单**的一项带条件合入，不阻塞其余任务。

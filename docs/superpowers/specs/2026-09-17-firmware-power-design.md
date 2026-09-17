@@ -120,3 +120,22 @@ wake(timer/BOOT/充电)
 | MAX_MODEM 让唤醒窗口变长，抵消收益 | 计数器对比「唤醒窗口毫秒数」；不划算就撤 1.2 |
 | 1.1 断射频破坏未来「刷屏中上报」功能 | 注释 + 不变量文档化 |
 | LED 改事件驱动改变观感 | 真机三态对照，不一致就不合入 |
+
+## 7. 变更记录（实现期裁定）
+
+**§3.2 P3.2「音频电源脚幂等化」—— 已评估，决定不做（2026-09-17，用户认可）**
+
+原设计：`BoardI2cForcePowerOn` 不再在每次 I2C 读写时重复拉高 `Audio_PWR_PIN`(GPIO42)，改为「音频会话期间保持供电」。
+
+评估结论：**该改法在当前引脚配置下不安全，放弃**。依据（逐字取自 IDF v6.0 头文件）：
+
+```c
+/* components/esp_driver_gpio/include/driver/gpio.h:136 */
+/* @warning If the pad is not configured for input (or input and output) the returned value is always 0. */
+```
+
+该脚按输出模式配置 ⇒ `gpio_get_level()` **读回恒 0** ⇒ 「电平已是目标值就跳过」的守卫会**漏掉必要的拉高** ⇒ 音频 codec 静默上电失败（故障不报错、只是没声音）。
+
+将来若要重做，只有两条路，且都必须重验音频：①用**软件影子变量**记住上次写入的电平；②把该脚改为 `GPIO_MODE_INPUT_OUTPUT` 后再读回。**不建议顺手做。**
+
+**其余实现期更正**（详见计划文件末尾的 Ruling 块）：DFS 只能以 `min=80 / light_sleep=false` 落地（保住 USB-Serial-JTAG 控制台）；`notify_pending` 字段缺失时默认 **true**（混合部署行为与改前逐字一致）；每任务必须过增量 `idf.py build` 编译门禁。
