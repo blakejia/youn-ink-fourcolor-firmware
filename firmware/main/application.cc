@@ -354,14 +354,34 @@ void Application::Initialize(bool quiet) {
         switch (event) {
             case NetworkEvent::Connected:
                 ESP_LOGI(kTag, "WiFi connected: %s", data.c_str());
-                // Duty-cycled device: nothing interactive is served while this wake is in
-                // flight, so the radio may sleep between beacons. LATENCY: each request pays
-                // tens-to-hundreds of ms more; measured against the "no visible-latency
-                // regression" red line via the awake-ms counter (Task 1). Quiet-only
-                // (ruling): an interactive session must not pay modem-sleep latency,
-                // so a promoted boot never takes this path.
-                if (IsQuietBoot() && !promoted_.load(std::memory_order_acquire)) {
-                    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+                // Single ownership: the radio level is decided here and only here.
+                // Quiet duty-cycle wakes take LOW_POWER (WIFI_PS_MAX_MODEM); a
+                // promoted boot takes PERFORMANCE (WIFI_PS_NONE, matching the
+                // config-AP precedent in wifi_configuration_ap.cc:196 — "user
+                // is driving ⇒ radio full on"). One atomic snapshot of
+                // promoted_ feeds the ternary, so guard and value cannot
+                // disagree; no new lock — the residual race (promotion landing
+                // between this snapshot and set_ps) is microseconds wide and
+                // self-heals on the next reconnect.
+                // Why here and not ServicePromotion(): a promotion can land
+                // inside the Task-2 paint cut (station down for the 15-25 s
+                // page_sync_paint_if_changed), where a downcall from app_main
+                // is silently dropped by WifiManager (station_active_ false,
+                // wifi_manager.cc:372-374); the post-cut StartStation re-fires
+                // Connected, which repairs the level with the then-current
+                // promoted_. This also covers promotion-before-first-connect.
+                // LATENCY: modem-sleep costs each request tens-to-hundreds of
+                // ms; measured against the "no visible-latency regression" red
+                // line via the awake-ms counter (Task 1).
+                // NOTE: driver retention of the ps setting across
+                // esp_wifi_stop()/start() is undetermined in this repo (IDF
+                // default is WIFI_PS_MIN_MODEM per esp_wifi.h) — whatever it
+                // retains, this branch re-issues the correct level on every
+                // connect, so retention never decides the steady state.
+                if (IsQuietBoot()) {
+                    const bool promoted = promoted_.load(std::memory_order_acquire);
+                    Board::GetInstance().SetPowerSaveLevel(promoted ? PowerSaveLevel::PERFORMANCE
+                                                                    : PowerSaveLevel::LOW_POWER);
                 }
                 wifi_connected_.store(true, std::memory_order_release);
                 StartSntpClockSyncOnce();
@@ -648,15 +668,11 @@ void Application::ServicePromotion() {
     rf_panel_commit_hook_register();
     UpdateStatusBarForUi();
     promoted_.store(true, std::memory_order_release);
-    // Undo Task 3's quiet-cycle MAX_MODEM: this wake is interactive from here,
-    // and every request would otherwise pay modem-sleep latency. PERFORMANCE
-    // (WIFI_PS_NONE) restores a full-performance radio, matching the config-AP
-    // path's precedent (wifi_configuration_ap.cc forces PS NONE while the
-    // device drives interaction). Only quiet boots reach here (early return
-    // above), and any of those with an active station took LOW_POWER in the
-    // Connected branch, so this is exactly-undo. Dropped silently when the
-    // station is down (config AP up, Task-2 paint cut, or never connected).
-    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    // No SetPowerSaveLevel here by design (single ownership): the Connected
+    // branch re-issues the level on every connect, reading the then-current
+    // promoted_. A downcall from this task would be silently dropped inside
+    // the Task-2 paint cut (station down 15-25 s), and the post-cut
+    // StartStation re-fires Connected, which repairs the level.
     promote_requested_.store(false, std::memory_order_release);
     ESP_LOGI(kTag, "Boot path: promoted to interactive");
     // A promotion via the config path (F21) arrives with the AP already up
