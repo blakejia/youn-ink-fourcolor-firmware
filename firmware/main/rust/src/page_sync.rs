@@ -71,8 +71,9 @@ static LAST_SYNC_OK: AtomicBool = AtomicBool::new(false);
 /// Lock-free (like SERVER_REACHABLE): `application.cc` reads it right after
 /// `page_sync_sync_once` returns, while `sync_schedule` may run under no or
 /// any lock — an atomic avoids a second lock order.
-/// Default true: an old server sends no field, and the first wake's sync may
-/// fail, both of which must behave exactly as today (fetch).
+/// "No new information" reads as pending (fetch, exactly as today): an old
+/// server sends no field, and every sync failure (alloc/fetch/parse) resets
+/// to true so a stale `false` from an earlier cycle can never suppress a poll.
 static NOTIFY_PENDING: AtomicBool = AtomicBool::new(true);
 
 #[derive(Clone, Copy)]
@@ -372,6 +373,8 @@ pub fn sync_once() -> bool {
     if raw.is_null() {
         log_e!("PageSync", "schedule buffer alloc failed");
         LAST_SYNC_OK.store(false, Ordering::Release);
+        // No new information about the queue: stay fetchable (as today).
+        NOTIFY_PENDING.store(true, Ordering::Release);
         return false;
     }
     // Same one-byte-over-allocation as the notify response: the wrapper's
@@ -380,6 +383,9 @@ pub fn sync_once() -> bool {
     let ok = if let Some(len) = fetch_schedule(body) {
         sync_schedule(&body[..len])
     } else {
+        // Fetch failed (non-200/timeout): this cycle knows nothing about the
+        // queue, so read as pending — exactly today's unconditional fetch.
+        NOTIFY_PENDING.store(true, Ordering::Release);
         false
     };
     unsafe { shim::rf_free(raw) };
@@ -394,6 +400,8 @@ pub fn sync_once() -> bool {
 fn sync_schedule(body: &[u8]) -> bool {
     let Some(parsed) = parse_schedule(body) else {
         log_w!("PageSync", "schedule json unusable (missing schedule_md5/pages)");
+        // Parsed nothing: no queue information either — read as pending.
+        NOTIFY_PENDING.store(true, Ordering::Release);
         return false;
     };
     let new_md5 = parsed.md5;
@@ -1191,6 +1199,29 @@ mod tests {
         shim::host::script_ok("/api/pages/schedule", &schedule_json_with_notify(0x11, &[], Some(true)));
         assert!(sync_once());
         assert!(notify_pending());
+    }
+
+    #[test]
+    fn a_failed_sync_leaves_notifications_fetchable() {
+        // F1: a failed fetch or an unparseable body carries no queue
+        // information — the gate must read pending (today's behaviour),
+        // never a stale `false` from an earlier cycle.
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json_with_notify(0x11, &[], Some(false)));
+        assert!(sync_once());
+        assert!(!notify_pending());
+        // Path 1: fetch fails (non-200).
+        shim::host::script_get("/api/pages/schedule", 500, b"");
+        assert!(!sync_once());
+        assert!(notify_pending(), "fetch failure must not reuse the stale false");
+        // Path 2: fetch succeeds but the body does not parse.
+        shim::host::script_ok("/api/pages/schedule", &schedule_json_with_notify(0x11, &[], Some(false)));
+        assert!(sync_once());
+        assert!(!notify_pending());
+        shim::host::script_ok("/api/pages/schedule", b"not json");
+        assert!(!sync_once());
+        assert!(notify_pending(), "unparseable body must not reuse the stale false");
     }
     /// A bitmap body whose every byte is `fill`, so the framebuffer shows which
     /// page was blitted.
