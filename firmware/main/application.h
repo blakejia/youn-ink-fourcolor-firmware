@@ -143,6 +143,10 @@ private:
     // esp_timer callback: run the one-shot cycle when one is due, else just
     // re-evaluate the policy (see .cc for the two reasons).
     void OnPowerTimer();
+    // Shared radio teardown: flag + amp-silent rails off + disconnect + stop.
+    // Bare esp_wifi_* calls (no ESP_ERROR_CHECK), so a repeat call is safe
+    // (second esp_wifi_stop returns ESP_ERR_WIFI_NOT_STARTED and is ignored).
+    void StopRadioForPaint();
     // Build the UI manager and register the settings page (interactive only).
     void BuildRawDrawUi(CustomLcdDisplay* lcd);
     // Ask the main loop to promote a quiet boot (build UI + bring up panel).

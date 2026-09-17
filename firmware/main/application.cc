@@ -923,6 +923,13 @@ void Application::OnPowerTimer() {
     }
 }
 
+void Application::StopRadioForPaint() {
+    wifi_connected_.store(false, std::memory_order_release);
+    rf_rails_audio(0);          // amp off before audio power off (silent)
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+}
+
 void Application::RunPowerCycle() {
     // The one-shot duty-cycle step both boot paths share (Task 6 calls this
     // once per quiet wake). Each stage takes and releases the module locks
@@ -945,13 +952,12 @@ void Application::RunPowerCycle() {
     // path never returns, but RAM dies with it, so no stale set survives).
     cycle_in_progress_.store(true, std::memory_order_release);
     last_cycle_ms_ = esp_timer_get_time() / 1000;
-    // Task 1 duration ledger: one count per wake here; the awake and radio
-    // spans both close at the sleep teardown below (same end instant — see
-    // F5), so awake can never read below radio for one cycle. Counters are
-    // RTC memory: this cycle's bookings land after this cycle's fetch, so
-    // each wake's GET carries the cumulative total through the previous
-    // completed cycle. Base instant kept in cycle_awake_base_ms_ (member:
-    // the policy runs in a different function).
+    // Task 1 duration ledger: one count per wake here. The wake booking is
+    // intentionally the FIRST counter write of the cycle, before this cycle's
+    // own schedule GET: each wake's GET therefore carries w through the
+    // current wake but a/r/g/f only through the previous completed cycle
+    // (this cycle's spans book at the sleep teardown below). Per-wake
+    // differencing stays exact; absolute snapshots mix the two instants.
     rf_power_count_wake();
     cycle_awake_base_ms_ = esp_timer_get_time() / 1000;
     // The backoff streak lives in RTC memory (rf_fail_streak_*) because RAM
@@ -964,6 +970,17 @@ void Application::RunPowerCycle() {
     // Unconditional, even on an empty schedule: that call draws and records
     // the empty hint, which is what makes the canvas's display-ownership
     // claim honest.
+    // Fetch the page BEFORE the radio comes down: `paint_if_changed` downloads
+    // the target page on demand (see page_sync.rs), so tearing the radio down
+    // first would strand the update. Only cut the radio once it is resident —
+    // on a failed fetch we keep it, so the existing retry semantics are intact.
+    // Quiet-boot guard is the conservative direction: duty-cycle wakes (this
+    // plan's power target) always take it; an interactive session reaching
+    // here simply keeps today's behavior (radio stays up, no regression).
+    const bool paint_ready = page_sync_prepare_paint();
+    if (paint_ready && IsQuietBoot()) {
+        StopRadioForPaint();
+    }
     page_sync_paint_if_changed();
     // The cold boot may have held the UI's first paint back for exactly this
     // frame; from here the UI paints normally (button activity would have
@@ -1060,10 +1077,10 @@ void Application::ServicePowerPolicy() {
     // UPPER BOUND, not exact radio-on time (see header comment at aw0):
     // includes WiFi connect + all requests; never quote as "radio was on X".
     rf_power_add_radio_ms((uint32_t)(teardown_ms - last_cycle_ms_));
-    // Amp off before audio power off (silent), then radio off.
-    rf_rails_audio(0);
-    esp_wifi_disconnect();
-    esp_wifi_stop();
+    // Amp off before audio power off (silent), then radio off. Shared with the
+    // pre-paint cutoff above (wifi flag already cleared at the sleep entry;
+    // the repeat store inside is idempotent).
+    StopRadioForPaint();
     esp_sleep_enable_timer_wakeup((uint64_t)d.wake_s * 1000000ULL);
     esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_BUTTON_GPIO, 0);
     // Charger-insert wake, but only while actually unplugged. decide() holds the
@@ -1126,10 +1143,7 @@ void Application::EnterManualSleep() {
     rf_panel_record_invalidate();
     // Same teardown order as the policy path: amp off before audio power off
     // (silent shutdown, no pop), then the radio.
-    rf_rails_audio(0);
-    wifi_connected_.store(false, std::memory_order_release);
-    esp_wifi_disconnect();
-    esp_wifi_stop();
+    StopRadioForPaint();
     UpdateStatusBarForUi();
     vTaskDelay(pdMS_TO_TICKS(300));
     esp_sleep_enable_ext0_wakeup(static_cast<gpio_num_t>(BOOT_BUTTON_GPIO), 0);

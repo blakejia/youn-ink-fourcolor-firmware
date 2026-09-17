@@ -540,6 +540,19 @@ fn blit_and_refresh(idx: usize, slot: *mut u8) -> bool {
     true
 }
 
+/// Fetch the page that is about to be painted, without touching the panel.
+///
+/// The power wiring turns the radio off before a full refresh (15-25 s of
+/// waveform), so the download must happen first — `paint_if_changed` would
+/// otherwise try to fetch it with the radio down and the page would never land.
+/// Returns false only when the page is missing and could not be fetched.
+pub fn prepare_paint() -> bool {
+    let Some(idx) = target_index() else { return true };   // empty hint: nothing to fetch
+    let md5 = with_table(|t| t.pages[idx].md5);
+    if !with_table(|t| t.pages[idx].bitmap.is_null()) { return true; }
+    !ensure_bitmap(idx, &md5).is_null()
+}
+
 /// Paint the target page only if the glass does not already show it.
 pub fn paint_if_changed() -> bool {
     if SUSPENDED.load(Ordering::Acquire) {
@@ -821,6 +834,11 @@ pub extern "C" fn page_sync_sync_once() -> bool {
 pub extern "C" fn page_sync_paint_if_changed() -> bool {
     paint_if_changed()
 }
+#[unsafe(no_mangle)]
+pub extern "C" fn page_sync_prepare_paint() -> bool {
+    prepare_paint()
+}
+
 
 /// Seconds until the server's next page change; -1 = unknown/empty schedule.
 #[unsafe(no_mangle)]
@@ -1290,6 +1308,33 @@ mod tests {
             "the second poll hit only the schedule endpoint"
         );
     }
+    #[test]
+    fn prepare_paint_fetches_the_page_without_touching_the_panel() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        sync_once();
+        let before = shim::host::refreshes();
+        assert!(prepare_paint(), "the bitmap must be resident");
+        assert_eq!(shim::host::refreshes(), before, "prepare must not refresh the panel");
+        assert!(paint_if_changed(), "then the paint still happens");
+    }
+
+    #[test]
+    fn prepare_paint_is_true_when_nothing_needs_downloading() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        sync_once();
+        prepare_paint();
+        paint_if_changed();                       // glass now shows page 0
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
+        sync_once();
+        assert!(prepare_paint(), "same page on the glass -> no download needed");
+    }
+
 
     #[test]
     fn a_changed_schedule_carries_over_the_kept_pages_bitmap() {

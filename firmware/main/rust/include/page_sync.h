@@ -35,6 +35,11 @@ bool page_sync_sync_once(void);
  *  Returns true when a refresh was actually spent. */
 bool page_sync_paint_if_changed(void);
 
+/** Fetch the page about to be painted into RAM, without touching the panel.
+ *  True = the page is resident (or nothing needs downloading). */
+bool page_sync_prepare_paint(void);
+
+
 /** Seconds until the server's next page change; -1 = unknown/empty schedule. */
 int32_t page_sync_next_wake_s(void);
 
