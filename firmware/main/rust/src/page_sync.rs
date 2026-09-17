@@ -531,7 +531,13 @@ fn blit_and_refresh(idx: usize, slot: *mut u8) -> bool {
     if !copied {
         return false;
     }
+    // Task 1 duration ledger: book only the request submission. The panel
+    // keeps refreshing asynchronously for seconds after this returns; that
+    // tail is panel-busy time the sleep gate already accounts for, not CPU
+    // time this wake spends — counting it as refresh_ms would double-book.
+    let t0 = unsafe { shim::rf_now_ms() };
     unsafe { shim::rf_request_full_refresh() };
+    unsafe { shim::rf_power_add_refresh_ms((shim::rf_now_ms().saturating_sub(t0)) as u32) };
     DISPLAYING.store(true, Ordering::Release);
     true
 }
@@ -1448,5 +1454,37 @@ mod tests {
         for kv in ["w=7", "a=1234", "r=567", "g=2", "f=890"] {
             assert!(gets.iter().any(|c| c.contains(kv)), "{kv} missing from {gets:?}");
         }
+    }
+    #[test]
+    fn each_schedule_poll_advances_the_http_get_counter() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_counters(0, 0, 0, 0, 0);
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        let mut c = [0u32; 5];
+        unsafe { shim::rf_power_counters(&mut c[0], &mut c[1], &mut c[2], &mut c[3], &mut c[4]) };
+        assert_eq!(c[3], 1, "one schedule GET attempted -> g advanced by one: {c:?}");
+        sync_once();
+        unsafe { shim::rf_power_counters(&mut c[0], &mut c[1], &mut c[2], &mut c[3], &mut c[4]) };
+        assert_eq!(c[3], 2, "second poll -> g advanced again: {c:?}");
+    }
+
+    #[test]
+    fn a_paint_books_refresh_time() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        shim::host::set_counters(0, 0, 0, 0, 0);
+        scripted_schedule_with_position(0, 240, &[(0xa1, 10)]);
+        shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
+        assert!(sync_once());
+        assert!(paint_if_changed(), "first paint spends one refresh request");
+        let mut c = [0u32; 5];
+        unsafe { shim::rf_power_counters(&mut c[0], &mut c[1], &mut c[2], &mut c[3], &mut c[4]) };
+        // The stub advances the scripted clock by 250 on each refresh request,
+        // so the booking is exactly the submission span the caller measured.
+        // (The stub owns the clock; wall time never leaks into the assertion.)
+        assert_eq!(c[4], 250, "a paint must book refresh_ms: {c:?}");
     }
 }

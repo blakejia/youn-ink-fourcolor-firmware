@@ -93,6 +93,10 @@ unsafe extern "C" {
     /// Null pointers are ignored, so callers may read a subset.
     pub fn rf_power_counters(wakes: *mut u32, awake_ms: *mut u32, radio_ms: *mut u32,
                              http_gets: *mut u32, refresh_ms: *mut u32);
+    /// Book `ms` of panel-refresh time (same writer style as awake/radio).
+    pub fn rf_power_add_refresh_ms(ms: u32);
+    /// Monotonic ms clock for duration bookkeeping (esp_timer on device).
+    pub fn rf_now_ms() -> u64;
 }
 
 /// `abort()`, used by the panic handler.
@@ -247,6 +251,7 @@ pub(crate) mod host {
         *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *FAIL_STREAK.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         *POWER.lock().unwrap_or_else(|e| e.into_inner()) = [0; 5];
+        *NOW_MS.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         AUDIO_ON.store(true, std::sync::atomic::Ordering::SeqCst);
         guard
     }
@@ -361,6 +366,25 @@ pub(crate) mod host {
                 *refresh_ms = c[4];
             }
         }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_power_add_refresh_ms(ms: u32) {
+        POWER.lock().unwrap_or_else(|e| e.into_inner())[4] += ms;
+    }
+
+    /// Scripted monotonic clock (tests only): `set_now_ms` stages it, and the
+    /// refresh path reads it through the same `rf_now_ms` the device serves
+    /// from `esp_timer_get_time() / 1000`.
+    static NOW_MS: Mutex<u64> = Mutex::new(0);
+
+    pub fn set_now_ms(ms: u64) {
+        *NOW_MS.lock().unwrap_or_else(|e| e.into_inner()) = ms;
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_now_ms() -> u64 {
+        *NOW_MS.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Any request whose URL contains `suffix` gets `status` + `body`.
@@ -611,6 +635,8 @@ pub(crate) mod host {
         _timeout_ms: c_int,
     ) -> c_int {
         let url = cstr(url);
+        // Mirrors shim.cpp: the single GET exit counts every attempt.
+        POWER.lock().unwrap_or_else(|e| e.into_inner())[3] += 1;
         note(format!("http_get {url}"));
         let cap = unsafe { *len }.max(0) as usize;
         let hit = {
@@ -701,6 +727,10 @@ pub(crate) mod host {
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_request_full_refresh() {
         counters(|c| c.refreshes += 1);
+        // The device's refresh request returns after submission; the test
+        // clock only advances when it crosses this call, so the delta the
+        // caller books is the submission span, never wall time.
+        *NOW_MS.lock().unwrap_or_else(|e| e.into_inner()) += 250;
         note("full_refresh");
     }
 

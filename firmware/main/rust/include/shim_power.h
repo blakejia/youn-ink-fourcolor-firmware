@@ -55,6 +55,8 @@ void rf_power_add_awake_ms(uint32_t ms);
 void rf_power_add_radio_ms(uint32_t ms);
 void rf_power_count_http_get(void);
 void rf_power_add_refresh_ms(uint32_t ms);
+/* Monotonic ms clock for Rust duration bookkeeping (esp_timer ms). */
+uint64_t rf_now_ms(void);
 
 #ifdef __cplusplus
 }

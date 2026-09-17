@@ -174,10 +174,18 @@ extern "C" void rf_timer_delete(void) {
     g_timer_cb = nullptr;
 }
 
+// Task 1 duration ledger counters. Defined here (above first use: rf_http_get
+// counts every GET at the single exit) so the device build sees them in order;
+// the reader/writer functions live next to the other power shims below.
+static uint32_t g_wakes, g_awake_ms, g_radio_ms, g_http_gets, g_refresh_ms;
+
 // ─────────────────────────────── http ───────────────────────────────
 
 extern "C" int rf_http_get(const char *url, const char *token, char *buf, int *len,
                            int timeout_ms) {
+    // Task 1 duration ledger: the single HTTP GET exit — count every schedule
+    // poll, bitmap fetch and notify poll the same way (attempts, not successes).
+    g_http_gets++;
     return http_wrapper_get(url, token, buf, len, timeout_ms);
 }
 
@@ -368,11 +376,9 @@ extern "C" void rf_rails_audio(int on) {
     Board::GetInstance().SetAudioRail(on != 0);
 }
 
-// Power-accounting counters for the Task 1 duration ledger: wakes, awake ms,
-// radio-on ms, schedule GETs and refresh ms. Plain RAM — a wake is a reboot,
-// so only the host test reads them back within one boot; the device ships
-// each wake's snapshot as schedule-GET query params before sleeping.
-static uint32_t g_wakes, g_awake_ms, g_radio_ms, g_http_gets, g_refresh_ms;
+// Power-accounting reader/writers (counters defined above, next to rf_http_get
+// which counts at the single GET exit). radio_ms stays an UPPER BOUND —
+// see the definition-site comment.
 extern "C" void rf_power_counters(uint32_t* w, uint32_t* a, uint32_t* r, uint32_t* g, uint32_t* f) {
     if (w) *w = g_wakes; if (a) *a = g_awake_ms; if (r) *r = g_radio_ms;
     if (g) *g = g_http_gets; if (f) *f = g_refresh_ms;
@@ -380,8 +386,11 @@ extern "C" void rf_power_counters(uint32_t* w, uint32_t* a, uint32_t* r, uint32_
 extern "C" void rf_power_count_wake(void)   { g_wakes++; }
 extern "C" void rf_power_add_awake_ms(uint32_t ms) { g_awake_ms += ms; }
 extern "C" void rf_power_add_radio_ms(uint32_t ms) { g_radio_ms += ms; }
-extern "C" void rf_power_count_http_get(void) { g_http_gets++; }
 extern "C" void rf_power_add_refresh_ms(uint32_t ms) { g_refresh_ms += ms; }
+
+extern "C" uint64_t rf_now_ms(void) {
+    return (uint64_t)(esp_timer_get_time() / 1000);
+}
 
 // ───────────────────── device signature (public ABI) ─────────────────────
 

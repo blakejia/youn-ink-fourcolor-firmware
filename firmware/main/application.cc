@@ -1045,10 +1045,12 @@ void Application::ServicePowerPolicy() {
              (int)in.mains, (int)in.sync_ok, gpio_get_level(CHARGE_DETECT_GPIO));
     TransitionLifecycle(kLifecycleSleep, "power policy");
     wifi_connected_.store(false, std::memory_order_release);
-    // Radio-on span ends here: cycle start (last_cycle_ms_) -> radio off.
-    // Cycle start is the only boot timestamp we own, so this is the honest
-    // upper bound of radio-on time — same esp_timer ms clock as the awake
-    // booking in RunPowerCycle. Recorded before the radio goes off.
+    // UPPER BOUND, not exact radio-on time: cycle start (last_cycle_ms_) ->
+    // radio off, including WiFi connect + all requests. Cycle start is the
+    // only boot timestamp we own, so this over-counts by the pre-radio boot
+    // span; never quote it as "the radio was on for X". Same esp_timer ms
+    // clock as the awake booking in RunPowerCycle. Recorded before the radio
+    // goes off.
     rf_power_add_radio_ms((uint32_t)(esp_timer_get_time() / 1000 - last_cycle_ms_));
     // Amp off before audio power off (silent), then radio off.
     rf_rails_audio(0);
