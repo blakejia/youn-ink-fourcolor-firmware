@@ -391,8 +391,11 @@ extern "C" void rf_rails_audio(int on) {
 // which counts at the single GET exit). radio_ms stays an UPPER BOUND —
 // see the definition-site comment.
 extern "C" void rf_power_counters(uint32_t* w, uint32_t* a, uint32_t* r, uint32_t* g, uint32_t* f) {
-    if (w) *w = g_wakes; if (a) *a = g_awake_ms; if (r) *r = g_radio_ms;
-    if (g) *g = g_http_gets; if (f) *f = g_refresh_submit_ms;
+    if (w) *w = g_wakes;
+    if (a) *a = g_awake_ms;
+    if (r) *r = g_radio_ms;
+    if (g) *g = g_http_gets;
+    if (f) *f = g_refresh_submit_ms;
 }
 extern "C" void rf_power_count_wake(void)   { g_wakes++; }
 extern "C" void rf_power_add_awake_ms(uint32_t ms) { g_awake_ms += ms; }
