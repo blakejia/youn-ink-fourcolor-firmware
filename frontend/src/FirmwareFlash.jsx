@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { api } from './api.js';
 import { Banner, BusyButton } from './ui.jsx';
-import { formatBytes } from './format.js';
+import { formatBytes, formatTime } from './format.js';
 import {
   APP_PARTITION_SIZE, FLASH_PARAMS, OTADATA_OFFSET, OTADATA_SIZE, SLOTS, parseOtadata,
 } from './flashTarget.js';
@@ -422,7 +422,7 @@ export default function FirmwareFlash({ onBusyChange } = {}) {
             <option value="">— 选择 —</option>
             {items.map((i) => (
               <option key={i.id} value={i.id}>
-                {i.source === 'build' ? '[构建产物] ' : '[上传] '}{i.name} · {formatBytes(i.size)}
+                {i.source === 'build' ? '[构建产物] ' : '[上传] '}{i.name} · {formatBytes(i.size)} · 构建 {formatTime(i.mtime)}
                 {i.image_ok === false ? ' · 校验未通过' : ''}
               </option>
             ))}
