@@ -131,6 +131,12 @@ def _require_device_token(request: Request) -> "Device":
     dev = registry.get_device_by_token(token)
     if dev is None or not dev.trusted:
         raise HTTPException(status_code=401, detail="unauthorized")
+    # Liveness: this is the one gate every authenticated device request passes
+    # (schedule poll, notification fetch, OTA check), so stamping here keeps the
+    # admin UI's "最近在线" truthful for HTTP-polling devices — the registry used
+    # to be written only by the WS hello path. Deliberately after the trust
+    # check: a refused request must not read as activity.
+    registry.touch(dev.device_id)
     return dev
 
 

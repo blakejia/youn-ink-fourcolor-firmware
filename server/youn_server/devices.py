@@ -180,6 +180,32 @@ class DeviceRegistry:
             )
             return cur.rowcount > 0
 
+    def touch(self, device_id: str, ip_address: Optional[str] = None) -> None:
+        """Stamp `last_seen` for an authenticated device request.
+
+        The registry was previously written only by the WebSocket hello path;
+        devices that poll over plain HTTP (the normal steady state) kept the
+        timestamp of their last WS handshake, so the admin UI showed days-old
+        liveness for a device checking in every ten seconds.
+
+        Callers MUST have authenticated the request first — this is a heartbeat,
+        not a validation step, so an unauthenticated call would let anyone forge
+        liveness. `ip_address` is refreshed only when supplied: many polls arrive
+        through a proxy and would otherwise overwrite the device's LAN address.
+        """
+        now = int(time.time())
+        with self._lock:
+            if ip_address is None:
+                self._conn.execute(
+                    "UPDATE devices SET last_seen = ? WHERE device_id = ?",
+                    (now, device_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE devices SET last_seen = ?, ip_address = ? WHERE device_id = ?",
+                    (now, ip_address, device_id),
+                )
+
     def set_secret(self, device_id: str, secret: str) -> None:
         with self._lock:
             self._conn.execute(
