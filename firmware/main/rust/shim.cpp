@@ -27,6 +27,7 @@
  #include <esp_mac.h>
  #include <esp_random.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
  #include <esp_timer.h>
  #include <freertos/FreeRTOS.h>
  #include <freertos/semphr.h>
@@ -400,9 +401,19 @@ extern "C" void rf_power_counters(uint32_t* w, uint32_t* a, uint32_t* r, uint32_
 extern "C" void rf_power_count_wake(void)   { g_wakes++; }
 extern "C" void rf_power_add_awake_ms(uint32_t ms) { g_awake_ms += ms; }
 extern "C" void rf_power_add_radio_ms(uint32_t ms) { g_radio_ms += ms; }
-// NOTE: no rf_power_add_refresh_ms writer — f is booked ONLY inside
-// rf_request_full_refresh above (the single exit). A second writer would let
-// a caller double-book the same submit.
+
+// Last reset reason, sampled once at first call (boot path) and cached in RTC
+// RAM: the query string must carry WHY the device rebooted (brownout vs watchdog
+// vs software) across deep sleeps, where `esp_reset_reason()` itself resets to
+// ESP_RST_UNKNOWN after the next wake. Reported as `?rr=<n>` by fetch_schedule;
+// values are the esp_reset_reason_t enum (e.g. 0xf=BROWNOUT, 0x8=RTCWDT on S3).
+RTC_DATA_ATTR static uint32_t g_last_reset_reason;
+extern "C" uint32_t rf_last_reset_reason(void) {
+    if (g_last_reset_reason == 0) {
+        g_last_reset_reason = (uint32_t)esp_reset_reason();
+    }
+    return g_last_reset_reason;
+}
 
 // ───────────────────── device signature (public ABI) ─────────────────────
 

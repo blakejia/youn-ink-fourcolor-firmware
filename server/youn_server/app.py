@@ -534,6 +534,23 @@ def create_app() -> FastAPI:
             "http_gets": _u32("g"),
             "refresh_submit_ms": _u32("f"),
         }
+        # `rr` is the esp_reset_reason_t enum the device sampled at boot
+        # (e.g. 15=BROWNOUT, 8=RTCWDT). Old firmware omits it: keep the last
+        # stored reason instead of clobbering it with "unknown" — the reason is
+        # boot-scoped, not poll-scoped, so absent means "unchanged since boot".
+        rr = qp.get("rr")
+        if rr is not None:
+            try:
+                power["reset_reason"] = max(0, int(rr))
+            except (TypeError, ValueError):
+                pass
+        else:
+            try:
+                prev = json.loads(registry.get_power_counters(dev.device_id) or "{}")
+                if "reset_reason" in prev:
+                    power["reset_reason"] = prev["reset_reason"]
+            except (ValueError, TypeError):
+                pass
         try:
             registry.set_power_counters(dev.device_id, json.dumps(power))
         except Exception:

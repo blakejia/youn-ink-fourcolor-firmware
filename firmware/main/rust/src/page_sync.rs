@@ -170,7 +170,8 @@ fn fetch_schedule(buf: &mut [u8]) -> Option<usize> {
     path.push("/api/pages/schedule");
     let mut c = [0u32; 5];
     unsafe { shim::rf_power_counters(&mut c[0], &mut c[1], &mut c[2], &mut c[3], &mut c[4]) };
-    let _ = write!(path, "?w={}&a={}&r={}&g={}&f={}", c[0], c[1], c[2], c[3], c[4]);
+    let rr = unsafe { shim::rf_last_reset_reason() };
+    let _ = write!(path, "?w={}&a={}&r={}&g={}&f={}&rr={}", c[0], c[1], c[2], c[3], c[4], rr);
     let mut url = CBuf::<320>::new();
     if unsafe { shim::rf_build_endpoint(path.as_ptr(), url.as_mut_ptr(), 320) } == 0 {
         log_w!("PageSync", "cannot build schedule endpoint");
@@ -1648,6 +1649,22 @@ mod tests {
         for kv in ["w=7", "a=1234", "r=567", "g=2", "f=890"] {
             assert!(gets.iter().any(|c| c.contains(kv)), "{kv} missing from {gets:?}");
         }
+    }
+
+    #[test]
+    fn schedule_url_carries_the_last_reset_reason() {
+        // BROWNOUT vs RTCWDT vs SW distinction rides the schedule query string
+        // just like the power counters: no serial console needed to see why a
+        // remote device rebooted.
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_counters(7, 1234, 567, 2, 890);
+        shim::host::set_reset_reason(0xf); // esp_reset_reason_t BROWNOUT_RST on s3
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        let gets = shim::host::calls_matching("http_get");
+        assert!(gets.iter().any(|c| c.contains("rr=15")),
+                "reset reason (0xf=15) missing from the schedule URL: {gets:?}");
     }
     #[test]
     fn each_schedule_poll_advances_the_http_get_counter() {

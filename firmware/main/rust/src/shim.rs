@@ -95,6 +95,8 @@ unsafe extern "C" {
     /// (rf_request_full_refresh), never the panel waveform — see F3 note.
     pub fn rf_power_counters(wakes: *mut u32, awake_ms: *mut u32, radio_ms: *mut u32,
                              http_gets: *mut u32, refresh_ms: *mut u32);
+    /// `esp_reset_reason()` at boot (shim.cpp caches it once; Rust only reads).
+    pub fn rf_last_reset_reason() -> u32;
 }
 
 /// `abort()`, used by the panic handler.
@@ -370,6 +372,18 @@ pub(crate) mod host {
     /// `set_counters` and let real paints move `refresh_ms`.
     pub fn refresh_submit_ms() -> u32 {
         POWER.lock().unwrap_or_else(|e| e.into_inner())[4]
+    }
+
+    /// Scripted `esp_reset_reason()` value for the `?rr=` query param.
+    static RESET_REASON: Mutex<u32> = Mutex::new(0);
+
+    pub fn set_reset_reason(v: u32) {
+        *RESET_REASON.lock().unwrap_or_else(|e| e.into_inner()) = v;
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_last_reset_reason() -> u32 {
+        *RESET_REASON.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Any request whose URL contains `suffix` gets `status` + `body`.
