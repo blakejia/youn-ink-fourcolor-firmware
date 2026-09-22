@@ -97,6 +97,7 @@ unsafe extern "C" {
                              http_gets: *mut u32, refresh_ms: *mut u32);
     /// `esp_reset_reason()` at boot (shim.cpp caches it once; Rust only reads).
     pub fn rf_last_reset_reason() -> u32;
+    pub fn rf_battery_sample(mv: *mut u16, pct: *mut u8, charge: *mut u8) -> i32;
 }
 
 /// `abort()`, used by the panic handler.
@@ -385,6 +386,36 @@ pub(crate) mod host {
     pub extern "C" fn rf_last_reset_reason() -> u32 {
         *RESET_REASON.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    // NOTE: host stubs below collide with the C++ rf_battery_sample at firmware link time; Task 2 adds #[cfg(test)]
+    /// Scripted battery sample for the `?v=&p=&c=` query params. `None` = no
+    /// valid reading this cycle (sensor absent, ADC failure, or mains-powered
+    /// skip) — the URL omits the params entirely rather than sending zeros.
+    static BATTERY: Mutex<Option<(u16, u8, u8)>> = Mutex::new(None);
+
+    pub fn set_battery_sample(mv: u16, pct: u8, charge: u8) {
+        *BATTERY.lock().unwrap_or_else(|e| e.into_inner()) = Some((mv, pct, charge));
+    }
+    pub fn set_battery_sample_none() {
+        *BATTERY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_battery_sample(mv: *mut u16, pct: *mut u8, charge: *mut u8) -> i32 {
+        let b = *BATTERY.lock().unwrap_or_else(|e| e.into_inner());
+        match b {
+            Some((m, p, c)) => {
+                unsafe {
+                    if !mv.is_null() { *mv = m; }
+                    if !pct.is_null() { *pct = p; }
+                    if !charge.is_null() { *charge = c; }
+                }
+                1
+            }
+            None => 0,
+        }
+    }
+
 
     /// Any request whose URL contains `suffix` gets `status` + `body`.
     ///

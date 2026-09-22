@@ -172,6 +172,14 @@ fn fetch_schedule(buf: &mut [u8]) -> Option<usize> {
     unsafe { shim::rf_power_counters(&mut c[0], &mut c[1], &mut c[2], &mut c[3], &mut c[4]) };
     let rr = unsafe { shim::rf_last_reset_reason() };
     let _ = write!(path, "?w={}&a={}&r={}&g={}&f={}&rr={}", c[0], c[1], c[2], c[3], c[4], rr);
+
+    let mut b_mv: u16 = 0;
+    let mut b_pct: u8 = 0;
+    let mut b_chg: u8 = 0;
+    if unsafe { shim::rf_battery_sample(&mut b_mv, &mut b_pct, &mut b_chg) } == 1 && b_mv > 0 {
+        let _ = write!(path, "&v={}&p={}&c={}", b_mv, b_pct, b_chg);
+    }
+
     let mut url = CBuf::<320>::new();
     if unsafe { shim::rf_build_endpoint(path.as_ptr(), url.as_mut_ptr(), 320) } == 0 {
         log_w!("PageSync", "cannot build schedule endpoint");
@@ -1666,6 +1674,36 @@ mod tests {
         assert!(gets.iter().any(|c| c.contains("rr=15")),
                 "reset reason (0xf=15) missing from the schedule URL: {gets:?}");
     }
+
+    #[test]
+    fn schedule_url_carries_battery_sample_when_one_exists() {
+        let _g = shim::host::lock();
+        shim::host::set_counters(7, 1234, 567, 2, 890);
+        shim::host::set_reset_reason(3);
+        shim::host::set_battery_sample(3980, 76, 4); // discharging
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        let gets = shim::host::calls_matching("http_get");
+        assert!(gets.iter().any(|c| c.contains("v=3980&p=76&c=4")),
+                "battery sample missing from the schedule URL: {gets:?}");
+    }
+
+    #[test]
+    fn schedule_url_omits_battery_params_when_no_sample() {
+        // mv=0 / 未设样本 = 传感器缺席或缺电读数：缺键而非零值（与 rr 语义一致）。
+        let _g = shim::host::lock();
+        shim::host::set_counters(1, 100, 50, 1, 0);
+        shim::host::set_reset_reason(3);
+        shim::host::set_battery_sample_none();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        let gets = shim::host::calls_matching("http_get");
+        let sched = gets.iter().find(|c| c.contains("/api/pages/schedule?"))
+            .expect("schedule GET");
+        assert!(!sched.contains("v=") && !sched.contains("&p=") && !sched.contains("&c="),
+                "no-sample must omit v/p/c entirely: {sched}");
+    }
+
     #[test]
     fn each_schedule_poll_advances_the_http_get_counter() {
         let _g = shim::host::lock();
