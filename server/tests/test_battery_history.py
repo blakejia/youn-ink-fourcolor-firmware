@@ -164,3 +164,19 @@ def test_power_history_hours_cap_and_default(client):
     r = client.get(f"/api/devices/{DEV}/power-history?hours=99999",
                    headers=_op_headers())
     assert r.status_code == 200  # 超上限钳到 2160，不报错
+
+
+def test_devices_list_carries_power_snapshot(client):
+    """/api/devices must carry each row's power snapshot: the devices page
+    renders the battery badge and the charge-state curve straight from
+    `device.power` — without it the cell is a dash and no curve renders."""
+    _register()
+    assert _get_schedule(
+        client, "?w=1&a=2&r=3&g=4&f=5&v=3980&p=76&c=4"
+    ).status_code == 200
+    r = client.get("/api/devices", headers=_op_headers())
+    assert r.status_code == 200
+    dev = next(d for d in r.json()["devices"] if d["device_id"] == DEV)
+    assert dev["power"]["battery_mv"] == 3980
+    assert dev["power"]["battery_pct"] == 76
+    assert dev["power"]["battery_charge"] == 4

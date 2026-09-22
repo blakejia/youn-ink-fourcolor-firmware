@@ -205,7 +205,21 @@ def create_app() -> FastAPI:
     @app.get("/api/devices")
     async def list_devices(request: Request) -> dict:
         _require_operator(request)
-        return {"devices": [d.__dict__ for d in registry.list_all()]}
+        out = []
+        for d in registry.list_all():
+            item = dict(d.__dict__)
+            # The power snapshot rides the list: the devices page renders the
+            # battery badge and the charge-state curve straight from each
+            # row's `power` (no per-row fetch). Old firmware / no battery
+            # sample yet → power is null or lacks the battery_* keys, and the
+            # cell shows a dash — same absent-means-absent rule as everywhere
+            # else on this path.
+            try:
+                item["power"] = json.loads(registry.get_power_counters(d.device_id) or "null")
+            except ValueError:
+                item["power"] = None
+            out.append(item)
+        return {"devices": out}
 
     @app.post("/api/devices/{device_id}/approve")
     async def approve_device(device_id: str, request: Request) -> dict:
