@@ -139,6 +139,9 @@ class Spec:
     col_span: Optional[int] = None
     row_start: Optional[int] = None
     row_span: Optional[int] = None
+    underline: bool = False
+    strike: bool = False
+    radii: Optional[tuple[int, int, int, int]] = None   # tl tr br bl; None = use radius
     unknown: list[str] = field(default_factory=list)
 
 
@@ -224,6 +227,22 @@ def parse(tw: str, style: dict, path: str) -> Spec:
             v = int(_PX.search(tok).group(1))
             _t, r, _b, l = sp.padding
             sp.padding = (v, r, v, l)
+        elif tok.startswith("pt-["):
+            v = int(_PX.search(tok).group(1))
+            t, r, b, l = sp.padding
+            sp.padding = (v, r, b, l)
+        elif tok.startswith("pr-["):
+            v = int(_PX.search(tok).group(1))
+            t, r, b, l = sp.padding
+            sp.padding = (t, v, b, l)
+        elif tok.startswith("pb-["):
+            v = int(_PX.search(tok).group(1))
+            t, r, b, l = sp.padding
+            sp.padding = (t, r, v, l)
+        elif tok.startswith("pl-["):
+            v = int(_PX.search(tok).group(1))
+            t, r, b, l = sp.padding
+            sp.padding = (t, r, b, v)
         elif tok.startswith("m-["):
             v = int(_PX.search(tok).group(1))
             sp.margin = (v, v, v, v)
@@ -235,6 +254,22 @@ def parse(tw: str, style: dict, path: str) -> Spec:
             v = int(_PX.search(tok).group(1))
             _t, r, _b, l = sp.margin
             sp.margin = (v, r, v, l)
+        elif tok.startswith("mt-["):
+            v = int(_PX.search(tok).group(1))
+            t, r, b, l = sp.margin
+            sp.margin = (v, r, b, l)
+        elif tok.startswith("mr-["):
+            v = int(_PX.search(tok).group(1))
+            t, r, b, l = sp.margin
+            sp.margin = (t, v, b, l)
+        elif tok.startswith("mb-["):
+            v = int(_PX.search(tok).group(1))
+            t, r, b, l = sp.margin
+            sp.margin = (t, r, v, l)
+        elif tok.startswith("ml-["):
+            v = int(_PX.search(tok).group(1))
+            t, r, b, l = sp.margin
+            sp.margin = (t, r, b, v)
         elif tok.startswith("items-"):
             sp.items = ALIGN.get(tok[6:], "stretch")
         elif tok.startswith("self-"):
@@ -247,6 +282,10 @@ def parse(tw: str, style: dict, path: str) -> Spec:
             sp.font_size = int(_PX.search(tok).group(1))
         elif tok == "text-center":
             sp.align = "center"
+        elif tok == "underline":
+            sp.underline = True
+        elif tok == "line-through":
+            sp.strike = True
         elif tok == "text-right":
             sp.align = "right"
         elif tok == "font-bold":
@@ -301,10 +340,24 @@ def parse(tw: str, style: dict, path: str) -> Spec:
     if "backgroundColor" in st:
         sp.bg = color_index(st["backgroundColor"])
     if "borderRadius" in st:
-        sp.radius = _int_of(st["borderRadius"], path + ".style.borderRadius") or 0
-    if "padding" in st:
-        v = _int_of(st["padding"], path + ".style.padding") or 0
-        sp.padding = (v, v, v, v)
+        raw = st["borderRadius"]
+        if isinstance(raw, (list, tuple)) or (isinstance(raw, str) and "," in raw):
+            # Per-corner form: "tl,tr,br,bl" (also accepts a 4-item list).
+            # Kept separate from the scalar path below, whose _int_of would
+            # reject the comma form rather than silently collapsing it.
+            parts = (list(raw) if isinstance(raw, (list, tuple))
+                     else [x.strip() for x in raw.split(",")])
+            if len(parts) == 4:
+                try:
+                    sp.radii = tuple(
+                        int(float(str(x).rstrip("px"))) for x in parts
+                    )  # type: ignore[assignment]
+                except (TypeError, ValueError):
+                    raise RenderError(path, "style.borderRadius 的四角值必须是数字")
+            else:
+                raise RenderError(path, "style.borderRadius 四角形式需要 4 个值")
+        else:
+            sp.radius = _int_of(raw, path + ".style.borderRadius") or 0
     if "paddingX" in st:
         v = _int_of(st["paddingX"], path + ".style.paddingX") or 0
         t, _r, bo, _l = sp.padding
@@ -313,6 +366,13 @@ def parse(tw: str, style: dict, path: str) -> Spec:
         v = _int_of(st["paddingY"], path + ".style.paddingY") or 0
         _t, r, _b, l = sp.padding
         sp.padding = (v, r, v, l)
+    for key, idx in (("paddingTop", 0), ("paddingRight", 1),
+                     ("paddingBottom", 2), ("paddingLeft", 3)):
+        if key in st:
+            v = _int_of(st[key], f"{path}.style.{key}") or 0
+            t, r, b, l = sp.padding
+            sp.padding = (v, r, b, l) if idx == 0 else (
+                t, v, b, l) if idx == 1 else (t, r, v, l) if idx == 2 else (t, r, b, v)
     for key, setter in (("margin", "all"), ("marginX", "x"), ("marginY", "y")):
         if key in st:
             v = _int_of(st[key], f"{path}.style.{key}") or 0
@@ -324,6 +384,13 @@ def parse(tw: str, style: dict, path: str) -> Spec:
             else:
                 _t, r, _b, l = sp.margin
                 sp.margin = (v, r, v, l)
+    for key, idx in (("marginTop", 0), ("marginRight", 1),
+                     ("marginBottom", 2), ("marginLeft", 3)):
+        if key in st:
+            v = _int_of(st[key], f"{path}.style.{key}") or 0
+            t, r, b, l = sp.margin
+            sp.margin = (v, r, b, l) if idx == 0 else (
+                t, v, b, l) if idx == 1 else (t, r, v, l) if idx == 2 else (t, r, b, v)
     if "gap" in st:
         sp.gap = _int_of(st["gap"], path + ".style.gap") or 0
     for key, attr in (("width", "w"), ("height", "h")):
@@ -374,11 +441,19 @@ def parse(tw: str, style: dict, path: str) -> Spec:
     if str(st.get("textOverflow", "")).lower() == "ellipsis":
         # CSS text-overflow:ellipsis. Only meaningful with a line cap and no
         # wrapping: with an explicit lineClamp it applies there; bare, it means
-        # the single-line case (clamp 1 + nowrap), matching `truncate`.
+        # the single-line case (clamp 1 + nowrap), i.e. byte-identical to the
+        # `truncate` token (see test_canvas_text_overflow).
         sp.truncated = True
+        sp.nowrap = True
         if sp.line_clamp is None:
             sp.line_clamp = 1
-            sp.nowrap = True
+    td = str(st.get("textDecoration", "")).lower()
+    if "underline" in td:
+        sp.underline = True
+    if "line-through" in td:
+        sp.strike = True
+    if "none" in td:
+        sp.underline = sp.strike = False
     if str(st.get("whiteSpace", "")).lower() == "nowrap":
         sp.nowrap = True
     if str(st.get("display", "")).lower() == "grid":

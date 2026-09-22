@@ -54,7 +54,9 @@ class CanvasRenderer:
 
         if spec.bg is not None:
             self.painter.fill(box, spec.bg)
-        if spec.radius > 0:
+        if spec.radii is not None:
+            self.painter.clip_corners(box, spec.radii)
+        elif spec.radius > 0:
             self.painter.clip_round(box, spec.radius)
         before = self.painter.surf.copy() if spec.clip else None
 
@@ -69,7 +71,8 @@ class CanvasRenderer:
                                       nowrap=spec.nowrap, max_lines=spec.line_clamp,
                                       ellipsis=spec.truncated,
                                       line_height=spec.line_height,
-                                      letter_spacing=spec.letter_spacing)
+                                      letter_spacing=spec.letter_spacing,
+                                      underline=spec.underline, strike=spec.strike)
                 else:
                     self.render_node(value, child_box, cpath)
 
