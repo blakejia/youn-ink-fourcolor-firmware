@@ -251,6 +251,16 @@ public:
         return ok;
     }
 
+    // Public bridge for the extern "C" battery-telemetry export: ReadBatteryStatus
+    // is private, and the C shim reaches the board only through public methods
+    // (same pattern as ReadBatteryPercentForFactoryTest above).
+    bool ReadBatterySampleForTelemetry(uint16_t* mv, uint8_t* pct) {
+        if (mv == nullptr || pct == nullptr) {
+            return false;
+        }
+        return ReadBatteryStatus(*mv, *pct);
+    }
+
     void SetFactoryLedOverride(bool enabled, bool blink) {
         if (power_ != nullptr) {
             power_->SetFactoryLedOverride(enabled, blink);
@@ -638,7 +648,7 @@ extern "C" bool ZectrixReadBatterySample(uint16_t* mv, uint8_t* pct, uint8_t* ch
     if (s.power_present) return false;
     uint16_t v = 0;
     uint8_t p = 0;
-    if (!board.ReadBatteryStatus(v, p)) return false;
+    if (!board.ReadBatterySampleForTelemetry(&v, &p)) return false;
     *mv = v;
     *pct = p;
     // charge encoding: 0=unknown 1=no-power 2=charging 3=full 4=discharging
