@@ -127,6 +127,23 @@ class DeviceRegistry:
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_device_secrets_token ON device_secrets(token)"
         )
+        # Battery telemetry history (spec 2026-09-22): one row per wake that
+        # carried ?v=&p=&c= on the schedule GET, plus that GET's power-counter
+        # snapshot so adjacent-row deltas explain the discharge rate.
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS battery_history (
+                   device_id TEXT NOT NULL,
+                   ts INTEGER NOT NULL,
+                   mv INTEGER NOT NULL,
+                   pct INTEGER NOT NULL,
+                   charge INTEGER NOT NULL,
+                   wakes INTEGER NOT NULL DEFAULT 0,
+                   awake_ms INTEGER NOT NULL DEFAULT 0,
+                   radio_ms INTEGER NOT NULL DEFAULT 0,
+                   http_gets INTEGER NOT NULL DEFAULT 0,
+                   refresh_submit_ms INTEGER NOT NULL DEFAULT 0,
+                   PRIMARY KEY (device_id, ts)
+               )""")
 
     # ── write ──
     def upsert(
@@ -292,6 +309,32 @@ class DeviceRegistry:
             return row["power_counters"]
         except (IndexError, KeyError):
             return None
+
+    def add_battery_sample(self, device_id: str, ts: int, mv: int, pct: int,
+                           charge: int, counters: dict) -> None:
+        """Append one battery sample; drop out-of-range values silently."""
+        for name, lo, hi in (("mv", 2500, 5000), ("pct", 0, 100), ("charge", 0, 4)):
+            v = {"mv": mv, "pct": pct, "charge": charge}[name]
+            if not (lo <= v <= hi):
+                return
+        c = counters or {}
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO battery_history VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (device_id, ts, mv, pct, charge, c.get("wakes", 0),
+                 c.get("awake_ms", 0), c.get("radio_ms", 0), c.get("http_gets", 0),
+                 c.get("refresh_submit_ms", 0)))
+            self._conn.execute(
+                "DELETE FROM battery_history WHERE device_id = ? AND ts < ?",
+                (device_id, ts - 90 * 86400))
+
+    def battery_history(self, device_id: str, since_ts: int) -> list:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT ts, mv, pct, charge, wakes, awake_ms, radio_ms, http_gets,"
+                " refresh_submit_ms FROM battery_history"
+                " WHERE device_id = ? AND ts >= ? ORDER BY ts", (device_id, since_ts))
+            return [dict(zip([d[0] for d in cur.description], row)) for row in cur.fetchall()]
 
 
     def list_all(self, only_trusted: bool = False) -> list[Device]:
