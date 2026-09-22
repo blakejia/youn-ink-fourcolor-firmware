@@ -173,6 +173,7 @@ export default function Devices() {
                   <th scope="col">最近在线</th>
                   <th scope="col">首次上线</th>
                   <th scope="col">信任</th>
+                  <th scope="col">电量</th>
                   <th scope="col">操作</th>
                 </tr>
               </thead>
@@ -186,6 +187,18 @@ export default function Devices() {
                     <td title={formatTime(d.last_seen)}>{timeAgo(d.last_seen)}</td>
                     <td className="muted" title={formatTime(d.first_seen)}>{formatTime(d.first_seen)}</td>
                     <td><span className={`badge ${d.trust ? 'on' : 'off'}`}>{d.trust ? '已信任' : '未信任'}</span></td>
+                    {(() => {
+                      const p = d.power;
+                      const pct = p && typeof p.battery_pct === 'number' ? p.battery_pct : null;
+                      return pct !== null ? (
+                        <>
+                          <td style={{ fontVariantNumeric: 'tabular-nums', fontSize: 12 }}>
+                            <span title={`${p.battery_mv} mV`}>🔋 {pct}%</span>
+                            <BatterySpark deviceId={d.device_id} />
+                          </td>
+                        </>
+                      ) : <td style={{ fontSize: 12, color: '#aaa' }}>—</td>;
+                    })()}
                     <td>
                       <BusyButton
                         className={d.trust ? 'btn danger' : 'btn'}
@@ -203,6 +216,50 @@ export default function Devices() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function BatterySpark({ deviceId }) {
+  const [pts, setPts] = useState(null);
+  const [hours, setHours] = useState(24);
+  useEffect(() => {
+    let alive = true;
+    api.powerHistory(deviceId, hours)
+      .then(d => alive && setPts(d.points ?? []))
+      .catch(() => alive && setPts([]));
+    return () => { alive = false; };
+  }, [deviceId, hours]);
+  const W = 320, H = 60, PAD = 2;
+  const span = (pts && pts.length > 1) ? pts[pts.length - 1].ts - pts[0].ts : 1;
+  const xy = p => [PAD + (p.ts - pts[0].ts) / span * (W - 2 * PAD),
+                   H - PAD - (p.mv - 3300) / (4200 - 3300) * (H - 2 * PAD)];
+  let segs = [], cur = [];
+  (pts || []).forEach(p => {
+    if (p.charge === 2 || p.charge === 3) { if (cur.length > 1) segs.push(cur); cur = []; }
+    else cur.push(p);
+  });
+  if (cur.length > 1) segs.push(cur);
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 2 }}>
+        <span style={{ fontSize: 11, color: 'var(--color-text-secondary, #666)' }}>电量曲线</span>
+        {[24, 168, 720, 2160].map(h => (
+          <button key={h} onClick={() => setHours(h)}
+                  style={{ fontWeight: h === hours ? 'bold' : 'normal', fontSize: 11, padding: '1px 4px', background: 'none', border: '1px solid #ccc', borderRadius: 3, cursor: 'pointer', color: 'inherit' }}>
+            {h === 24 ? '24h' : h === 168 ? '7d' : h === 720 ? '30d' : '90d'}
+          </button>
+        ))}
+      </div>
+      <svg width={W} height={H} role="img" aria-label="电池电压曲线" style={{ display: 'block' }}>
+        {pts === null && <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="12" fill="#888">加载中…</text>}
+        {pts !== null && pts.length < 2 &&
+          <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="11" fill="#888">暂无数据（新固件生效后逐点累积）</text>}
+        {segs.map((s, i) => (
+          <polyline key={i} fill="none" stroke="#000" strokeWidth="1.5"
+                    points={s.map(p => xy(p).join(',')).join(' ')} />
+        ))}
+      </svg>
     </div>
   );
 }

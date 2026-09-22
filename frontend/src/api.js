@@ -100,4 +100,6 @@ export const api = {
     }
     return res.json();
   },
+  powerHistory: (deviceId, hours = 24) =>
+    request(`/devices/${encodeURIComponent(deviceId)}/power-history?hours=${hours}`),
 };
