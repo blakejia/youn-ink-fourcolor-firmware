@@ -76,11 +76,17 @@ def wrap(text: str, font, max_w: int, nowrap: bool = False,
 
 def clamp(lines: list[str], font, max_w: int, max_lines: Optional[int],
           ellipsis: bool = False, letter_spacing: int = 0) -> list[str]:
-    """行数上限；超出时最后一行加省略号（能放得下才加）。"""
-    if not max_lines or len(lines) <= max_lines:
+    """行数上限；超出时最后一行加省略号（能放得下才加）。
+
+    Also covers the single-line CSS `text-overflow:ellipsis` case: a line that
+    is *wider* than the box (nowrap, or one long unbreakable word) must be cut
+    even when the line count is within `max_lines` — previously `clamp` only
+    looked at the line count, so `truncate` never ellipsized a too-wide line.
+    """
+    if not ellipsis or not max_w:
         return lines
-    kept = lines[:max_lines]
-    if ellipsis:
+    kept = lines[:max_lines] if max_lines else lines
+    if kept and width_of(kept[-1], font, letter_spacing) > max_w:
         last = kept[-1]
         while last and width_of(last + "…", font, letter_spacing) > max_w:
             last = last[:-1]

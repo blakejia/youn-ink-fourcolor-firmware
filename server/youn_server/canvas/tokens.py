@@ -255,8 +255,15 @@ def parse(tw: str, style: dict, path: str) -> Spec:
             m = _INT.search(tok)
             sp.line_clamp = int(m.group(1)) if m else None
         elif tok == "truncate":
+            # Tailwind's truncate = overflow:hidden + text-overflow:ellipsis +
+            # whitespace-nowrap. Without the line cap the ellipsis branch in
+            # text.clamp() was unreachable (`max_lines=None` returns early), so
+            # the token only stopped wrapping and let the text run past the box.
+            # An explicit line-clamp-[N] alongside it wins (checked either order).
             sp.truncated = True
             sp.nowrap = True
+            if sp.line_clamp is None:
+                sp.line_clamp = 1
         elif tok == "whitespace-nowrap":
             sp.nowrap = True
         elif tok.startswith("leading-["):
@@ -364,6 +371,14 @@ def parse(tw: str, style: dict, path: str) -> Spec:
         sp.align = ta if ta in ("center", "right", "left") else sp.align
     if "lineClamp" in st:
         sp.line_clamp = _int_of(st["lineClamp"], path + ".style.lineClamp")
+    if str(st.get("textOverflow", "")).lower() == "ellipsis":
+        # CSS text-overflow:ellipsis. Only meaningful with a line cap and no
+        # wrapping: with an explicit lineClamp it applies there; bare, it means
+        # the single-line case (clamp 1 + nowrap), matching `truncate`.
+        sp.truncated = True
+        if sp.line_clamp is None:
+            sp.line_clamp = 1
+            sp.nowrap = True
     if str(st.get("whiteSpace", "")).lower() == "nowrap":
         sp.nowrap = True
     if str(st.get("display", "")).lower() == "grid":
