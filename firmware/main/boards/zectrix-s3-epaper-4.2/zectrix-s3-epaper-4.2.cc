@@ -629,6 +629,24 @@ extern "C" bool ZectrixReadBatteryPercentForFactoryTest(int* level) {
     auto& board = static_cast<CustomBoard&>(Board::GetInstance());
     return board.ReadBatteryPercentForFactoryTest(level);
 }
+extern "C" bool ZectrixReadBatterySample(uint16_t* mv, uint8_t* pct, uint8_t* charge) {
+    if (mv == nullptr || pct == nullptr || charge == nullptr) return false;
+    auto& board = static_cast<CustomBoard&>(Board::GetInstance());
+    board.RefreshChargeSnapshotForFactoryTest();
+    ChargeStatus::Snapshot s = board.GetChargeSnapshot();
+    // power_present=true: mains/USB attached → no battery telemetry (skip; curve gap is intentional)
+    if (s.power_present) return false;
+    uint16_t v = 0;
+    uint8_t p = 0;
+    if (!board.ReadBatteryStatus(v, p)) return false;
+    *mv = v;
+    *pct = p;
+    // charge encoding: 0=unknown 1=no-power 2=charging 3=full 4=discharging
+    if (s.full)            *charge = 3;  // full takes priority over charging
+    else if (s.charging)   *charge = 2;
+    else                    *charge = 4;  // !power_present && !charging → discharging
+    return true;
+}
 
 extern "C" void ZectrixSetFactoryLedOverride(bool enabled, bool blink) {
     auto& board = static_cast<CustomBoard&>(Board::GetInstance());

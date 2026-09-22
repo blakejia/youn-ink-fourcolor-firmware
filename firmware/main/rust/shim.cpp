@@ -414,6 +414,16 @@ extern "C" uint32_t rf_last_reset_reason(void) {
     }
     return g_last_reset_reason;
 }
+// Forward declaration: ZectrixReadBatterySample is defined in the board .cc
+// and compiled into the firmware, but no header exports it to this TU.
+extern "C" bool ZectrixReadBatterySample(uint16_t* mv, uint8_t* pct, uint8_t* charge);
+
+// Battery telemetry: page_sync rides ?v=&p=&c= on the schedule GET. Values
+// come from the board's ADC + charge snapshot; 0 / false return = no valid
+// reading (mains / no battery / ADC failure), which Rust maps to "omit params".
+extern "C" int rf_battery_sample(uint16_t* mv, uint8_t* pct, uint8_t* charge) {
+    return ZectrixReadBatterySample(mv, pct, charge) ? 1 : 0;
+}
 
 // ───────────────────── device signature (public ABI) ─────────────────────
 
