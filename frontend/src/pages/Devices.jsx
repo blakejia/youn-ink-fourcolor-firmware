@@ -190,10 +190,15 @@ export default function Devices() {
                     {(() => {
                       const p = d.power;
                       const pct = p && typeof p.battery_pct === 'number' ? p.battery_pct : null;
+                      const chg = p && typeof p.battery_charge === 'number' ? p.battery_charge : null;
+                      const chgLabel = chg === 2 ? '充电中' : chg === 3 ? '已充满'
+                        : (chg === 4 || chg === 1) ? '放电中' : chg === 0 ? '状态未知' : null;
+                      const chgColor = chg === 2 ? 'rgb(220,30,30)' : chg === 3 ? '#b8860b' : '#666';
                       return pct !== null ? (
                         <>
                           <td style={{ fontVariantNumeric: 'tabular-nums', fontSize: 12 }}>
                             <span title={`${p.battery_mv} mV`}>🔋 {pct}%</span>
+                            {chgLabel && <span style={{ color: chgColor, marginLeft: 4, fontSize: 11 }}>{chgLabel}</span>}
                             <BatterySpark deviceId={d.device_id} />
                           </td>
                         </>
@@ -234,12 +239,15 @@ function BatterySpark({ deviceId }) {
   const span = (pts && pts.length > 1) ? pts[pts.length - 1].ts - pts[0].ts : 1;
   const xy = p => [PAD + (p.ts - pts[0].ts) / span * (W - 2 * PAD),
                    H - PAD - (p.mv - 3300) / (4200 - 3300) * (H - 2 * PAD)];
+  // Discharge (4/0/1) black, charging (2) palette red, full (3) palette yellow —
+  // segments break on every charge-state change (spec: 充电段着色, 2026-09-22 修订).
+  const chargeColor = c => (c === 2 ? 'rgb(220,30,30)' : c === 3 ? 'rgb(255,215,0)' : '#000');
   let segs = [], cur = [];
   (pts || []).forEach(p => {
-    if (p.charge === 2 || p.charge === 3) { if (cur.length > 1) segs.push(cur); cur = []; }
-    else cur.push(p);
+    if (cur.length && cur[0].charge !== p.charge) { segs.push(cur); cur = []; }
+    cur.push(p);
   });
-  if (cur.length > 1) segs.push(cur);
+  if (cur.length) segs.push(cur);
   return (
     <div style={{ marginTop: 6 }}>
       <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 2 }}>
@@ -250,13 +258,18 @@ function BatterySpark({ deviceId }) {
             {h === 24 ? '24h' : h === 168 ? '7d' : h === 720 ? '30d' : '90d'}
           </button>
         ))}
+        <span style={{ fontSize: 10, color: '#888', marginLeft: 'auto', display: 'inline-flex', gap: 8 }} title="按充电状态着色的电压曲线">
+          <span><span style={{ color: '#000' }}>▬</span> 放电</span>
+          <span><span style={{ color: 'rgb(220,30,30)' }}>▬</span> 充电</span>
+          <span><span style={{ color: 'rgb(255,215,0)' }}>▬</span> 充满</span>
+        </span>
       </div>
       <svg width={W} height={H} role="img" aria-label="电池电压曲线" style={{ display: 'block' }}>
         {pts === null && <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="12" fill="#888">加载中…</text>}
         {pts !== null && pts.length < 2 &&
           <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="11" fill="#888">暂无数据（新固件生效后逐点累积）</text>}
         {segs.map((s, i) => (
-          <polyline key={i} fill="none" stroke="#000" strokeWidth="1.5"
+          <polyline key={i} fill="none" stroke={chargeColor(s[0].charge)} strokeWidth="1.5"
                     points={s.map(p => xy(p).join(',')).join(' ')} />
         ))}
       </svg>

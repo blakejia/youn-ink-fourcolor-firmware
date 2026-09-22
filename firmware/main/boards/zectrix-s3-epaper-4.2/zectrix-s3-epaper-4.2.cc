@@ -644,17 +644,22 @@ extern "C" bool ZectrixReadBatterySample(uint16_t* mv, uint8_t* pct, uint8_t* ch
     auto& board = static_cast<CustomBoard&>(Board::GetInstance());
     board.RefreshChargeSnapshotForFactoryTest();
     ChargeStatus::Snapshot s = board.GetChargeSnapshot();
-    // power_present=true: mains/USB attached → no battery telemetry (skip; curve gap is intentional)
-    if (s.power_present) return false;
+    // No battery installed → the ADC reading is meaningless: no sample at all
+    // (sensor-absent semantics; missing keys on the wire, old rows untouched).
+    if (s.no_battery) return false;
     uint16_t v = 0;
     uint8_t p = 0;
     if (!board.ReadBatterySampleForTelemetry(&v, &p)) return false;
     *mv = v;
     *pct = p;
-    // charge encoding: 0=unknown 1=no-power 2=charging 3=full 4=discharging
-    if (s.full)            *charge = 3;  // full takes priority over charging
+    // charge encoding: 0=unknown 1=no-power 2=charging 3=full 4=discharging.
+    // Mains IS sampled (spec amendment 2026-09-22): charging states only exist
+    // while plugged, and the 3.7→4.2 V charge ramp is worth plotting.
+    // charge_status.cc:66-75 guarantees power_present ⇒ exactly one of
+    // full/charging/no_battery, so the else arm is kNoPower (battery only).
+    if (s.full)            *charge = 3;
     else if (s.charging)   *charge = 2;
-    else                    *charge = 4;  // !power_present && !charging → discharging
+    else                    *charge = 4;
     return true;
 }
 
