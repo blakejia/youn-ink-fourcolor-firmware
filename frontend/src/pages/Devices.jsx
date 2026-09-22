@@ -1,10 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
 import { Banner, BusyButton } from '../ui.jsx';
 import { formatCountdown, formatTime, timeAgo } from '../format.js';
 
 // Charge-state vocabulary shared by the cell badge, the curve colors, the
-// legend and the modal tooltip — one source so they can never disagree.
+// legend and the hover readout — one source so they can never disagree.
 const chargeLabel = c => (c === 2 ? '充电中' : c === 3 ? '已充满'
   : (c === 4 || c === 1) ? '放电中' : c === 0 ? '状态未知' : null);
 const chargeColor = c => (c === 2 ? 'rgb(220,30,30)' : c === 3 ? 'rgb(255,215,0)' : '#000');
@@ -36,7 +36,7 @@ function Segs({ pts, xy, strokeW = 1.5 }) {
 
 function ChargeLegend({ fontSize = 10 }) {
   return (
-    <span style={{ fontSize, color: '#888', display: 'inline-flex', gap: 8 }} title="按充电状态着色的电压曲线">
+    <span style={{ fontSize, color: '#666', display: 'inline-flex', gap: 8 }} title="按充电状态着色的电压曲线">
       <span><span style={{ color: '#000' }}>▬</span> 放电</span>
       <span><span style={{ color: 'rgb(220,30,30)' }}>▬</span> 充电</span>
       <span><span style={{ color: 'rgb(255,215,0)' }}>▬</span> 充满</span>
@@ -237,6 +237,7 @@ export default function Devices() {
                       const chgLabel = chargeLabel(chg);
                       return pct !== null ? (
                         <td
+                          className="bat-cell"
                           style={{ fontVariantNumeric: 'tabular-nums', fontSize: 12, cursor: 'pointer' }}
                           title="点击查看多天电量详情"
                           onClick={() => setDetailDevice(d)}
@@ -295,9 +296,9 @@ function BatterySpark({ deviceId }) {
         <span style={{ marginLeft: 'auto' }}><ChargeLegend /></span>
       </div>
       <svg width={W} height={H} role="img" aria-label="电池电压曲线（24 小时）" style={{ display: 'block' }}>
-        {pts === null && <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="12" fill="#888">加载中…</text>}
+        {pts === null && <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="12" fill="#666">加载中…</text>}
         {pts !== null && pts.length < 2 &&
-          <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="11" fill="#888">暂无数据（新固件生效后逐点累积）</text>}
+          <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="11" fill="#666">暂无数据（新固件生效后逐点累积）</text>}
         {xy && <Segs pts={pts} xy={xy} />}
       </svg>
     </div>
@@ -306,16 +307,19 @@ function BatterySpark({ deviceId }) {
 
 // Modal detail view: big SVG, 24h/7d/30d/90d window switch, hover readout.
 // Follows the ConfirmDialog interaction contract: backdrop click and Escape
-// close it; the × button is the explicit close.
+// close it; the × button is the explicit close. The readout is driven by
+// pointer events (mouse + touch + pen), and keyboard users scrub points with
+// ←/→/Home/End on the focusable chart — hover is never the only path.
 function BatteryDetail({ device, onClose }) {
   const [hours, setHours] = useState(24);
   const [pts, setPts] = useState(null);
-  const [hover, setHover] = useState(null);
+  const [hoverIdx, setHoverIdx] = useState(null);
+  const dialogRef = useRef(null);
   const W = 640, H = 240, PAD = 12;
   useEffect(() => {
     let alive = true;
     setPts(null);
-    setHover(null);
+    setHoverIdx(null);
     api.powerHistory(device.device_id, hours)
       .then(d => alive && setPts(d.points ?? []))
       .catch(() => alive && setPts([]));
@@ -326,59 +330,72 @@ function BatteryDetail({ device, onClose }) {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
+  useEffect(() => { dialogRef.current?.focus(); }, []);
   const p = device.power;
   const pct = p && typeof p.battery_pct === 'number' ? p.battery_pct : null;
   const chg = p && typeof p.battery_charge === 'number' ? p.battery_charge : null;
   const xy = pts && pts.length ? makeXY(pts, W, H, PAD) : null;
-  const onMove = e => {
+  const pick = (clientX, target) => {
     if (!xy) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const fx = (e.clientX - rect.left) / rect.width * W;
-    let best = pts[0], bd = Infinity;
-    for (const q of pts) {
+    const rect = target.getBoundingClientRect();
+    const fx = (clientX - rect.left) / rect.width * W;
+    let bestIdx = 0, bd = Infinity;
+    pts.forEach((q, i) => {
       const dx = Math.abs(xy(q)[0] - fx);
-      if (dx < bd) { bd = dx; best = q; }
-    }
-    setHover(best);
+      if (dx < bd) { bd = dx; bestIdx = i; }
+    });
+    setHoverIdx(bestIdx);
   };
+  const onSvgKey = e => {
+    if (!pts || !pts.length) return;
+    const last = pts.length - 1;
+    const cur = hoverIdx == null ? last : hoverIdx;
+    if (e.key === 'ArrowLeft') { e.preventDefault(); setHoverIdx(Math.max(0, cur - 1)); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); setHoverIdx(Math.min(last, cur + 1)); }
+    else if (e.key === 'Home') { e.preventDefault(); setHoverIdx(0); }
+    else if (e.key === 'End') { e.preventDefault(); setHoverIdx(last); }
+  };
+  const hover = hoverIdx != null && pts && pts[hoverIdx] ? pts[hoverIdx] : null;
   return (
     <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="modal" role="dialog" aria-modal="true"
+      <div className="modal" role="dialog" aria-modal="true" tabIndex={-1} ref={dialogRef}
            aria-label={`${device.device_id} 电量详情`} style={{ width: 'max-content', maxWidth: '95vw' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <h2 className="modal-title" style={{ margin: 0 }}>电量详情 · {device.device_id}</h2>
           {pct !== null && <span style={{ fontSize: 13 }}>🔋 {pct}%</span>}
           {chargeLabel(chg) && <span style={{ fontSize: 13, color: chargeBadgeColor(chg) }}>{chargeLabel(chg)}</span>}
-          <button type="button" onClick={onClose} aria-label="关闭"
-                  autoFocus
-                  style={{ marginLeft: 'auto', background: 'none', border: 'none', fontSize: 22, cursor: 'pointer', lineHeight: 1, padding: '0 4px', color: 'inherit' }}>
-            ×
-          </button>
+          <button type="button" className="spark-close" onClick={onClose} aria-label="关闭">×</button>
         </div>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', margin: '10px 0 6px' }}>
           {[24, 168, 720, 2160].map(h => (
-            <button key={h} onClick={() => setHours(h)}
-                    style={{ fontWeight: h === hours ? 'bold' : 'normal', fontSize: 12, padding: '2px 8px', background: 'none', border: '1px solid #ccc', borderRadius: 3, cursor: 'pointer', color: 'inherit' }}>
+            <button key={h} className="spark-win" aria-pressed={h === hours} onClick={() => setHours(h)}>
               {h === 24 ? '24h' : h === 168 ? '7d' : h === 720 ? '30d' : '90d'}
             </button>
           ))}
           <span style={{ marginLeft: 'auto' }}><ChargeLegend fontSize={11} /></span>
         </div>
-        <svg width={W} height={H} role="img" aria-label={`${device.device_id} 电压曲线`}
-             style={{ display: 'block', background: '#fff', border: '1px solid #eee' }}
-             onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
-          {pts === null && <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="14" fill="#888">加载中…</text>}
+        <div className="spark-readout" role="status" aria-live="polite">
+          {hover
+            ? `${formatTime(hover.ts)} · ${hover.mv} mV · ${hover.pct}% · ${chargeLabel(hover.charge) ?? '—'}`
+            : '悬停、拖动或用 ←/→ 键查看各点读数'}
+        </div>
+        <svg width={W} height={H} role="img" aria-label={`${device.device_id} 电压曲线，可用方向键查看各点`}
+             tabIndex={0} onKeyDown={onSvgKey}
+             onPointerMove={(e) => pick(e.clientX, e.currentTarget)}
+             onPointerDown={(e) => pick(e.clientX, e.currentTarget)}
+             onPointerLeave={() => setHoverIdx(null)}
+             style={{ display: 'block', background: 'var(--color-surface)', border: '1px solid var(--color-border)',
+                      cursor: 'crosshair', touchAction: 'pan-y' }}>
+          {pts === null && <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="14" fill="#666">加载中…</text>}
           {pts !== null && pts.length < 2 &&
-            <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="13" fill="#888">暂无数据（新固件生效后逐点累积）</text>}
+            <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="13" fill="#666">暂无数据（新固件生效后逐点累积）</text>}
           {xy && <Segs pts={pts} xy={xy} strokeW={2} />}
           {xy && hover && (
             <g>
-              <rect x={PAD} y={2} width={W - 2 * PAD} height={18} fill="rgba(255,255,255,0.92)" />
-              <text x={PAD + 4} y={15} fontSize="12" fill="#333">
-                {`${formatTime(hover.ts)} · ${hover.mv} mV · ${hover.pct}% · ${chargeLabel(hover.charge) ?? '—'}`}
-              </text>
+              <line x1={xy(hover)[0]} y1={PAD} x2={xy(hover)[0]} y2={H - PAD}
+                    stroke="#999" strokeWidth={1} strokeDasharray="3 3" />
               <circle cx={xy(hover)[0]} cy={xy(hover)[1]} r={4}
-                      fill={chargeColor(hover.charge)} stroke="#fff" strokeWidth={1.5} />
+                      fill={chargeColor(hover.charge)} stroke="var(--color-surface)" strokeWidth={1.5} />
             </g>
           )}
         </svg>

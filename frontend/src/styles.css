@@ -260,3 +260,38 @@ pre { white-space: pre-wrap; word-break: break-all; }
     scroll-behavior: auto !important;
   }
 }
+
+/* ─── Battery spark & detail controls ─── */
+.bat-cell { touch-action: manipulation; }
+.spark-win {
+  font-size: 12px;
+  padding: 3px 10px;
+  background: none;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  cursor: pointer;
+  color: inherit;
+  touch-action: manipulation;
+}
+.spark-win:hover { border-color: var(--color-text); }
+.spark-win[aria-pressed="true"] { font-weight: 700; border-color: var(--color-text); }
+.spark-close {
+  margin-left: auto;
+  background: none;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  padding: 0 6px;
+  cursor: pointer;
+  color: inherit;
+  border-radius: 4px;
+  touch-action: manipulation;
+}
+.spark-close:hover { background: rgba(127, 127, 127, .18); }
+.spark-readout {
+  min-height: 18px;
+  margin-bottom: 2px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+}
