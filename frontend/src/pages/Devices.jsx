@@ -366,6 +366,25 @@ function BatteryDetail({ device, onClose }) {
           {chargeLabel(chg) && <span style={{ fontSize: 13, color: chargeBadgeColor(chg) }}>{chargeLabel(chg)}</span>}
           <button type="button" className="spark-close" onClick={onClose} aria-label="关闭">×</button>
         </div>
+        {p && (
+          <dl className="spark-stats">
+            <div><dt>唤醒次数</dt><dd>{p.wakes ?? '—'}</dd></div>
+            <div><dt>醒着时长</dt><dd>{p.awake_ms != null ? `${(p.awake_ms / 1000).toFixed(1)} 秒` : '—'}</dd></div>
+            <div><dt>radio 时长</dt><dd>{p.radio_ms != null ? `${(p.radio_ms / 1000).toFixed(1)} 秒` : '—'}</dd></div>
+            <div><dt>HTTP 请求</dt><dd>{p.http_gets ?? '—'}</dd></div>
+            <div><dt>刷屏提交</dt><dd>{p.refresh_submit_ms != null ? `${(p.refresh_submit_ms / 1000).toFixed(1)} 秒` : '—'}</dd></div>
+            <div>
+              <dt>上次重启</dt>
+              <dd>
+                <span className={`badge ${p.reset_reason === 3 || p.reset_reason === 9 || p.reset_reason === 8 ? 'off' : 'on'}`}>
+                  {p.reset_reason === 11 ? 'USB（刷机）' : p.reset_reason === 9 ? '欠压复位'
+                    : p.reset_reason === 8 ? '看门狗' : p.reset_reason === 3 ? '软件重启'
+                    : p.reset_reason === 5 ? '深睡唤醒' : p.reset_reason === 1 ? '上电' : '未知'}
+                </span>
+              </dd>
+            </div>
+          </dl>
+        )}
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', margin: '10px 0 6px' }}>
           {[24, 168, 720, 2160].map(h => (
             <button key={h} className="spark-win" aria-pressed={h === hours} onClick={() => setHours(h)}>
