@@ -563,7 +563,7 @@ def create_app() -> FastAPI:
             v, p, c = int(qp["v"]), int(qp["p"]), int(qp["c"])
         except (KeyError, TypeError, ValueError):
             v = 0
-        if v:
+        if v and 2500 <= v <= 5000 and 0 <= p <= 100 and 0 <= c <= 4:
             registry.add_battery_sample(dev.device_id, int(time.time()), v, p, c, power)
             power["battery_mv"], power["battery_pct"], power["battery_charge"] = v, p, c
             try:

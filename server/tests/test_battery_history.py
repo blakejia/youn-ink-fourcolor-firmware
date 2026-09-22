@@ -77,6 +77,10 @@ def test_out_of_range_values_dropped(client):
                 "?v=3900&p=50&c=9"):
         assert _get_schedule(client, bad).status_code == 200
     assert registry.battery_history(DEV, since_ts=now - 60) == []
+    snap = json.loads(registry.get_power_counters(DEV))
+    assert "battery_mv" not in snap
+    assert "battery_pct" not in snap
+    assert "battery_charge" not in snap
 
 
 def test_purge_drops_rows_older_than_90_days(client):
