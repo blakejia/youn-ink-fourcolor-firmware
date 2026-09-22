@@ -97,9 +97,12 @@ class Spec:
     wrap: bool = False
     items: str = "stretch"
     self_align: str = "auto"
+    justify_items: str = "stretch"          # grid: inline-axis child alignment
     content: str = "flex-start"
     justify: str = "flex-start"
     gap: int = 0
+    gap_x: Optional[int] = None             # None = fall back to gap
+    gap_y: Optional[int] = None
     padding: tuple[int, int, int, int] = (0, 0, 0, 0)     # t r b l
     margin: tuple[int, int, int, int] = (0, 0, 0, 0)
     width: Optional[int] = None
@@ -214,6 +217,10 @@ def parse(tw: str, style: dict, path: str) -> Spec:
         elif tok.startswith("flex-basis-["):
             m = _PX.search(tok)
             sp.basis = int(m.group(1)) if m else None
+        elif tok.startswith("gap-x-["):
+            sp.gap_x = int(_PX.search(tok).group(1)) if _PX.search(tok) else None
+        elif tok.startswith("gap-y-["):
+            sp.gap_y = int(_PX.search(tok).group(1)) if _PX.search(tok) else None
         elif tok.startswith("gap-["):
             sp.gap = int(_PX.search(tok).group(1)) if _PX.search(tok) else 0
         elif tok.startswith("p-["):
@@ -276,6 +283,8 @@ def parse(tw: str, style: dict, path: str) -> Spec:
             sp.self_align = ALIGN.get(tok[5:], "auto")
         elif tok.startswith("content-"):
             sp.content = ALIGN.get(tok[8:], "flex-start")
+        elif tok.startswith("justify-items-"):
+            sp.justify_items = ALIGN.get(tok[14:], "stretch")
         elif tok.startswith("justify-"):
             sp.justify = ALIGN.get(tok[8:], "flex-start")
         elif tok.startswith("text-[") and tok.endswith("px]"):
@@ -393,6 +402,12 @@ def parse(tw: str, style: dict, path: str) -> Spec:
                 t, v, b, l) if idx == 1 else (t, r, v, l) if idx == 2 else (t, r, b, v)
     if "gap" in st:
         sp.gap = _int_of(st["gap"], path + ".style.gap") or 0
+    if "rowGap" in st:
+        sp.gap_y = _int_of(st["rowGap"], path + ".style.rowGap")
+    if "columnGap" in st:
+        sp.gap_x = _int_of(st["columnGap"], path + ".style.columnGap")
+    if "justifyItems" in st:
+        sp.justify_items = ALIGN.get(str(st["justifyItems"]).lower(), "stretch")
     for key, attr in (("width", "w"), ("height", "h")):
         if key in st:
             pct = _pct_of(st[key])

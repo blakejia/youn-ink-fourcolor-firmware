@@ -31,6 +31,26 @@ AXIS = {
     "column": {"main": 4, "cross": 3, "m_start": 7, "m_end": 8, "c_start": 5, "c_end": 6},
 }
 
+def gap_x(spec) -> int:
+    """列/水平间距：gap-x- 令牌或 style.columnGap 优先，否则回落 gap。"""
+    return spec.gap if spec.gap_x is None else spec.gap_x
+
+
+def gap_y(spec) -> int:
+    """行/垂直间距：gap-y- 令牌或 style.rowGap 优先，否则回落 gap。"""
+    return spec.gap if spec.gap_y is None else spec.gap_y
+
+
+def gap_main(spec) -> int:
+    """主轴间距（条目之间）：row 方向是水平，column 方向是垂直。"""
+    return gap_x(spec) if spec.direction == "row" else gap_y(spec)
+
+
+def gap_cross(spec) -> int:
+    """副轴间距（换行后的行与行之间）：与 gap_main 互补。"""
+    return gap_y(spec) if spec.direction == "row" else gap_x(spec)
+
+
 
 def clear_specs() -> None:
     _SPECS.clear()
@@ -128,7 +148,7 @@ def _split_lines(entries: list, spec: Spec, avail_main: int, ax: dict) -> list[l
     lines, cur, used = [], [], 0
     for e in entries:
         need = e[ax["main"]] + e[ax["m_start"]] + e[ax["m_end"]]
-        extra = spec.gap if cur else 0
+        extra = gap_main(spec) if cur else 0
         if cur and used + extra + need > avail_main:
             lines.append(cur)
             cur, used = [], 0
@@ -147,7 +167,7 @@ def _resolve_main(entries: list, spec: Spec, avail_main: int, ax: dict) -> list[
 
     def used():
         return (sum(bases) + sum(e[ax["m_start"]] + e[ax["m_end"]] for e in entries)
-                + spec.gap * max(0, len(entries) - 1))
+                + gap_main(spec) * max(0, len(entries) - 1))
 
     free = avail_main - used()
     if free > 0:
@@ -197,14 +217,14 @@ def measure(node, avail_w: int, avail_h: int, path: str) -> tuple[int, int]:
     lines = _split_lines(entries, spec, inner_w if spec.direction == "row" else inner_h, ax)
 
     if spec.direction == "row":
-        cw = max((sum(e[3] + e[5] + e[6] for e in ln) + spec.gap * max(0, len(ln) - 1)
+        cw = max((sum(e[3] + e[5] + e[6] for e in ln) + gap_x(spec) * max(0, len(ln) - 1)
                   for ln in lines), default=0)
         ch = sum(max((e[4] + e[7] + e[8] for e in ln), default=0) for ln in lines) \
-            + spec.gap * max(0, len(lines) - 1)
+            + gap_cross(spec) * max(0, len(lines) - 1)
     else:
         cw = max((e[3] + e[5] + e[6] for ln in lines for e in ln), default=0)
         ch = sum(e[4] + e[7] + e[8] for ln in lines for e in ln) \
-            + spec.gap * max(0, len(entries) - 1)
+            + gap_main(spec) * max(0, len(entries) - 1)
 
     out_w = w if w_exp else cw + pl + pr
     out_h = h if h_exp else ch + pt + pb
@@ -239,7 +259,7 @@ def _place_line(entries: list, spec: Spec, ax: dict, avail_main: int, cross_size
                 origin_main: int, origin_cross: int, out: list) -> None:
     bases = _resolve_main(entries, spec, avail_main, ax)
     used = (sum(bases) + sum(e[ax["m_start"]] + e[ax["m_end"]] for e in entries)
-            + spec.gap * max(0, len(entries) - 1))
+            + gap_main(spec) * max(0, len(entries) - 1))
     pos, step = _justify(spec.justify, origin_main, avail_main, used, len(entries))
     for i, e in enumerate(entries):
         kid, text, ksp = e[0], e[1], e[2]
@@ -268,7 +288,7 @@ def _place_line(entries: list, spec: Spec, ax: dict, avail_main: int, cross_size
             box = Box(int(origin_cross + e[ax["c_start"]] + off), int(pos),
                       int(cross), int(main))
         out.append(("node", kid, box, e[9]))
-        pos += main + e[ax["m_end"]] + spec.gap + (step if i < len(entries) - 1 else 0)
+        pos += main + e[ax["m_end"]] + gap_main(spec) + (step if i < len(entries) - 1 else 0)
 
 
 def place(node, box: Box, path: str) -> list[tuple[str, object, object, str]]:
@@ -299,7 +319,7 @@ def place(node, box: Box, path: str) -> list[tuple[str, object, object, str]]:
     for ln in lines:
         line_cross.append(max((e[4] + e[7] + e[8] for e in ln), default=0) if row
                           else max((e[3] + e[5] + e[6] for e in ln), default=0))
-    total_cross = sum(line_cross) + spec.gap * max(0, len(lines) - 1)
+    total_cross = sum(line_cross) + gap_cross(spec) * max(0, len(lines) - 1)
 
     # align-content：多行时在 cross 轴分配；单行时交给 _place_line 的 align-items
     origin_cross = inner.y if row else inner.x
@@ -316,7 +336,7 @@ def place(node, box: Box, path: str) -> list[tuple[str, object, object, str]]:
                         inner.x, int(cursor), out)
         else:
             _place_line(ln, spec, ax, avail_main, cross_size, inner.y, int(cursor), out)
-        cursor += line_cross[idx] + spec.gap + cstep
+        cursor += line_cross[idx] + gap_cross(spec) + cstep
 
     # 文字统一在父内容盒里绘制（对齐/折行相对父盒）
     return [("text", v, inner, p) if k == "text" else (k, v, b, p) for (k, v, b, p) in out]

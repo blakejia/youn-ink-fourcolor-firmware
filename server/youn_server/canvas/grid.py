@@ -125,7 +125,8 @@ def layout(node, spec, inner, entries, measure_child,
     entries: (kid, text, ksp, w, h, ml, mr, mt, mb, cpath)
     measure_child(idx, avail_w, avail_h, cpath) → (w, h)
     """
-    gap = spec.gap
+    gap_x = spec.gap_x if spec.gap_x is not None else spec.gap
+    gap_y = spec.gap_y if spec.gap_y is not None else spec.gap
     cols = parse_tracks(spec.grid_cols) or [Track("fr", 1.0)]
     ncols = len(cols)
     col_span_of = [((e[2].col_span if e[2] else None) or 1) for e in entries]
@@ -191,10 +192,10 @@ def layout(node, spec, inner, entries, measure_child,
     # 内容高 24/60 的行拉成 122/158。
     definite_w = inner.w if (definite[0] and inner.w) else None
     definite_h = inner.h if (definite[1] and inner.h) else None
-    col_sizes = resolve(cols, definite_w, col_content, gap)
-    row_sizes = resolve(rows, definite_h, row_content, gap)
-    xs = _offsets(col_sizes, gap, inner.x)
-    ys = _offsets(row_sizes, gap, inner.y)
+    col_sizes = resolve(cols, definite_w, col_content, gap_x)
+    row_sizes = resolve(rows, definite_h, row_content, gap_y)
+    xs = _offsets(col_sizes, gap_x, inner.x)
+    ys = _offsets(row_sizes, gap_y, inner.y)
 
     out = []
     for i, (cr, cc) in enumerate(cells):
@@ -203,8 +204,8 @@ def layout(node, spec, inner, entries, measure_child,
         sr = ((ksp.row_span if ksp else None) or 1)
         sc = col_span_of[i]
         cell_x, cell_y = xs[cc], ys[cr]
-        cell_w = sum(col_sizes[cc:cc + sc]) + gap * (sc - 1)
-        cell_h = sum(row_sizes[cr:cr + sr]) + gap * (sr - 1)
+        cell_w = sum(col_sizes[cc:cc + sc]) + gap_x * (sc - 1)
+        cell_h = sum(row_sizes[cr:cr + sr]) + gap_y * (sr - 1)
 
         # 条目在轨道内的尺寸与对齐（CSS：显式尺寸优先；否则行内轴 stretch、
         # 块轴按 align-self/items 拉伸或居中）—— 含 margin 内缩。
@@ -225,8 +226,16 @@ def layout(node, spec, inner, entries, measure_child,
             off_y = max(0, (avail_h - h) // 2)
         elif align == "flex-end":
             off_y = max(0, avail_h - h)
-        out.append((e, int(cell_x + ml), int(cell_y + mt + off_y), int(w), int(h)))
+        # 行内轴：justify-items（默认 stretch 已体现在 w=avail_w 上）。
+        ji = spec.justify_items
+        off_x = 0
+        if ji == "center":
+            off_x = max(0, (avail_w - w) // 2)
+        elif ji == "flex-end":
+            off_x = max(0, avail_w - w)
+        out.append((e, int(cell_x + ml + off_x), int(cell_y + mt + off_y),
+                    int(w), int(h)))
 
-    content_w = sum(col_sizes) + gap * max(0, ncols - 1)
-    content_h = sum(row_sizes) + gap * max(0, nrows - 1)
+    content_w = sum(col_sizes) + gap_x * max(0, ncols - 1)
+    content_h = sum(row_sizes) + gap_y * max(0, nrows - 1)
     return out, content_w, content_h
