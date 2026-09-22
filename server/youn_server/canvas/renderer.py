@@ -65,14 +65,15 @@ class CanvasRenderer:
             for kind, value, child_box, cpath in place(node, box, path):
                 if kind == "text":
                     self._bound(cpath, "text", child_box, str(value))
-                    self.painter.text(str(value), spec.font_size, spec.bold,
+                    self.painter.text(str(value), spec.font_size, spec.weight,
                                       spec.align, child_box,
                                       spec.color if spec.color is not None else IDX_BLACK,
                                       nowrap=spec.nowrap, max_lines=spec.line_clamp,
                                       ellipsis=spec.truncated,
                                       line_height=spec.line_height,
                                       letter_spacing=spec.letter_spacing,
-                                      underline=spec.underline, strike=spec.strike)
+                                      underline=spec.underline, strike=spec.strike,
+                                      vertical=spec.vertical)
                 else:
                     self.render_node(value, child_box, cpath)
 

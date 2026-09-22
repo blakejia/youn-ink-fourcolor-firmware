@@ -110,11 +110,34 @@ def resolve(tracks: list[Track], total: Optional[int], content: list[int],
     return sizes
 
 
-def _offsets(sizes: list[int], gap: int, origin: int) -> list[int]:
-    xs, cur = [], origin
+def _axis_offsets(sizes: list[int], gap: int, origin: int,
+                   total: Optional[int], mode: str) -> list[int]:
+    """轨道在自由空间里的分布（CSS justify-content / align-content 语义）。
+
+    total=None（轴不确定）或 free<=0（fr/auto 已吃满）都退化为贴原点，
+    与 flex 的 _justify 同一套模式词：center / flex-end / space-*
+    （start 与 space-* 单轨等价于 start）。
+    """
+    used = sum(sizes) + gap * max(0, len(sizes) - 1)
+    free = max(0, (total - used) if total is not None else 0)
+    start, extra = origin, 0.0
+    if mode == "center":
+        start = origin + free // 2
+    elif mode in ("flex-end", "end"):
+        start = origin + free
+    elif mode == "space-between" and len(sizes) > 1:
+        extra = free / (len(sizes) - 1)
+    elif mode == "space-around" and sizes:
+        step = free / len(sizes)
+        start, extra = origin + int(step / 2), step
+    elif mode == "space-evenly" and sizes:
+        step = free / (len(sizes) + 1)
+        start, extra = origin + int(step), step
+    xs: list[int] = []
+    cur = float(start)
     for i, s in enumerate(sizes):
-        xs.append(cur)
-        cur += s + (gap if i < len(sizes) - 1 else 0)
+        xs.append(int(cur))
+        cur += s + gap + (extra if i < len(sizes) - 1 else 0)
     return xs
 
 
@@ -194,8 +217,8 @@ def layout(node, spec, inner, entries, measure_child,
     definite_h = inner.h if (definite[1] and inner.h) else None
     col_sizes = resolve(cols, definite_w, col_content, gap_x)
     row_sizes = resolve(rows, definite_h, row_content, gap_y)
-    xs = _offsets(col_sizes, gap_x, inner.x)
-    ys = _offsets(row_sizes, gap_y, inner.y)
+    xs = _axis_offsets(col_sizes, gap_x, inner.x, definite_w, spec.justify)
+    ys = _axis_offsets(row_sizes, gap_y, inner.y, definite_h, spec.content)
 
     out = []
     for i, (cr, cc) in enumerate(cells):

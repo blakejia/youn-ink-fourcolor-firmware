@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .errors import RenderError
+from .text import resolve_weight
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +26,10 @@ _PILLOW_BG = {0: (0, 0, 0), 1: (255, 255, 255), 2: (255, 215, 0), 3: (220, 30, 3
 ALIGN = {"start": "flex-start", "end": "flex-end", "flex-start": "flex-start",
          "flex-end": "flex-end", "center": "center", "stretch": "stretch",
          "baseline": "baseline", "between": "space-between",
-         "around": "space-around", "evenly": "space-evenly"}
+         "around": "space-around", "evenly": "space-evenly",
+         # CSS style 键的完整拼写（justify-content: "space-between" 等）
+         "space-between": "space-between", "space-around": "space-around",
+         "space-evenly": "space-evenly"}
 
 
 def color_index(value) -> Optional[int]:
@@ -126,7 +130,7 @@ class Spec:
     radius: int = 0
     clip: bool = False
     font_size: int = 16
-    bold: bool = False
+    weight: str = "regular"
     align: str = "left"
     line_clamp: Optional[int] = None
     nowrap: bool = False
@@ -144,6 +148,7 @@ class Spec:
     row_span: Optional[int] = None
     underline: bool = False
     strike: bool = False
+    vertical: bool = False                  # style writingMode == vertical-rl
     radii: Optional[tuple[int, int, int, int]] = None   # tl tr br bl; None = use radius
     unknown: list[str] = field(default_factory=list)
 
@@ -297,8 +302,14 @@ def parse(tw: str, style: dict, path: str) -> Spec:
             sp.strike = True
         elif tok == "text-right":
             sp.align = "right"
-        elif tok == "font-bold":
-            sp.bold = True
+        elif tok.startswith("font-"):
+            # 全字重词（font-medium/black/thin…）；font-bold 走同一解析。
+            # 未知的 font-* 按不认识的令牌告警（font-sans 等字体族不在子集内）。
+            fw = resolve_weight(tok[5:])
+            if fw is None:
+                sp.unknown.append(tok)
+            else:
+                sp.weight = fw
         elif tok.startswith("line-clamp-["):
             m = _INT.search(tok)
             sp.line_clamp = int(m.group(1)) if m else None
@@ -408,6 +419,12 @@ def parse(tw: str, style: dict, path: str) -> Spec:
         sp.gap_x = _int_of(st["columnGap"], path + ".style.columnGap")
     if "justifyItems" in st:
         sp.justify_items = ALIGN.get(str(st["justifyItems"]).lower(), "stretch")
+    if "justifyContent" in st:
+        sp.justify = ALIGN.get(str(st["justifyContent"]).lower(), "flex-start")
+    if "alignContent" in st:
+        sp.content = ALIGN.get(str(st["alignContent"]).lower(), "flex-start")
+    if str(st.get("writingMode", "")).lower() == "vertical-rl":
+        sp.vertical = True
     for key, attr in (("width", "w"), ("height", "h")):
         if key in st:
             pct = _pct_of(st[key])
@@ -445,9 +462,11 @@ def parse(tw: str, style: dict, path: str) -> Spec:
         sp.clip = True
     if "fontSize" in st:
         sp.font_size = _int_of(st["fontSize"], path + ".style.fontSize") or 16
-    if str(st.get("fontWeight", "")).lower() in ("bold", "bolder", "600", "700",
-                                                 "800", "900"):
-        sp.bold = True
+    if "fontWeight" in st:
+        # 无效值按 CSS 忽略（保留 font-* 令牌已设的字重）。
+        fw = resolve_weight(st["fontWeight"])
+        if fw is not None:
+            sp.weight = fw
     if "textAlign" in st:
         ta = str(st["textAlign"]).lower()
         sp.align = ta if ta in ("center", "right", "left") else sp.align

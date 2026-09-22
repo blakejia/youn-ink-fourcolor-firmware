@@ -20,7 +20,7 @@ from typing import Optional
 
 from . import grid as _grid
 from .errors import RenderError
-from .text import fit_box, load_font
+from .text import fit_box, load_font, metrics, width_of
 from .tokens import Spec, parse
 
 _SPECS: dict[int, Spec] = {}
@@ -113,15 +113,6 @@ def _axis(spec: Spec, axis: str, avail: int) -> tuple[Optional[int], bool]:
     return None, False
 
 
-def _text_size(text: str, spec: Spec, max_w: int) -> tuple[int, int]:
-    font = load_font(spec.font_size, spec.bold)
-    w, h, _ = fit_box(text, font, max_w, spec.font_size, nowrap=spec.nowrap,
-                      max_lines=spec.line_clamp, ellipsis=spec.truncated,
-                      line_height=spec.line_height,
-                      letter_spacing=spec.letter_spacing)
-    return w, h
-
-
 def _entries_of(node, spec: Spec, path: str, inner: Box, avail_h: int) -> list:
     kids = children_of(node, path)
     out = []
@@ -141,6 +132,22 @@ def _entries_of(node, spec: Spec, path: str, inner: Box, avail_h: int) -> list:
     return out
 
 
+def _text_size(text: str, spec: Spec, max_w: int) -> tuple[int, int]:
+    font = load_font(spec.font_size, spec.weight)
+    if spec.vertical:
+        # 竖排（vertical-rl）：列宽=行高的水平占位，列高=逐字行进之和；
+        # '\n' 另起一列（rl：新列在左）。与 paint.text 的绘制口径一致。
+        ls = spec.letter_spacing
+        cols = str(text).split("\n")
+        col_w = metrics(font, spec.font_size)
+        height = max((sum(width_of(ch, font) + ls for ch in c) for c in cols),
+                     default=0)
+        return col_w * len(cols), max(1, height)
+    w, h, _ = fit_box(text, font, max_w, spec.font_size, nowrap=spec.nowrap,
+                      max_lines=spec.line_clamp, ellipsis=spec.truncated,
+                      line_height=spec.line_height,
+                      letter_spacing=spec.letter_spacing)
+    return w, h
 def _split_lines(entries: list, spec: Spec, avail_main: int, ax: dict) -> list[list]:
     """按**假想主轴尺寸**切行（flex-wrap）。不换行时永远单行。"""
     if not spec.wrap or spec.direction != "row":

@@ -17,12 +17,58 @@ _DEFAULT = (
 )
 _BOLD = ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",) + _DEFAULT
 
+# 非常规/粗体的字面：Noto CJK 全字重都装在本机（Thin..Black）。常规与粗体
+# 保留上表的历史链（常规首选 SourceHan）—— 旧画布的字节输出逐字不变。
+_FACE_FILES = {
+    "thin": "/usr/share/fonts/opentype/noto/NotoSansCJK-Thin.ttc",
+    "light": "/usr/share/fonts/opentype/noto/NotoSansCJK-Light.ttc",
+    "demilight": "/usr/share/fonts/opentype/noto/NotoSansCJK-DemiLight.ttc",
+    "medium": "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+    "black": "/usr/share/fonts/opentype/noto/NotoSansCJK-Black.ttc",
+}
+
+# CSS 字重到可用字面的映射（数字按 CSS font-matching：目标缺失时先向上取）。
+# 本机没有 SemiBold/ExtraBold 的 Noto Sans CJK ⇒ 600→Bold(700)、800→Black(900)。
+_WEIGHT_WORDS = {
+    "100": "thin", "thin": "thin",
+    "200": "light", "extralight": "light", "extra-light": "light",
+    "300": "light", "light": "light",
+    "350": "demilight", "demilight": "demilight", "demi-light": "demilight",
+    "400": "regular", "normal": "regular", "regular": "regular",
+    "500": "medium", "medium": "medium",
+    "600": "bold", "semibold": "bold", "semi-bold": "bold",
+    "700": "bold", "bold": "bold", "bolder": "bold",
+    "800": "black", "extrabold": "black", "extra-bold": "black",
+    "900": "black", "black": "black",
+}
+
+
+def resolve_weight(value) -> Optional[str]:
+    """CSS fontWeight（数值/名/字重词）→ 规范字面名；无法识别返回 None。
+
+    tokens 用 None 把未知词当不认识的令牌告警；style 键用 ``or "regular"``
+    走 CSS 的“无效声明忽略”语义。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):               # 兼容旧 load_font(size, bold)
+        return "bold" if value else "regular"
+    return _WEIGHT_WORDS.get(str(value).strip().lower())
+
+
 _CJK = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]")
 
 
-@functools.lru_cache(maxsize=64)
-def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    for path in (_BOLD if bold else _DEFAULT):
+@functools.lru_cache(maxsize=128)
+def load_font(size: int, weight: "str | bool" = "regular") -> ImageFont.FreeTypeFont:
+    w = resolve_weight(weight) or "regular"
+    if w == "regular":
+        chain = _DEFAULT
+    elif w == "bold":
+        chain = _BOLD
+    else:
+        chain = (_FACE_FILES[w],) + _DEFAULT
+    for path in chain:
         try:
             return ImageFont.truetype(path, size)
         except OSError:

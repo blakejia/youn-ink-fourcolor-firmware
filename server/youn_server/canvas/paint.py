@@ -5,7 +5,7 @@ from PIL import Image, ImageDraw
 
 from .images import PALETTE_RGB
 from .layout import Box
-from .text import fit_box, load_font, width_of
+from .text import fit_box, load_font, metrics, width_of
 
 
 class Painter:
@@ -79,11 +79,16 @@ class Painter:
             img = img.resize((box.w, box.h), Image.NEAREST)
         self.surf.paste(img, (box.x, box.y))
 
-    def text(self, text: str, size: int, bold: bool, align: str, box: Box,
+    def text(self, text: str, size: int, weight: str, align: str, box: Box,
              color_idx: int, nowrap: bool = False, max_lines=None,
              ellipsis: bool = False, line_height=None, letter_spacing: int = 0,
-             underline: bool = False, strike: bool = False) -> None:
-        font = load_font(size, bold)
+             underline: bool = False, strike: bool = False,
+             vertical: bool = False) -> None:
+        font = load_font(size, weight)
+        if vertical:
+            self._text_vertical(text, size, font, align, box, color_idx,
+                                letter_spacing, underline, strike)
+            return
         _w, _h, lines = fit_box(text, font, box.w, size, nowrap=nowrap,
                                 max_lines=max_lines, ellipsis=ellipsis,
                                 line_height=line_height,
@@ -124,3 +129,42 @@ class Painter:
                         uy = min(box.y + box.h - 1, y + line_h - 1)
                         draw.line([(x0, uy), (x1, uy)],
                                   fill=PALETTE_RGB[color_idx], width=1)
+
+    def _text_vertical(self, text: str, size: int, font, align: str, box: Box,
+                       color_idx: int, letter_spacing: int,
+                       underline: bool, strike: bool) -> None:
+        """竖排（writing-mode: vertical-rl）：列从内容盒右缘起、逐字下行。
+
+        行内轴自上而下 ⇒ text-align 映射到**纵向**：left=上(start)、
+        center=中、right=下(end)。'\\n' 另起一列（rl：新列在左）。
+        西文字符直立堆叠（不做 90° 旋转，见 CAPABILITIES）。装饰线：
+        删除线为列中垂线；下划线在列右侧（CSS 竖排语义）。
+        与 layout._text_size 的竖排测量口径一致（列宽=行高，列高=行进和）。
+        """
+        draw = ImageDraw.Draw(self.surf)
+        draw.fontmode = "1"
+        ls = letter_spacing
+        col_w = metrics(font, size)
+        for ci, seg in enumerate(str(text).split("\n")):
+            x0 = box.x + box.w - col_w * (ci + 1)
+            advances = [width_of(ch, font) + ls for ch in seg]
+            seg_len = sum(advances)
+            if align == "center":
+                y = box.y + max(0, (box.h - seg_len) // 2)
+            elif align == "right":
+                y = box.y + max(0, box.h - seg_len)
+            else:
+                y = box.y
+            y0 = y
+            for ch, adv in zip(seg, advances):
+                draw.text((x0, y), ch, fill=PALETTE_RGB[color_idx], font=font)
+                y += adv
+            if seg_len > 1:
+                if strike and col_w > 0:
+                    sx = x0 + col_w // 2
+                    draw.line([(sx, y0), (sx, y0 + seg_len - 1)],
+                              fill=PALETTE_RGB[color_idx], width=1)
+                if underline and col_w > 2:
+                    ux = min(box.x + box.w - 1, x0 + col_w - 2)
+                    draw.line([(ux, y0), (ux, y0 + seg_len - 1)],
+                              fill=PALETTE_RGB[color_idx], width=1)
