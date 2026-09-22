@@ -107,3 +107,60 @@ def test_snapshot_without_params_has_no_battery_fields(client):
     assert "battery_mv" not in snap
     assert "battery_pct" not in snap
     assert "battery_charge" not in snap
+
+
+# ── power-history endpoint ──────────────────────────────────────────────
+_OP_TOKEN = "op_test_token"
+
+
+@pytest.fixture(autouse=True)
+def _operator_token_for_power_history():
+    """Enable operator auth for power-history tests (conftest clears it)."""
+    import youn_server.config as config_mod
+    orig = config_mod.settings.operator_token
+    config_mod.settings.operator_token = _OP_TOKEN
+    yield
+    config_mod.settings.operator_token = orig
+
+
+def _op_headers() -> dict:
+    return {"X-Operator-Token": _OP_TOKEN}
+
+
+def test_power_history_requires_operator_token(client):
+    """No X-Operator-Token header → 401 when operator token is configured."""
+    r = client.get(f"/api/devices/{DEV}/power-history")
+    assert r.status_code == 401
+
+
+def test_power_history_returns_points_ascending(client):
+    """Points come back sorted by ts ascending; counters preserved."""
+    now = int(time.time())
+    for i, (mv, p) in enumerate([(4000, 90), (3900, 80), (3800, 70)]):
+        registry.add_battery_sample(DEV, now - 300 + i * 60, mv, p, 4,
+                                   {"wakes": i, "awake_ms": 100 * i})
+    r = client.get(f"/api/devices/{DEV}/power-history?hours=1",
+                   headers=_op_headers())
+    assert r.status_code == 200
+    pts = r.json()["points"]
+    assert [p["mv"] for p in pts] == [4000, 3900, 3800]
+    assert pts[0]["awake_ms"] == 0 and pts[2]["awake_ms"] == 200
+
+
+def test_power_history_downsamples_over_500_points(client):
+    """600 raw rows over 12 h → capped at 500 buckets by time-bucket average."""
+    now = int(time.time())
+    for i in range(600):
+        registry.add_battery_sample(DEV, now - 600 * 60 + i * 60,
+                                    4000 - i // 10, 90, 4, {})
+    r = client.get(f"/api/devices/{DEV}/power-history?hours=12",
+                   headers=_op_headers())
+    assert r.status_code == 200
+    assert len(r.json()["points"]) <= 500
+
+
+def test_power_history_hours_cap_and_default(client):
+    """hours=99999 is silently clamped to 2160; returns 200, not 422."""
+    r = client.get(f"/api/devices/{DEV}/power-history?hours=99999",
+                   headers=_op_headers())
+    assert r.status_code == 200  # 超上限钳到 2160，不报错

@@ -221,6 +221,45 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "unknown device")
         return {"device_id": device_id, "trust": False}
 
+    # ── power-history ─────────────────────────────────────────────────
+    def _downsample_battery(points: list, buckets: int) -> list:
+        """Time-bucket average; charge = majority in bucket, counters = bucket-last
+        (keeps deltas monotonic non-decreasing across bucket boundaries)."""
+        span = points[-1]["ts"] - points[0]["ts"] or 1
+        width = span / buckets
+        out, cur, cur_ts = [], [], None
+        for p in points:
+            b = int((p["ts"] - points[0]["ts"]) / width)
+            b = min(b, buckets - 1)  # clamp FP overshoot
+            if cur and b != cur_ts:
+                out.append(_merge_bucket(cur))
+                cur = []
+            cur_ts = b
+            cur.append(p)
+        if cur:
+            out.append(_merge_bucket(cur))
+        return out
+    def _merge_bucket(bucket: list) -> dict:
+        charges = [p["charge"] for p in bucket]
+        charge = max(set(charges), key=charges.count)
+        merged = {"ts": bucket[-1]["ts"], "charge": charge}
+        for k in ("mv", "pct"):
+            merged[k] = round(sum(p[k] for p in bucket) / len(bucket))
+        for k in ("wakes", "awake_ms", "radio_ms", "http_gets", "refresh_submit_ms"):
+            merged[k] = bucket[-1][k]
+        return merged
+
+    @app.get("/api/devices/{device_id}/power-history")
+    async def get_power_history(device_id: str, request: Request,
+                                hours: int = 24) -> dict:
+        _require_operator(request)
+        hours = max(1, min(hours, 2160))
+        since = int(time.time()) - hours * 3600
+        pts = registry.battery_history(device_id, since)
+        if len(pts) > 500:
+            pts = _downsample_battery(pts, 500)
+        return {"points": pts}
+
     # ── device pairing ──
     @app.post("/api/devices/pair-start")
     async def pair_start(body: _PairStartBody, request: Request) -> dict:
