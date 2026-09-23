@@ -79,6 +79,10 @@ public:
     // Cut or restore the audio/amp rail. Boards without audio power control
     // keep the no-op default.
     virtual void SetAudioRail(bool /*on*/) {}
+    // E-ink keeps its image with the rail off; boards that control the EPD
+    // rail via a GPIO override this to cut regulator static draw while the
+    // panel sits in its command deep-sleep (between refreshes / in sleep).
+    virtual void SetEpdRail(bool /*on*/) {}
     // True while a charger/USB is supplying the board (Stage 1 power policy:
     // mains never sleeps). Boards without charger detection keep false.
     virtual bool IsPowerPresent() const { return false; }

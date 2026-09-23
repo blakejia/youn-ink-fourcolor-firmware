@@ -302,6 +302,17 @@ public:
         }
     }
 
+    void SetEpdRail(bool on) override {
+        if (power_ == nullptr) {
+            return;
+        }
+        if (on) {
+            power_->PowerEpdOn();
+        } else {
+            power_->PowerEpdOff();
+        }
+    }
+
 private:
     static int64_t GetNowMs() {
         return esp_timer_get_time() / 1000;
@@ -369,6 +380,20 @@ private:
                                             NFC_PWR_GPIO,
                                             NFC_FD_GPIO,
                                             NFC_FD_ACTIVE_LEVEL);
+        if (!Application::GetInstance().IsQuietBoot()) {
+            BringUpNfc();
+        }
+        // Quiet boot defers BringUpNfc: a duty-cycle wake has no user flow,
+        // and the NFC chip's only consumer is the factory test, which is
+        // interactive-only. The object stays so ZectrixGetNfc() keeps its
+        // contract; the factory NFC step calls BringUpNfc() explicitly, and
+        // ZectrixNfc::Init's compare_exchange keeps a double bring-up a no-op.
+    }
+
+    void BringUpNfc() {
+        if (nfc_ == nullptr) {
+            return;
+        }
         if (!nfc_->Init()) {
             ESP_LOGW(kTag, "NFC init failed");
             nfc_.reset();
@@ -699,12 +724,20 @@ extern "C" bool ZectrixReadBatterySample(uint16_t* mv, uint8_t* pct, uint8_t* ch
 }
 
 // ─── PCF8563 bridges for app/shim (mechanism layer, extern "C") ───
+extern "C" int ZectrixRtcNowEpoch(uint32_t* epoch);  // defined below
 extern "C" void ZectrixRtcArmAwakeWatchdog(uint32_t minutes) {
     RtcPcf8563* rtc = ZectrixGetRtc();
     if (rtc == nullptr || minutes == 0) return;
     time_t now = time(nullptr);
-    if (now < 1577836800) return;  // no wall clock yet: can't form a tm; the
-                                    // policy tick retries every 15-60 s
+    if (now < 1577836800) {
+        // A quiet wake that seeded from the PCF8563 already has a plausible
+        // time(); only a boot where the seed failed (RTC empty/unreachable)
+        // reaches this arm with a 1970 clock — skip then, the policy tick
+        // re-arms every 15-60 s and the seed repairs it via SNTP.
+        uint32_t epoch = 0;
+        if (!ZectrixRtcNowEpoch(&epoch) || epoch < 1577836800) return;
+        now = (time_t)epoch;
+    }
     struct tm target = {};
     time_t at = now + (time_t)minutes * 60;
     localtime_r(&at, &target);

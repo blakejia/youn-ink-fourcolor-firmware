@@ -33,15 +33,27 @@
 #include "shim_power.h"
 #include <nvs.h>
 
+#include <sys/time.h>
+#include <ctime>
 // PCF8563 bridges (board mechanism layer): awake-watchdog arm/disarm, the
 // epoch write-back for SNTP sync, and the boot-side fired flag. Implemented
 // in boards/zectrix-s3-epaper-4.2/zectrix-s3-epaper-4.2.cc.
 extern "C" void ZectrixRtcArmAwakeWatchdog(uint32_t minutes);
 extern "C" void ZectrixRtcDisarmAwakeWatchdog();
 extern "C" void ZectrixRtcSetEpoch(uint32_t epoch);
+extern "C" int ZectrixRtcNowEpoch(uint32_t* epoch);
 extern "C" uint32_t ZectrixAwakeWatchdogFired();
 
-#include <ctime>
+// RTC slow-memory retains this stamp across deep-sleep wakes; it is cleared
+// only by a cold reset/power loss. SNTP's success callback updates it.
+RTC_DATA_ATTR static std::atomic<uint32_t> s_last_sntp_sync_epoch{0};
+extern "C" void rf_sntp_mark_synced(void) {
+    const uint32_t now = (uint32_t)time(nullptr);
+    if (now >= 1577836800) {
+        s_last_sntp_sync_epoch.store(now, std::memory_order_release);
+    }
+}
+
 
 namespace {
 constexpr char kTag[] = "Application";
@@ -152,11 +164,44 @@ void StartSntpClockSyncOnce() {
         // time across power loss — the battery gate's clock fallback and any
         // cold boot then know the time without waiting for SNTP.
         ZectrixRtcSetEpoch((uint32_t)now);
+        // Daily gate (RTC-persisted, see rf_sntp_last_sync): SNTP restarts on
+        // every duty-cycle wake otherwise — DNS + 1-3 NTP round-trips per
+        // wake to re-learn a time the PCF8563 already holds. One resync a day
+        // bounds the RTC drift (~30 ppm ⇒ <3 s/day) without per-wake radio.
+        rf_sntp_mark_synced();
         Application::GetInstance().UpdateStatusBarForUi();
     });
     esp_sntp_init();
     s_started = true;
     ESP_LOGI(kTag, "SNTP started: tz=Asia/Shanghai servers=ntp.aliyun.com,cn.pool.ntp.org,pool.ntp.org");
+}
+
+
+void SeedSystemClockFromRtc() {
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    uint32_t epoch = 0;
+    if (ZectrixRtcNowEpoch(&epoch) && epoch >= 1577836800) {
+        struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
+        if (settimeofday(&tv, nullptr) == 0) {
+            ESP_LOGI(kTag, "System clock seeded from PCF8563: %u", (unsigned)epoch);
+        } else {
+            ESP_LOGW(kTag, "Failed to seed system clock from PCF8563");
+        }
+    } else {
+        ESP_LOGI(kTag, "PCF8563 holds no plausible time; SNTP will seed the clock");
+    }
+}
+
+bool ShouldStartSntpNow() {
+    const time_t now = time(nullptr);
+    if (now < 1577836800) return true;  // no usable RTC seed: SNTP is required
+    const uint32_t last = s_last_sntp_sync_epoch.load(std::memory_order_acquire);
+    if (last < 1577836800) return true;  // first sync since cold boot
+    if (now <= (time_t)last) return true;  // RTC moved backwards: repair it
+    // RTC slow-memory stamp survives deep sleep; refresh only once per day.
+    // At ~30 ppm, PCF8563 drift stays below about 3 seconds per day.
+    return (uint32_t)(now - (time_t)last) >= 24u * 60u * 60u;
 }
 
 std::atomic<bool> s_pairing_started{false};
@@ -314,6 +359,11 @@ void Application::Initialize(bool quiet) {
     // Store before Board::GetInstance(): the board ctor reads IsQuietBoot()
     // to decide the panel bring-up.
     quiet_boot_.store(effective_quiet, std::memory_order_release);
+    // Seed the wall clock from the PCF8563 before anything reads time(): the
+    // battery gate, the awake-watchdog base and pairing tokens all get a
+    // plausible clock on the first tick of a quiet wake (SNTP may not run).
+    // After quiet_boot_ is stored; the board ctor below reads IsQuietBoot().
+    SeedSystemClockFromRtc();
     if (effective_quiet) {
         // Timer-wake duty cycle, not user activity: backdate the idle clock
         // past the grace window so the policy computes the duty-cycle wake
@@ -404,7 +454,6 @@ void Application::Initialize(bool quiet) {
                                                                     : PowerSaveLevel::LOW_POWER);
                 }
                 wifi_connected_.store(true, std::memory_order_release);
-                StartSntpClockSyncOnce();
                 StartServerPairingOnce();
                 // 已配对且配对任务不再运行（如重新配网后）时补一次 SyncIdle：
                 // Connected 此前没有任何跃迁，而 provisioned/ConfigModeExit 会把
@@ -426,7 +475,10 @@ void Application::Initialize(bool quiet) {
                 // cannot cover an arm from this task mid-cycle, and the
                 // running cycle's terminal policy call re-arms anyway.
                 if (!cycle_in_progress_.load(std::memory_order_acquire)) {
-                    RearmPowerTimer(3000);
+                    RearmPowerTimer(250);
+                }
+                if (ShouldStartSntpNow()) {
+                    StartSntpClockSyncOnce();
                 }
                 break;
             case NetworkEvent::Disconnected:
@@ -830,6 +882,10 @@ void Application::RouteInput(uint8_t button, uint8_t gesture) {
 
         case RF_INPUT_ACTION_NOTIFY_FETCH_NEXT:
             notify_request_next();
+            // Re-evaluate promptly: the paint-cut radio stays off during a
+            // normal display busy window, but an active /next pull must restore
+            // it well before the 10 s HTTP timeout (the EPD wave can take 15-25 s).
+            RearmPowerTimer(250);
             return;
 
         case RF_INPUT_ACTION_CANVAS_PREV:
@@ -1180,12 +1236,19 @@ void Application::ServicePowerPolicy() {
     if (!d.sleep) {
         // Paired with StopRadioForPaint above: StopStation() cleared
         // station_active_, so this StartStation() really restarts the driver
-        // (wifi_manager.cc:121-124 early-return no longer fires). Without it
-        // the session would live on with no Wi-Fi — and a paint in this cycle
-        // synchronously marks Display busy, so decide() returns StayAwake{busy}
-        // and this branch is exactly where the device lands. Deep-sleep
-        // reboots clear the flag, so it is only ever consumed here.
-        if (radio_cut_for_paint_) {
+        // (wifi_manager.cc:121-124 early-return no longer fires).
+        //
+        // Lazy restart (screen-lifetime audit 2026-09-23): while the panel is
+        // mid-waveform, busy comes from SleepBusySrc::Display and ordinary
+        // paint needs no radio — the notification and bitmap were fetched
+        // before the pre-paint cut. Keep the cut through the 15-25 s refresh;
+        // after busy clears the policy sleeps on battery or restores Wi-Fi for
+        // mains/grace. Exception: a new notification pull after the cut re-arms
+        // policy at 250 ms, and notify_active lets that pull restore Wi-Fi even
+        // while the panel is busy, before the 10 s HTTP timeout.
+        if (rf_power_should_resume_radio(radio_cut_for_paint_ ? 1 : 0,
+                                         in.busy ? 1 : 0,
+                                         in.notify_active ? 1 : 0) != 0) {
             radio_cut_for_paint_ = false;
             WifiManager::GetInstance().StartStation();
         }
@@ -1217,6 +1280,12 @@ void Application::ServicePowerPolicy() {
     if (d.invalidate_panel) {
         rf_panel_record_invalidate();
     }
+    // B (screen-lifetime audit 2026-09-23): no-paint wakes leave the EPD rail
+    // energized for the whole sleep (boot PowerEpdOn holds GPIO6 high). The
+    // panel itself is in command deep-sleep (0x07) after every refresh; the
+    // draw is regulator static + rail leakage. Cut it here; every paint path
+    // re-inits through EPD_Init -> EPD_PowerOn (idempotent re-drive).
+    Board::GetInstance().SetEpdRail(false);
     // pin2 is the raw CHARGE_DETECT_GPIO level: expect 1 while unplugged
     // (attach drives LOW per charge_status.cc), and mains must read 0 on
     // battery. If the matrix disagrees, the fix is CHARGE_DETECT_PLUG_PULLS_LOW
@@ -1316,6 +1385,7 @@ void Application::EnterManualSleep() {
     if (!Board::GetInstance().IsPowerPresent()) {
         EnableChargerInsertWakeup();
     }
+    Board::GetInstance().SetEpdRail(false);   // same rail cut as the policy sleep
     ZectrixRtcDisarmAwakeWatchdog();  // manual sleep, same disarm as the policy path
     esp_deep_sleep_start();
 }

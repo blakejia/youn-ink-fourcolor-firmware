@@ -38,6 +38,15 @@ fn poll_cap(i: &Inputs) -> u32 {
     cap.min(i.max_sleep_s).max(MIN_SLEEP_S)
 }
 
+/// Whether a paint-cut station may be restored during a panel busy window.
+/// Notify pulls are the sole exception: they hold awake and need the radio
+/// before their bounded HTTP timeout expires.
+pub fn should_resume_radio_after_paint(
+    radio_cut: bool, display_busy: bool, notify_active: bool,
+) -> bool {
+    radio_cut && (!display_busy || notify_active)
+}
+
 pub fn decide(i: &Inputs) -> Action {
     // A device on USB is a development device: keep the console and stay
     // flashable, whatever the schedule says.
@@ -128,6 +137,14 @@ mod tests {
     // in-flight /next pull maps to this same hold — no separate decide() arm
     // is needed, and the stay-awake cannot stick (every fetch_once terminal
     // path leaves FETCHING, so the next re-arm re-evaluates to Sleep).
+
+    #[test]
+    fn active_notification_pull_restores_radio_during_busy_paint() {
+        assert!(!should_resume_radio_after_paint(true, true, false));
+        assert!(should_resume_radio_after_paint(true, true, true));
+        assert!(should_resume_radio_after_paint(true, false, false));
+        assert!(!should_resume_radio_after_paint(false, false, true));
+    }
 
     #[test]
     fn a_busy_panel_or_audio_holds_the_device_awake() {
@@ -267,3 +284,17 @@ pub unsafe extern "C" fn rf_power_decide(inp: *const CInputs, out: *mut CDecisio
         }
     }
 }
+
+/// # Safety
+/// This scalar-only FFI has no pointer preconditions.
+#[unsafe(no_mangle)]
+pub extern "C" fn rf_power_should_resume_radio(
+    radio_cut: u8, display_busy: u8, notify_active: u8,
+) -> u8 {
+    should_resume_radio_after_paint(
+        radio_cut != 0,
+        display_busy != 0,
+        notify_active != 0,
+    ) as u8
+}
+

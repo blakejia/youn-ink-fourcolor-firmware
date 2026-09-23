@@ -532,7 +532,11 @@ void CustomLcdDisplay::refresh_task_loop() {
     };
 
     while (true) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+        // Every producer xTaskNotifyGive()s this task; the timeout is only a
+        // lost-notification fuse. 50 ms made the task wake ~20x/s while idle
+        // (tickless idle is off, so each wake is real); 500 ms bounds the
+        // worst-case fuse latency while cutting idle wakes 10x.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
 
         TickType_t now = xTaskGetTickCount();
 

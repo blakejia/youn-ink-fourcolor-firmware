@@ -140,6 +140,91 @@ pub fn parse_next(body: &[u8]) -> Option<(&[u8], [u8; ID_CAP])> {
     Some((b64, out))
 }
 
+/// Length of the id prefix in a `.bin` /next response: 32 ASCII hex chars.
+pub const BINARY_ID_LEN: usize = 32;
+
+/// Full binary body: id (32 ASCII hex) + bitmap (30000 B 2bpp BWRY).
+pub fn binary_body_len() -> usize {
+    BINARY_ID_LEN + page_sync::PAGE_BITMAP_SIZE
+}
+
+/// Extract the id and raw bitmap from a `.bin` /next response.
+///
+/// Pure, so it is unit-tested on the host. The server writes
+/// `id(32 hex) || bitmap`; a body of any other length is malformed.
+pub fn parse_binary_next(body: &[u8]) -> Option<(&[u8], [u8; ID_CAP])> {
+    if body.len() != binary_body_len() {
+        log_w!(TAG, "binary next body {} bytes, want {}", body.len(), binary_body_len());
+        return None;
+    }
+    let id_bytes = &body[..BINARY_ID_LEN];
+    if core::str::from_utf8(id_bytes).is_err()
+        || !id_bytes.iter().all(|b| b.is_ascii_hexdigit())
+    {
+        log_w!(TAG, "binary next id is not 32 ascii hex chars");
+        return None;
+    }
+    let mut out = [0u8; ID_CAP];
+    out[..BINARY_ID_LEN].copy_from_slice(id_bytes);
+    Some((&body[BINARY_ID_LEN..], out))
+}
+
+/// Apply a `.bin` /next response body (status already checked by caller).
+fn handle_binary_next(body: &[u8], bitmap: *mut u8) -> bool {
+    match parse_binary_next(body) {
+        Some((raw, id)) => {
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(bitmap, page_sync::PAGE_BITMAP_SIZE)
+            };
+            dst.copy_from_slice(raw);
+            store_id(&id);
+            show_bitmap(bitmap);
+            set_state(NOTIFYING);
+            unsafe { shim::rf_timer_start() };
+            log_i!(TAG, "notify {:?} displaying (binary)",
+                   core::str::from_utf8(&id[..BINARY_ID_LEN]).unwrap_or("?"));
+            true
+        }
+        None => false,
+    }
+}
+
+/// JSON `/next` fallback for servers predating `.bin` (404 on the binary
+/// path). Runs its own GET; the caller's `buf` still holds the failed binary
+/// response, so this allocates a fresh one. The fallback shares handle_next
+/// with the original JSON flow so both paths keep one parse/ack semantics.
+fn fetch_json_fallback(device_id: &[u8], bitmap: *mut u8) -> bool {
+    use core::fmt::Write as _;
+    let mut path = CBuf::<96>::new();
+    let _ = write!(
+        path,
+        "/api/notifications/next?device_id={}",
+        core::str::from_utf8(device_id).unwrap_or("")
+    );
+    let mut url = CBuf::<320>::new();
+    if unsafe { shim::rf_build_endpoint(path.as_ptr(), url.as_mut_ptr(), 320) } == 0 {
+        log_w!(TAG, "fallback: cannot build endpoint");
+        return false;
+    }
+    let mut token = CBuf::<80>::new();
+    unsafe { shim::rf_get_token(token.as_mut_ptr(), 80) };
+    let buf = unsafe { shim::rf_alloc(RESPONSE_BUF + 1) };
+    if buf.is_null() {
+        log_e!(TAG, "fallback: alloc failed");
+        return false;
+    }
+    let mut len = (RESPONSE_BUF + 1) as i32;
+    let status = unsafe {
+        shim::rf_http_get(url.as_ptr(), token.as_ptr(), buf as *mut core::ffi::c_char, &mut len,
+                          HTTP_TIMEOUT_MS)
+    };
+    let len = (len.max(0) as usize).min(RESPONSE_BUF + 1);
+    let body = unsafe { core::slice::from_raw_parts(buf, len) };
+    let shown = handle_next(status, body, bitmap);
+    unsafe { shim::rf_free(buf) };
+    shown
+}
+
 /// Decode `b64` straight into the caller's bitmap buffer.
 fn decode_next(b64: &[u8], out_bitmap: *mut u8) -> bool {
     let dst = unsafe { core::slice::from_raw_parts_mut(out_bitmap, page_sync::PAGE_BITMAP_SIZE) };
@@ -234,7 +319,7 @@ fn fetch_once() {
     let mut path = CBuf::<96>::new();
     let _ = write!(
         path,
-        "/api/notifications/next?device_id={}",
+        "/api/notifications/next.bin?device_id={}",
         core::str::from_utf8(device_id.as_bytes()).unwrap_or("")
     );
     let mut url = CBuf::<320>::new();
@@ -271,7 +356,23 @@ fn fetch_once() {
     };
 
     let len = (len.max(0) as usize).min(RESPONSE_BUF + 1);
-    if !handle_next(status, unsafe { core::slice::from_raw_parts(buf, len) }, bitmap) {
+    let body = unsafe { core::slice::from_raw_parts(buf, len) };
+    let shown = match status {
+        200 => handle_binary_next(body, bitmap),
+        204 => {
+            log_i!(TAG, "no pending notification (204, binary)");
+            false
+        }
+        // Older server without /next.bin: fall back to the JSON endpoint so a
+        // firmware newer than its server keeps working (rolling deploy).
+        404 => fetch_json_fallback(device_id.as_bytes(), bitmap),
+        other => {
+            log_w!(TAG, "binary next fetch failed (status={})", other);
+            false
+        }
+    };
+    if !shown && state() == FETCHING {
+        // Neither path moved the state machine to NOTIFYING; reset the guard.
         set_state(IDLE);
     }
 
@@ -540,15 +641,17 @@ mod tests {
         String::from_utf8(out).expect("ascii")
     }
 
-    /// A `/next` response carrying a full-size bitmap tagged with `fill`.
+    /// A `.bin` /next response: id(32 hex, NUL-padded) || bitmap tagged with
+    /// `fill`. Mirrors the server's binary layout the production path parses.
     fn next_body(fill: u8, id: &str) -> Vec<u8> {
-        let bitmap = vec![fill; page_sync::PAGE_BITMAP_SIZE];
-        format!(
-            r#"{{"bitmap_base64":"{}","notification":{{"id":"{}","title":"t"}}}}"#,
-            encode(&bitmap),
-            id
-        )
-        .into_bytes()
+        // The server writes uuid4().hex: exactly 32 lowercase hex chars, no
+        // padding. Short test ids are right-padded with '0' to keep every
+        // byte a valid hex digit (the parser rejects anything else).
+        let mut id_field = [b'0'; BINARY_ID_LEN];
+        id_field[..id.len()].copy_from_slice(id.as_bytes());
+        let mut body = id_field.to_vec();
+        body.resize(BINARY_ID_LEN + page_sync::PAGE_BITMAP_SIZE, fill);
+        body
     }
 
     /// Cold start with the canvas owning the screen, then one scripted pull.
@@ -557,7 +660,7 @@ mod tests {
         reset_for_test();
         shim::host::set_fb();
         let body = next_body(fill, id);
-        shim::host::script_ok("/api/notifications/next", &body);
+        shim::host::script_ok("/api/notifications/next.bin", &body);
         fetch_once();
     }
 
@@ -601,7 +704,7 @@ mod tests {
 
         page_sync::reset_for_test();
         shim::host::set_fb();
-        shim::host::script_ok("/api/notifications/next", &next_body(0x5a, "settle1"));
+        shim::host::script_ok("/api/notifications/next.bin", &next_body(0x5a, "5e771e1"));
         fetch_once();
         assert!(!is_fetching(), "a settled pull clears the guard");
         assert!(is_active(), "a good pull lands on the panel");
@@ -616,7 +719,7 @@ mod tests {
         page_sync::reset_for_test();
         reset_for_test();
         shim::host::set_fb();
-        shim::host::script_get("/api/notifications/next", 204, b"");
+        shim::host::script_get("/api/notifications/next.bin", 204, b"");
 
         request_next();
         assert!(is_fetching());
@@ -631,7 +734,7 @@ mod tests {
         page_sync::reset_for_test();
         reset_for_test();
         shim::host::set_fb();
-        shim::host::script_get("/api/notifications/next", 204, b"");
+        shim::host::script_get("/api/notifications/next.bin", 204, b"");
 
         fetch_once();
 
@@ -655,7 +758,7 @@ mod tests {
             page_sync::reset_for_test();
             reset_for_test();
             shim::host::set_fb();
-            shim::host::script_get("/api/notifications/next", 200, &body);
+            shim::host::script_get("/api/notifications/next.bin", 200, &body);
 
             fetch_once();
 
@@ -678,14 +781,14 @@ mod tests {
             core::ptr::copy_nonoverlapping(body.as_bytes().as_ptr(), block.add(ACK_ID_OFF), body.as_bytes().len());
             *block.add(ACK_ID_OFF + body.as_bytes().len()) = 0;
         }
-        shim::host::script_ok("/api/notifications/deadbeeffeedface/ack", b"{\"status\":\"acked\"}");
+        shim::host::script_ok("/api/notifications/deadbeeffeedface0000000000000000/ack", b"{\"status\":\"acked\"}");
 
         send_ack(block);
 
         let posts = shim::host::calls_matching("http_post");
         assert_eq!(posts.len(), 1, "exactly one ack is sent");
         assert!(
-            posts[0].starts_with("http_post http://host/api/notifications/deadbeeffeedface/ack"),
+            posts[0].starts_with("http_post http://host/api/notifications/deadbeeffeedface0000000000000000/ack"),
             "{}",
             posts[0]
         );
@@ -695,7 +798,7 @@ mod tests {
     #[test]
     fn post_ack_dismisses_whatever_the_ack_does() {
         let _g = shim::host::lock();
-        boot_with(0x5a, "dismissme");
+        boot_with(0x5a, "d15add1d");
 
         unsafe { post_ack(c"reject".as_ptr()) };
 
@@ -717,7 +820,7 @@ mod tests {
     #[test]
     fn the_timeout_dismisses_and_repaints_the_canvas() {
         let _g = shim::host::lock();
-        boot_with(0x5a, "timeoutid");
+        boot_with(0x5a, "71de0a7");
         assert!(is_active());
 
         on_timeout();
@@ -732,7 +835,7 @@ mod tests {
     #[test]
     fn a_quiet_dismiss_leaves_screen_ownership_to_the_caller() {
         let _g = shim::host::lock();
-        boot_with(0x5a, "quietid");
+        boot_with(0x5a, "0a17d1d");
         let refreshes_before = shim::host::refreshes();
 
         dismiss_quiet();
@@ -780,5 +883,58 @@ mod tests {
         let body = format!(r#"{{"bitmap_base64":"AA==","notification":{{"id":"{ok}"}}}}"#);
         assert!(parse_next(body.as_bytes()).is_some());
     }
-}
+    #[test]
+    fn falls_back_to_json_when_server_lacks_binary_endpoint() {
+        let _g = shim::host::lock();
+        page_sync::reset_for_test();
+        reset_for_test();
+        shim::host::set_fb();
+        let bitmap = vec![0x6Bu8; page_sync::PAGE_BITMAP_SIZE];
+        let json = format!(
+            r#"{{"bitmap_base64":"{}","notification":{{"id":"0123456789abcdef0123456789abcdef","title":"t"}}}}"#,
+            encode(&bitmap)
+        );
+        shim::host::script_get("/api/notifications/next.bin", 404, b"not found");
+        shim::host::script_ok("/api/notifications/next?device_id=", json.as_bytes());
 
+        fetch_once();
+
+        assert!(is_active(), "old server's JSON response still displays the notice");
+        assert_eq!(shim::host::fb()[0], 0x6B);
+        let calls = shim::host::calls_matching("http_get");
+        assert_eq!(calls.len(), 2, "binary 404 is followed by exactly one JSON pull");
+        assert!(calls[0].contains("/api/notifications/next.bin?"));
+        assert!(calls[1].contains("/api/notifications/next?"));
+    }
+
+    #[test]
+    fn parses_binary_next_body() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let mut body = id.as_bytes().to_vec();
+        body.resize(BINARY_ID_LEN + page_sync::PAGE_BITMAP_SIZE, 0xA5);
+        let (raw, parsed) = parse_binary_next(&body).expect("parses");
+        assert_eq!(&parsed[..32], id.as_bytes());
+        assert_eq!(parsed[32], 0, "id slot is NUL-terminated in the fixed cap");
+        assert_eq!(raw.len(), page_sync::PAGE_BITMAP_SIZE);
+        assert_eq!(raw[0], 0xA5);
+    }
+
+    #[test]
+    fn rejects_malformed_binary_next_bodies() {
+        let short = vec![b'a'; binary_body_len() - 1];
+        assert!(parse_binary_next(&short).is_none());
+        let long = vec![b'a'; binary_body_len() + 1];
+        assert!(parse_binary_next(&long).is_none());
+        let mut bad = vec![b'z'; BINARY_ID_LEN];
+        bad.resize(binary_body_len(), 0);
+        assert!(parse_binary_next(&bad).is_none());
+        assert!(parse_binary_next(&[]).is_none());
+    }
+
+    #[test]
+    fn binary_layout_matches_server_contract() {
+        assert_eq!(BINARY_ID_LEN, 32);
+        assert_eq!(binary_body_len(), 32 + page_sync::PAGE_BITMAP_SIZE);
+    }
+
+}

@@ -205,3 +205,74 @@ def test_next_rejects_token_mismatch(client, trusted_device):
                     params={"device_id": device_id},
                     headers={"Authorization": f"Bearer {token}"})
     assert r2.status_code == 200
+
+
+def test_next_bin_returns_id_plus_bitmap(client, trusted_device):
+    """200 = id(32B hex ascii) || bitmap(30000B), total 30032 bytes."""
+    device_id, token = trusted_device
+    client.post("/api/notifications",
+                json={"device_id": device_id, "title": "t", "body": "b"},
+                headers={"X-Operator-Token": ""})
+    r = client.get("/api/notifications/next.bin",
+                   params={"device_id": device_id},
+                   headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200
+    body = r.content
+    assert len(body) == 32 + 30000
+    nid = body[:32].decode("ascii")
+    assert len(nid) == 32 and all(c in "0123456789abcdef" for c in nid)
+    # Second pull: queue drained -> 204 (same atomic mark_shown semantics).
+    r2 = client.get("/api/notifications/next.bin",
+                    params={"device_id": device_id},
+                    headers={"Authorization": f"Bearer {token}"})
+    assert r2.status_code == 204
+
+
+def test_next_bin_requires_device_token(client, trusted_device):
+    device_id, _ = trusted_device
+    client.post("/api/notifications",
+                json={"device_id": device_id, "title": "t", "body": "b"},
+                headers={"X-Operator-Token": ""})
+    r = client.get("/api/notifications/next.bin", params={"device_id": device_id})
+    assert r.status_code == 401
+
+
+def test_next_bin_rejects_token_mismatch(client, trusted_device):
+    """Cross-device drain must 401 and leave the queue intact (same rule as
+    the JSON endpoint — one auth boundary, not two)."""
+    device_id, token = trusted_device
+    client.post("/api/notifications",
+                json={"device_id": device_id, "title": "t", "body": "b"},
+                headers={"X-Operator-Token": ""})
+    r = client.get("/api/notifications/next.bin",
+                   params={"device_id": "OTHER-DEVICE"},
+                   headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 401
+    r2 = client.get("/api/notifications/next.bin",
+                    params={"device_id": device_id},
+                    headers={"Authorization": f"Bearer {token}"})
+    assert r2.status_code == 200
+
+
+def test_next_bin_and_json_share_queue_semantics(client, trusted_device):
+    """A pull through either endpoint consumes the same FIFO entry exactly
+    once — the two endpoints are views over one store, not parallel queues."""
+    device_id, token = trusted_device
+    client.post("/api/notifications",
+                json={"device_id": device_id, "title": "t", "body": "b"},
+                headers={"X-Operator-Token": ""})
+    r = client.get("/api/notifications/next",
+                   params={"device_id": device_id},
+                   headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200
+    nid = r.json()["notification"]["id"]
+    # The binary endpoint sees an empty queue afterwards.
+    r2 = client.get("/api/notifications/next.bin",
+                    params={"device_id": device_id},
+                    headers={"Authorization": f"Bearer {token}"})
+    assert r2.status_code == 204
+    # And ack on the id pulled from JSON still works.
+    r3 = client.post(f"/api/notifications/{nid}/ack",
+                     json={"decision": "agree"},
+                     headers={"Authorization": f"Bearer {token}"})
+    assert r3.status_code == 200

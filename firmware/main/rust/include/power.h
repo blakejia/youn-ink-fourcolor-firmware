@@ -42,6 +42,11 @@ typedef struct {
 
 void rf_power_decide(const rf_power_inputs_t* in, rf_power_decision_t* out);
 
+// A paint-cut radio stays off while only the panel is busy. Active notification
+// pulls are the exception: they must reconnect before the fetch timeout.
+uint8_t rf_power_should_resume_radio(uint8_t radio_cut, uint8_t display_busy,
+                                     uint8_t notify_active);
+
 #ifdef __cplusplus
 }
 #endif

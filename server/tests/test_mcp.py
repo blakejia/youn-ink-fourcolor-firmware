@@ -16,13 +16,22 @@ from fastapi.testclient import TestClient
 
 from youn_server.app import create_app
 from youn_server.devices import registry
+from youn_server import notify_store as ns
 
 
 @pytest.fixture()
 def client():
-    app = create_app()
-    with TestClient(app) as c:
-        yield c
+    # notify_store is a process singleton, but isolate_pages_dir changes and
+    # removes settings.data_dir for each test. Drop any prior store (whose
+    # backing temp directory may already be gone) before creating the app, and
+    # clear it again before the next test.
+    ns._store = None
+    try:
+        app = create_app()
+        with TestClient(app) as c:
+            yield c
+    finally:
+        ns._store = None
 
 
 def _mcp_headers(session_id):

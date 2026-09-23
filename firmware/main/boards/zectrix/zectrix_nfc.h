@@ -43,6 +43,7 @@ public:
     bool PowerOn();
     void PowerOff();
     bool IsPowered() const;
+    bool IsInitialized() const { return initialized_.load(std::memory_order_acquire); }
     bool HasField() const;
     void SetFieldCallback(std::function<void(bool)> callback);
 

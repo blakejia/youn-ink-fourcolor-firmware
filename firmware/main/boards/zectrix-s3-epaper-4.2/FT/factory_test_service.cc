@@ -854,6 +854,15 @@ void FactoryTestService::FlowTask() {
         mark_failure_and_wait_poweroff(FactoryTestStep::kNfc, "NFC 设备未初始化");
         return;
     }
+    // Quiet boots defer NFC bring-up (Init is skipped in the board ctor); the
+    // factory flow is interactive-only, so this is its first real Init on such
+    // boots. ZectrixNfc::Init is idempotent (compare_exchange), so interactive
+    // boots that already initialized pay nothing here.
+    if (!nfc->IsInitialized() && !nfc->Init()) {
+        ESP_LOGE(TAG, "factory_test type=nfc state=enter result=FAIL reason=init_failed");
+        mark_failure_and_wait_poweroff(FactoryTestStep::kNfc, "NFC 初始化失败");
+        return;
+    }
 
     bool nfc_write_verified = false;
     esp_err_t last_write_ret = ESP_FAIL;

@@ -452,14 +452,17 @@ def create_app() -> FastAPI:
         n = ns.get_store().enqueue(device_id, title, text, ttl)
         return {"notification": asdict(n)}
 
-    @app.get("/api/notifications/next")
-    async def next_notification(request: Request, device_id: str = Query(...)):
-        dev = _require_device_token(request)
-        if dev.device_id != device_id:
-            raise HTTPException(status_code=401, detail="device mismatch")
+    def _next_notification_payload(device_id: str):
+        """Shared FIFO pull + bitmap render for the JSON and binary endpoints.
+
+        Both endpoints must keep the exact same queue semantics: next_for()
+        marks shown atomically, a render failure marks error and 500s, so a
+        stranded response can never re-offer (device red-line: notifications
+        are never lost). This helper is the single owner of those rules.
+        """
         n = ns.get_store().next_for(device_id)
         if n is None:
-            return Response(status_code=204)
+            return None, None
         try:
             # dither=False：通知是纯文字画布，文字的灰度反锯齿若走
             # Floyd-Steinberg 会被抖成稀疏黑白点（细笔画看着又糊又断）。
@@ -479,8 +482,33 @@ def create_app() -> FastAPI:
         except Exception:
             ns.get_store().mark_error(n.id)
             raise HTTPException(500, "render failed")
+        return n, bitmap
+
+    @app.get("/api/notifications/next")
+    async def next_notification(request: Request, device_id: str = Query(...)):
+        dev = _require_device_token(request)
+        if dev.device_id != device_id:
+            raise HTTPException(status_code=401, detail="device mismatch")
+        n, bitmap = _next_notification_payload(device_id)
+        if n is None:
+            return Response(status_code=204)
         return {"bitmap_base64": base64.b64encode(bitmap).decode("ascii"),
                 "notification": asdict(n)}
+
+    @app.get("/api/notifications/next.bin")
+    async def next_notification_binary(request: Request, device_id: str = Query(...)):
+        """Raw-bytes variant for the firmware pull: 200 = id(32B hex) || bitmap
+        (30000B 2bpp BWRY), 204 = empty queue. Saves the ~33% base64+JSON
+        overhead per notification wake. Same auth and queue semantics as /next
+        (both go through _next_notification_payload)."""
+        dev = _require_device_token(request)
+        if dev.device_id != device_id:
+            raise HTTPException(status_code=401, detail="device mismatch")
+        n, bitmap = _next_notification_payload(device_id)
+        if n is None:
+            return Response(status_code=204)
+        return Response(content=n.id.encode("ascii") + bitmap,
+                        media_type="application/octet-stream")
 
     @app.post("/api/notifications/{nid}/ack")
     async def ack_notification(nid: str, request: Request, body: dict = Body(...)):
