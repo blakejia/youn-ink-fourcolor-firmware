@@ -27,11 +27,32 @@ function makeXY(pts, W, H, PAD) {
                H - PAD - (p.mv - 3300) / (4200 - 3300) * (H - 2 * PAD)];
 }
 
+// The continuous gray base line keeps the curve unbroken across charge-state
+// transitions; the colored segments render on top so the underlying voltage
+// trace stays one connected line (the "gap" between two colored runs is now
+// a visible handoff, not a break).
+function BaseLine({ pts, xy, strokeW = 1.5 }) {
+  if (!pts || pts.length < 2) return null;
+  return (
+    <polyline fill="none" stroke="rgba(0,0,0,0.28)" strokeWidth={strokeW}
+              points={pts.map(p => xy(p).join(',')).join(' ')} />
+  );
+}
+
 function Segs({ pts, xy, strokeW = 1.5 }) {
   return splitSegs(pts).map((s, i) => (
     <polyline key={i} fill="none" stroke={chargeColor(s[0].charge)} strokeWidth={strokeW}
               points={s.map(p => xy(p).join(',')).join(' ')} />
   ));
+}
+
+function Curve({ pts, xy, strokeW = 1.5 }) {
+  return (
+    <>
+      <BaseLine pts={pts} xy={xy} strokeW={strokeW} />
+      <Segs pts={pts} xy={xy} strokeW={strokeW} />
+    </>
+  );
 }
 
 function ChargeLegend({ fontSize = 10 }) {
@@ -299,7 +320,7 @@ function BatterySpark({ deviceId }) {
         {pts === null && <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="12" fill="#666">加载中…</text>}
         {pts !== null && pts.length < 2 &&
           <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="11" fill="#666">暂无数据（新固件生效后逐点累积）</text>}
-        {xy && <Segs pts={pts} xy={xy} />}
+        {xy && <Curve pts={pts} xy={xy} />}
       </svg>
     </div>
   );
@@ -408,7 +429,7 @@ function BatteryDetail({ device, onClose }) {
           {pts === null && <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="14" fill="#666">加载中…</text>}
           {pts !== null && pts.length < 2 &&
             <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="13" fill="#666">暂无数据（新固件生效后逐点累积）</text>}
-          {xy && <Segs pts={pts} xy={xy} strokeW={2} />}
+          {xy && <Curve pts={pts} xy={xy} strokeW={2} />}
           {xy && hover && (
             <g>
               <line x1={xy(hover)[0]} y1={PAD} x2={xy(hover)[0]} y2={H - PAD}
