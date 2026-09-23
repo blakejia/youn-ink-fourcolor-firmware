@@ -4,6 +4,7 @@
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -284,18 +285,28 @@ void CustomLcdDisplay::BringUpPanel() {
     panel_brought_up_ = true;
     ESP_LOGI(TAG, "EPD bring-up");
     EPD_Init();
-    EPD_Clear();
-    memcpy(prev_buffer, buffer, lcd_spi_data.buffer_len);
+    // Screen-lifetime audit (2026-09-23): no EPD_Clear white baseline and no
+    // unconditional first Display here. An e-ink panel keeps its image without
+    // power, so waking must not blank-diff then re-submit identical content —
+    // that white baseline is what turned every USB replug into a forced FULL
+    // refresh of unchanged pixels (white -> same image, diff_ratio >= 30%).
+    // The refresh task owns the first submission; its wake-baseline gate
+    // (reason=="ui" && DEEPSLEEP) decides sync-skip vs a real FULL. Leaving
+    // prev_buffer_synced=false ("baseline unknown") keeps a cold boot on the
+    // normal !synced -> FULL path, so first paint still draws the screen.
+    prev_buffer_synced = false;
 #if CONFIG_ZECTRIX_EPD_4COLOR_BOOT_TEST_PATTERN
+    // Factory test pattern keeps the old blank+submit semantics (compiled out
+    // in production: CONFIG is not set).
+    EPD_Clear();
     if (IsFourColorPanel()) {
         EPD_DisplayFourColorTestPattern();
     } else {
         EPD_Display();
     }
-#else
-    EPD_Display();
-#endif
+    memcpy(prev_buffer, buffer, lcd_spi_data.buffer_len);
     prev_buffer_synced = true;
+#endif
     if (IsFourColorPanel()) {
         last_sample_tick = xTaskGetTickCount();
     }
@@ -587,6 +598,39 @@ void CustomLcdDisplay::refresh_task_loop() {
         memcpy(tx_buf, buffer, lcd_spi_data.buffer_len);
         xSemaphoreGive(dirty_mutex);
         last_sample_tick = xTaskGetTickCount();
+
+        // Wake-baseline gate (screen-lifetime audit 2026-09-23): the first
+        // frame after a deep-sleep wake with a UI rebuild re-renders exactly
+        // what the glass already shows (an e-ink panel cannot change while it
+        // sleeps) while prev_buffer is RAM-lost — the diff would compare
+        // against a stale/unknown baseline and force a FULL refresh of
+        // identical content. That was "plug USB, the page flashes once" for
+        // no reason. Sync the baseline and skip the submission instead;
+        // clock/status-bar deltas that actually differ land as the next real
+        // submission (the minute clock already schedules those). Cold boots
+        // and canvas submissions (reason != "ui") are untouched and still draw.
+        if (!prev_buffer_synced && prev_buffer != nullptr &&
+            last_refresh_reason_ != nullptr &&
+            strcmp(last_refresh_reason_, "ui") == 0 &&
+            esp_reset_reason() == ESP_RST_DEEPSLEEP) {
+            memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
+            prev_buffer_synced = true;
+            stat_skip_nodiff++;
+            maybe_log_stats(last_sample_tick);
+            ESP_LOGI(TAG, "[REFRESH] wake baseline synced; skipping identical ui refresh");
+            bool fire_idle_cb_wake = false;
+            xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+            urgent_refresh = false;
+            refresh_in_progress = false;
+            UpdateDisplayBusyLocked();
+            fire_idle_cb_wake = CheckRefreshIdleLocked();
+            xSemaphoreGive(dirty_mutex);
+            if (fire_idle_cb_wake && on_refresh_idle_) {
+                on_refresh_idle_();
+            }
+            vTaskDelay(1);
+            continue;
+        }
 
         // 统一差异分析：仅统计差异比例
         FrameDiffResult result = analyze_frame_diff(prev_buffer, tx_buf, Width, Height);
