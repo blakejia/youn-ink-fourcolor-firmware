@@ -98,6 +98,11 @@ unsafe extern "C" {
     /// `esp_reset_reason()` at boot (shim.cpp caches it once; Rust only reads).
     pub fn rf_last_reset_reason() -> u32;
     pub fn rf_battery_sample(mv: *mut u16, pct: *mut u8, charge: *mut u8) -> i32;
+    /// One-hour battery-report gate (spec 2026-09-23): peek with
+    /// `rf_battery_due`, arm with `rf_battery_arm` after a real report.
+    /// C++ impl in shim.cpp keeps the stamp in RTC slow memory.
+    pub fn rf_battery_due() -> i32;
+    pub fn rf_battery_arm();
 }
 
 /// `abort()`, used by the panic handler.
@@ -415,6 +420,32 @@ pub(crate) mod host {
     }
     pub fn set_battery_sample_none() {
         *BATTERY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Staged one-hour report-gate state. `DUE` defaults to true, mirroring
+    /// the device's cold-boot RTC stamp (zeroed => report on first wake).
+    static BATTERY_DUE: Mutex<bool> = Mutex::new(true);
+    static BATTERY_ARMED: Mutex<bool> = Mutex::new(false);
+    pub fn set_battery_due(due: bool) {
+        *BATTERY_DUE.lock().unwrap_or_else(|e| e.into_inner()) = due;
+    }
+    pub fn clear_battery_armed() {
+        *BATTERY_ARMED.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    }
+    pub fn battery_armed() -> bool {
+        *BATTERY_ARMED.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_battery_due() -> i32 {
+        *BATTERY_DUE.lock().unwrap_or_else(|e| e.into_inner()) as i32
+    }
+
+    #[cfg(test)]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_battery_arm() {
+        *BATTERY_ARMED.lock().unwrap_or_else(|e| e.into_inner()) = true;
     }
 
     /// Any request whose URL contains `suffix` gets `status` + `body`.

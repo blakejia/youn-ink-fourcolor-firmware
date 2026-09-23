@@ -425,6 +425,27 @@ extern "C" int rf_battery_sample(uint16_t* mv, uint8_t* pct, uint8_t* charge) {
     return ZectrixReadBatterySample(mv, pct, charge) ? 1 : 0;
 }
 
+// One-hour sliding battery-report gate (spec 2026-09-23): deep sleep clears
+// RAM, so the due-at stamp lives in RTC slow memory — it survives every
+// duty-cycle wake and is zeroed on cold boot (flash => report on first wake).
+// Clock is SNTP time(); while it is still implausible (< 2020) we always
+// report but never stamp, so a 1970 boot can't poison the window — the first
+// post-sync report arms it. Peek and arm are separate: page_sync arms only
+// after a real sample reached the URL, so an ADC hiccup never buys an hour
+// of silence.
+RTC_DATA_ATTR static uint32_t g_battery_due_at;
+static const time_t kBatteryMinClock = 1577836800;  // 2020-01-01 UTC
+extern "C" int rf_battery_due(void) {
+    time_t now = time(nullptr);
+    if (now < kBatteryMinClock) return 1;              // no clock: always due
+    return (uint32_t)now >= g_battery_due_at ? 1 : 0;
+}
+extern "C" void rf_battery_arm(void) {
+    time_t now = time(nullptr);
+    if (now < kBatteryMinClock) return;                // no clock: don't arm
+    g_battery_due_at = (uint32_t)now + 3600;           // any real report slides the gate
+}
+
 // ───────────────────── device signature (public ABI) ─────────────────────
 
 /* Implemented in Rust. Writes mac_hex / timestamp / nonce_b64 / sig_b64, each

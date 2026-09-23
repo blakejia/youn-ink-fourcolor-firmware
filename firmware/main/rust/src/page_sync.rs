@@ -173,11 +173,19 @@ fn fetch_schedule(buf: &mut [u8]) -> Option<usize> {
     let rr = unsafe { shim::rf_last_reset_reason() };
     let _ = write!(path, "?w={}&a={}&r={}&g={}&f={}&rr={}", c[0], c[1], c[2], c[3], c[4], rr);
 
-    let mut b_mv: u16 = 0;
-    let mut b_pct: u8 = 0;
-    let mut b_chg: u8 = 0;
-    if unsafe { shim::rf_battery_sample(&mut b_mv, &mut b_pct, &mut b_chg) } == 1 && b_mv > 0 {
-        let _ = write!(path, "&v={}&p={}&c={}", b_mv, b_pct, b_chg);
+    // One-hour sliding gate (spec 2026-09-23): v/p/c ride only when due, and
+    // arming happens AFTER a real sample lands on the wire — peek and arm are
+    // split so one ADC hiccup can't silence an hour of telemetry. Inside the
+    // window we also skip the read itself, so the 10-sample ADC burst rides
+    // only on reporting wakes.
+    if unsafe { shim::rf_battery_due() } != 0 {
+        let mut b_mv: u16 = 0;
+        let mut b_pct: u8 = 0;
+        let mut b_chg: u8 = 0;
+        if unsafe { shim::rf_battery_sample(&mut b_mv, &mut b_pct, &mut b_chg) } == 1 && b_mv > 0 {
+            let _ = write!(path, "&v={}&p={}&c={}", b_mv, b_pct, b_chg);
+            unsafe { shim::rf_battery_arm() };
+        }
     }
 
     let mut url = CBuf::<320>::new();
@@ -1681,6 +1689,7 @@ mod tests {
         shim::host::set_counters(7, 1234, 567, 2, 890);
         shim::host::set_reset_reason(3);
         shim::host::set_battery_sample(3980, 76, 4); // discharging
+        shim::host::set_battery_due(true);
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
         sync_once();
         let gets = shim::host::calls_matching("http_get");
@@ -1695,6 +1704,7 @@ mod tests {
         shim::host::set_counters(1, 100, 50, 1, 0);
         shim::host::set_reset_reason(3);
         shim::host::set_battery_sample_none();
+        shim::host::set_battery_due(true);
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
         sync_once();
         let gets = shim::host::calls_matching("http_get");
@@ -1702,6 +1712,57 @@ mod tests {
             .expect("schedule GET");
         assert!(!sched.contains("v=") && !sched.contains("&p=") && !sched.contains("&c="),
                 "no-sample must omit v/p/c entirely: {sched}");
+    }
+
+    #[test]
+    fn battery_params_wait_outside_the_one_hour_gate() {
+        // Sliding gate (spec 2026-09-23): inside the window the schedule GET
+        // rides WITHOUT v/p/c; peeking must not advance the RTC stamp either.
+        let _g = shim::host::lock();
+        shim::host::set_counters(1, 100, 50, 1, 0);
+        shim::host::set_reset_reason(3);
+        shim::host::set_battery_sample(3980, 76, 4);
+        shim::host::set_battery_due(false);
+        shim::host::clear_battery_armed();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        let gets = shim::host::calls_matching("http_get");
+        let sched = gets.iter().find(|c| c.contains("/api/pages/schedule?"))
+            .expect("schedule GET");
+        assert!(!sched.contains("v="), "inside the window v/p/c must be omitted: {sched}");
+        assert!(!shim::host::battery_armed(), "a peek must not arm the gate");
+    }
+
+    #[test]
+    fn battery_params_report_when_due_and_arm_the_gate() {
+        let _g = shim::host::lock();
+        shim::host::set_counters(1, 100, 50, 1, 0);
+        shim::host::set_reset_reason(3);
+        shim::host::set_battery_sample(3980, 76, 4);
+        shim::host::set_battery_due(true);
+        shim::host::clear_battery_armed();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        let gets = shim::host::calls_matching("http_get");
+        assert!(gets.iter().any(|c| c.contains("v=3980&p=76&c=4")),
+                "due report missing from the schedule URL: {gets:?}");
+        assert!(shim::host::battery_armed(), "a real report must slide the gate");
+    }
+
+    #[test]
+    fn a_failed_sample_leaves_the_gate_unarmed() {
+        // Due but no sensor reading: nothing rides the wire, so the stamp must
+        // NOT advance — one ADC hiccup would otherwise silence an hour of
+        // telemetry. The next wake simply retries.
+        let _g = shim::host::lock();
+        shim::host::set_counters(1, 100, 50, 1, 0);
+        shim::host::set_reset_reason(3);
+        shim::host::set_battery_sample_none();
+        shim::host::set_battery_due(true);
+        shim::host::clear_battery_armed();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        assert!(!shim::host::battery_armed(), "failed sample must not arm the gate");
     }
 
     #[test]
