@@ -83,8 +83,20 @@ extern "C" void app_main(void)
     esp_pm_config_t pm = {};
     pm.max_freq_mhz = 240;
     pm.min_freq_mhz = 80;
-    pm.light_sleep_enable = true;  // 自动 light sleep（省电批 2 C）：idle 段真睡眠
-    ESP_ERROR_CHECK(esp_pm_configure(&pm));
+    // 自动 light sleep 回退（2026-09-23 事故修复）：本行上方红线已定——
+    // USB-Serial-JTAG 控制台必须在 idle 存活，而 esp32s3 的 light sleep 会
+    // 拆掉该 pad；且它还要求 CONFIG_FREERTOS_USE_TICKLESS_IDLE（本配置未开）。
+    // 改 true 的那次：esp_pm_configure 返回 ESP_ERR_NOT_SUPPORTED，被
+    // ESP_ERROR_CHECK abort 成 0.3s 启动死循环。降级包装确保同类配置漂移
+    // 永远只降级回 DFS、不再复位循环。
+    pm.light_sleep_enable = false;
+    esp_err_t pm_err = esp_pm_configure(&pm);
+    if (pm_err != ESP_OK) {
+        ESP_LOGW("main", "esp_pm_configure(light_sleep=%d)=%s; falling back to DFS-only",
+                 (int)pm.light_sleep_enable, esp_err_to_name(pm_err));
+        pm.light_sleep_enable = false;
+        ESP_ERROR_CHECK(esp_pm_configure(&pm));
+    }
     auto& app = Application::GetInstance();
     app.Initialize(quiet_boot);
     app.Run();  // This function runs the main event loop and never returns
