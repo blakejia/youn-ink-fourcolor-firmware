@@ -83,7 +83,7 @@ extern "C" void app_main(void)
     esp_pm_config_t pm = {};
     pm.max_freq_mhz = 240;
     pm.min_freq_mhz = 80;
-    pm.light_sleep_enable = false;
+    pm.light_sleep_enable = true;  // 自动 light sleep（省电批 2 C）：idle 段真睡眠
     ESP_ERROR_CHECK(esp_pm_configure(&pm));
     auto& app = Application::GetInstance();
     app.Initialize(quiet_boot);

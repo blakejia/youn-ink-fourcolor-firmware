@@ -1,6 +1,7 @@
 #include "wifi_station.h"
 #include <cctype>
 #include <cstring>
+#include <esp_attr.h>
 #include <algorithm>
 #include <mutex>
 
@@ -95,6 +96,56 @@ static bool IsValidBssid(const uint8_t bssid[6]) {
         }
     }
     return !(all_zero || all_ff);
+}
+
+// Deep-sleep persistence for the Wi-Fi half of g_fast_cache: RAM clears on
+// every duty-cycle wake, so each boot fell through to the full scan
+// (fast_direct_connect_skip reason=cache_miss). RTC slow memory survives deep
+// sleep and is zeroed on cold boot — exactly the liveness semantics wanted:
+// a moved or renamed router just falls back to the existing scan ladder.
+// The IP half stays RAM-only: DHCP-lease reuse across sleeps needs lease-age
+// bookkeeping we deliberately do not take on (YAGNI).
+RTC_DATA_ATTR static struct RtcWifiCache {
+    uint32_t magic;
+    uint8_t ssid[33];   // 32 + NUL (ESP_MAX_SSID_LEN)
+    uint8_t bssid[6];
+    uint8_t channel;
+} g_rtc_wifi_cache;
+static constexpr uint32_t kRtcWifiCacheMagic = 0x52465731;  // "RFW1"
+
+static void SaveWifiCacheToRtc(const std::string& ssid, const uint8_t bssid[6], uint8_t channel) {
+    if (ssid.empty() || ssid.size() >= sizeof(g_rtc_wifi_cache.ssid)) {
+        g_rtc_wifi_cache.magic = 0;  // unpersistable -> honest cache_miss next boot
+        return;
+    }
+    g_rtc_wifi_cache.magic = kRtcWifiCacheMagic;
+    memset(g_rtc_wifi_cache.ssid, 0, sizeof(g_rtc_wifi_cache.ssid));
+    memcpy(g_rtc_wifi_cache.ssid, ssid.data(), ssid.size());
+    memcpy(g_rtc_wifi_cache.bssid, bssid, 6);
+    g_rtc_wifi_cache.channel = channel;
+}
+
+static void ClearWifiCacheRtc() {
+    memset(&g_rtc_wifi_cache, 0, sizeof(g_rtc_wifi_cache));
+}
+
+static void SeedFastCacheFromRtc() {
+    if (g_rtc_wifi_cache.magic != kRtcWifiCacheMagic ||
+        g_rtc_wifi_cache.channel == 0 ||
+        g_rtc_wifi_cache.ssid[0] == '\0' ||
+        g_rtc_wifi_cache.ssid[sizeof(g_rtc_wifi_cache.ssid) - 1] != '\0' ||
+        !IsValidBssid(g_rtc_wifi_cache.bssid)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_fast_cache_mutex);
+    if (g_fast_cache.have_wifi) return;  // never clobber a fresher RAM entry
+    g_fast_cache.have_wifi = true;
+    g_fast_cache.ssid = reinterpret_cast<const char*>(g_rtc_wifi_cache.ssid);
+    memcpy(g_fast_cache.bssid, g_rtc_wifi_cache.bssid, 6);
+    g_fast_cache.channel = g_rtc_wifi_cache.channel;
+    // esp_timer restarts at 0 every boot and last_ms feeds only the FAST_RC
+    // age log — stamp "now" so the line reads as fresh as the sleep crossed.
+    g_fast_cache.last_ms = esp_timer_get_time() / 1000;
 }
 
 static bool IsValidIpInfo(const esp_netif_ip_info_t& info) {
@@ -590,6 +641,7 @@ static bool SaveFastConnectCache(const std::string& ssid, const uint8_t bssid[6]
     memcpy(g_fast_cache.bssid, bssid, 6);
     g_fast_cache.channel = channel;
     g_fast_cache.last_ms = esp_timer_get_time() / 1000;
+    SaveWifiCacheToRtc(ssid, bssid, channel);
     return changed;
 }
 
@@ -615,6 +667,10 @@ WifiStation::WifiStation() {
         }
         nvs_close(nvs);
     }
+
+    // Deep-sleep wake: RAM cache was zeroed by the sleep; the RTC mirror
+    // survives and seeds it so the STA-start fast path sees the last AP.
+    SeedFastCacheFromRtc();
 
     esp_timer_create_args_t fast_timer_args = {
         .callback = &WifiStation::FastConnectTimeout,
@@ -982,6 +1038,7 @@ void WifiStation::ClearFastReconnectCache(const char* reason) {
         memset(g_fast_cache.bssid, 0, sizeof(g_fast_cache.bssid));
         g_fast_cache.channel = 0;
         g_fast_cache.last_ms = 0;
+        ClearWifiCacheRtc();  // keep the RTC mirror in lockstep with RAM
     }
     fast_fail_count_ = 0;
     ESP_LOGI(FAST_RC_TAG,
