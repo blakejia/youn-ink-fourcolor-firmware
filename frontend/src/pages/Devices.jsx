@@ -21,10 +21,54 @@ function splitSegs(pts) {
   return segs;
 }
 
-function makeXY(pts, W, H, PAD) {
-  const span = (pts && pts.length > 1) ? pts[pts.length - 1].ts - pts[0].ts : 1;
-  return p => [PAD + (p.ts - pts[0].ts) / span * (W - 2 * PAD),
+function makeXY(pts, W, H, PAD, xRange) {
+  const t0 = xRange ? xRange[0] : (pts && pts.length ? pts[0].ts : 0);
+  const t1 = xRange ? xRange[1] : (pts && pts.length > 1 ? pts[pts.length - 1].ts : t0 + 1);
+  const span = Math.max(1, t1 - t0);
+  return p => [PAD + (p.ts - t0) / span * (W - 2 * PAD),
                H - PAD - (p.mv - 3300) / (4200 - 3300) * (H - 2 * PAD)];
+}
+
+// Full-window x-axis range: the modal chart always spans the selected window
+// (pts span only part of it early on, which is correct — the axis shows the
+// real time scale). Now is floored to the window start so a clock that runs
+// backwards can't invert the range.
+function windowRange(pts, hours) {
+  const t1 = Math.max(Math.floor(Date.now() / 1000), (pts && pts.length ? pts[pts.length - 1].ts : 0));
+  return [Math.max(0, t1 - hours * 3600), t1];
+}
+
+function AxisTicks({ W, H, PAD, xr }) {
+  const yTicks = [3.3, 3.7, 4.1].map(v => [v, 3300 + (v - 3.3) * 1000]);
+  return (
+    <g aria-hidden="true">
+      {yTicks.map(([label, mv]) => (
+        <g key={label}>
+          <line x1={PAD} y1={H - PAD - (mv - 3300) / 900 * (H - 2 * PAD)}
+                x2={W - PAD} y2={H - PAD - (mv - 3300) / 900 * (H - 2 * PAD)}
+                stroke="var(--color-border)" strokeWidth={1} />
+          <text x={PAD + 2} y={H - PAD - (mv - 3300) / 900 * (H - 2 * PAD) - 3}
+                fontSize={10} fill="#666" style={{ fontVariantNumeric: 'tabular-nums' }}>
+            {label.toFixed(1)}V
+          </text>
+        </g>
+      ))}
+      {[0, 0.25, 0.5, 0.75, 1].map(f => {
+        const ts = Math.round(xr[0] + f * (xr[1] - xr[0]));
+        return (
+          <g key={f}>
+            <line x1={PAD + f * (W - 2 * PAD)} y1={H - PAD}
+                  x2={PAD + f * (W - 2 * PAD)} y2={H - PAD + 4}
+                  stroke="var(--color-border)" strokeWidth={1} />
+            <text x={PAD + f * (W - 2 * PAD)} y={H - 6} textAnchor={f === 0 ? 'start' : f === 1 ? 'end' : 'middle'}
+                  fontSize={10} fill="#666">
+              {formatTime(ts)}
+            </text>
+          </g>
+        );
+      })}
+    </g>
+  );
 }
 
 // The continuous gray base line keeps the curve unbroken across charge-state
@@ -336,7 +380,7 @@ function BatteryDetail({ device, onClose }) {
   const [pts, setPts] = useState(null);
   const [hoverIdx, setHoverIdx] = useState(null);
   const dialogRef = useRef(null);
-  const W = 640, H = 240, PAD = 12;
+  const W = 640, H = 300, PAD = 32;
   useEffect(() => {
     let alive = true;
     setPts(null);
@@ -355,7 +399,8 @@ function BatteryDetail({ device, onClose }) {
   const p = device.power;
   const pct = p && typeof p.battery_pct === 'number' ? p.battery_pct : null;
   const chg = p && typeof p.battery_charge === 'number' ? p.battery_charge : null;
-  const xy = pts && pts.length ? makeXY(pts, W, H, PAD) : null;
+  const xr = pts && pts.length ? windowRange(pts, hours) : null;
+  const xy = pts && pts.length ? makeXY(pts, W, H, PAD, xr) : null;
   const pick = (clientX, target) => {
     if (!xy) return;
     const rect = target.getBoundingClientRect();
@@ -426,6 +471,7 @@ function BatteryDetail({ device, onClose }) {
              onPointerLeave={() => setHoverIdx(null)}
              style={{ display: 'block', background: 'var(--color-surface)', border: '1px solid var(--color-border)',
                       cursor: 'crosshair', touchAction: 'pan-y' }}>
+          {xy && <AxisTicks W={W} H={H} PAD={PAD} xr={xr} />}
           {pts === null && <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="14" fill="#666">加载中…</text>}
           {pts !== null && pts.length < 2 &&
             <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="13" fill="#666">暂无数据（新固件生效后逐点累积）</text>}
