@@ -428,20 +428,32 @@ extern "C" int rf_battery_sample(uint16_t* mv, uint8_t* pct, uint8_t* charge) {
 // One-hour sliding battery-report gate (spec 2026-09-23): deep sleep clears
 // RAM, so the due-at stamp lives in RTC slow memory — it survives every
 // duty-cycle wake and is zeroed on cold boot (flash => report on first wake).
-// Clock is SNTP time(); while it is still implausible (< 2020) we always
-// report but never stamp, so a 1970 boot can't poison the window — the first
-// post-sync report arms it. Peek and arm are separate: page_sync arms only
-// after a real sample reached the URL, so an ADC hiccup never buys an hour
-// of silence.
+// Clock resolution (A): prefer SNTP time(); fall back to the PCF8563, which
+// SNTP writes on every sync (so it holds time across power loss too). An
+// implausible clock (< 2020) reports but never stamps — a 1970 boot cannot
+// poison the window, and the first post-sync report arms it. Peek and arm are
+// separate: page_sync arms only after a real sample reached the URL, so an
+// ADC hiccup never buys an hour of silence.
 RTC_DATA_ATTR static uint32_t g_battery_due_at;
 static const time_t kBatteryMinClock = 1577836800;  // 2020-01-01 UTC
-extern "C" int rf_battery_due(void) {
+extern "C" int ZectrixRtcNowEpoch(uint32_t* epoch);  // board .cc (mechanism)
+
+static time_t BatteryClock(void) {
     time_t now = time(nullptr);
-    if (now < kBatteryMinClock) return 1;              // no clock: always due
+    if (now >= kBatteryMinClock) return now;
+    uint32_t epoch = 0;
+    if (ZectrixRtcNowEpoch(&epoch) && epoch >= (uint32_t)kBatteryMinClock) {
+        return (time_t)epoch;
+    }
+    return 0;
+}
+extern "C" int rf_battery_due(void) {
+    time_t now = BatteryClock();
+    if (now < kBatteryMinClock) return 1;              // no clock anywhere: always due
     return (uint32_t)now >= g_battery_due_at ? 1 : 0;
 }
 extern "C" void rf_battery_arm(void) {
-    time_t now = time(nullptr);
+    time_t now = BatteryClock();
     if (now < kBatteryMinClock) return;                // no clock: don't arm
     g_battery_due_at = (uint32_t)now + 3600;           // any real report slides the gate
 }

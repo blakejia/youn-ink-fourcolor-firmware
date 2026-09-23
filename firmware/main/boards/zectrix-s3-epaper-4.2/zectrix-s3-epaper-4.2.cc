@@ -29,6 +29,22 @@
 #include "ui/rawdraw_ui_manager.h"
 #include "wifi_manager.h"
 
+#include <esp_attr.h>
+#include <esp_system.h>
+
+// Awake-watchdog plumbing (mechanism, spec 2026-09-23 B): the INT edge lands
+// in ISR context, so the handler only stamps an RTC flag (survives the coming
+// reset) and restarts. No I²C in the ISR — the armed latch below gates the
+// callback so a stray edge outside an armed window is ignored.
+namespace {
+RTC_DATA_ATTR static volatile uint32_t g_awake_wd_fired;
+static volatile bool s_awake_wd_armed = false;
+static RtcPcf8563* s_rtc_for_isr = nullptr;
+static void RtcIntIsrThunk(void*) {
+    if (s_rtc_for_isr != nullptr) s_rtc_for_isr->NotifyFromIsr();
+}
+}  // namespace
+
 namespace {
 
 constexpr char kTag[] = "ZectrixFtBoard";
@@ -326,6 +342,25 @@ private:
         if (!rtc_->Init(RTC_INT_GPIO)) {
             ESP_LOGW(kTag, "RTC init failed");
         }
+        // Awake watchdog (spec 2026-09-23 B): Init leaves the INT GPIO
+        // interrupt disabled (the factory code polls instead), so wire the
+        // real falling edge here — polling can never fire when the tasks are
+        // wedged, which is the only case this path exists for. Non-IRAM
+        // service is deliberate: during a flash-cache-off window the edge
+        // waits instead of running against a disabled cache.
+        s_rtc_for_isr = rtc_.get();
+        esp_err_t isr = gpio_install_isr_service(0);
+        if (isr != ESP_OK && isr != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(kTag, "RTC INT isr service failed: %s", esp_err_to_name(isr));
+        } else if (gpio_isr_handler_add(RTC_INT_GPIO, RtcIntIsrThunk, nullptr) != ESP_OK) {
+            ESP_LOGE(kTag, "RTC INT handler add failed");
+        }
+        // Callback runs inside NotifyFromIsr (ISR context): stamp + restart.
+        rtc_->OnInterrupt([]() {
+            if (!s_awake_wd_armed) return;   // stray edge outside an armed window
+            g_awake_wd_fired = 1;
+            esp_restart();
+        });
     }
 
     void InitializeNfc() {
@@ -661,6 +696,62 @@ extern "C" bool ZectrixReadBatterySample(uint16_t* mv, uint8_t* pct, uint8_t* ch
     else if (s.charging)   *charge = 2;
     else                    *charge = 4;
     return true;
+}
+
+// ─── PCF8563 bridges for app/shim (mechanism layer, extern "C") ───
+extern "C" void ZectrixRtcArmAwakeWatchdog(uint32_t minutes) {
+    RtcPcf8563* rtc = ZectrixGetRtc();
+    if (rtc == nullptr || minutes == 0) return;
+    time_t now = time(nullptr);
+    if (now < 1577836800) return;  // no wall clock yet: can't form a tm; the
+                                    // policy tick retries every 15-60 s
+    struct tm target = {};
+    time_t at = now + (time_t)minutes * 60;
+    localtime_r(&at, &target);
+    rtc->ClearAlarmFlag();
+    if (!rtc->SetAlarm(target)) {
+        s_awake_wd_armed = false;
+        return;
+    }
+    if (!rtc->EnableInterrupt(true)) {
+        s_awake_wd_armed = false;
+        return;
+    }
+    s_awake_wd_armed = true;
+}
+
+extern "C" void ZectrixRtcDisarmAwakeWatchdog() {
+    s_awake_wd_armed = false;
+    RtcPcf8563* rtc = ZectrixGetRtc();
+    if (rtc == nullptr) return;
+    rtc->DisableAlarm();
+    rtc->ClearAlarmFlag();
+}
+
+extern "C" void ZectrixRtcSetEpoch(uint32_t epoch) {
+    RtcPcf8563* rtc = ZectrixGetRtc();
+    if (rtc == nullptr) return;
+    time_t t = (time_t)epoch;
+    struct tm local_tm = {};
+    localtime_r(&t, &local_tm);
+    if (local_tm.tm_year + 1900 >= 2020) rtc->SetTime(local_tm);
+}
+
+extern "C" int ZectrixRtcNowEpoch(uint32_t* epoch) {
+    if (epoch == nullptr) return 0;
+    RtcPcf8563* rtc = ZectrixGetRtc();
+    if (rtc == nullptr) return 0;
+    struct tm t = {};
+    if (!rtc->GetTime(t)) return 0;
+    if (t.tm_year + 1900 < 2020) return 0;  // uninitialised PCF8563 reads 2000
+    *epoch = (uint32_t)mktime(&t);          // GetTime returns local fields (API)
+    return 1;
+}
+
+extern "C" uint32_t ZectrixAwakeWatchdogFired() {
+    if (g_awake_wd_fired == 0) return 0;
+    g_awake_wd_fired = 0;
+    return 1;
 }
 
 extern "C" void ZectrixSetFactoryLedOverride(bool enabled, bool blink) {

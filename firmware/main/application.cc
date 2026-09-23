@@ -33,6 +33,14 @@
 #include "shim_power.h"
 #include <nvs.h>
 
+// PCF8563 bridges (board mechanism layer): awake-watchdog arm/disarm, the
+// epoch write-back for SNTP sync, and the boot-side fired flag. Implemented
+// in boards/zectrix-s3-epaper-4.2/zectrix-s3-epaper-4.2.cc.
+extern "C" void ZectrixRtcArmAwakeWatchdog(uint32_t minutes);
+extern "C" void ZectrixRtcDisarmAwakeWatchdog();
+extern "C" void ZectrixRtcSetEpoch(uint32_t epoch);
+extern "C" uint32_t ZectrixAwakeWatchdogFired();
+
 #include <ctime>
 
 namespace {
@@ -140,6 +148,10 @@ void StartSntpClockSyncOnce() {
         char time_buf[32] = {};
         strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &local_tm);
         ESP_LOGI(kTag, "SNTP time synchronized: %s", time_buf);
+        // A (spec 2026-09-23): hand the wall clock to the PCF8563 so it holds
+        // time across power loss — the battery gate's clock fallback and any
+        // cold boot then know the time without waiting for SNTP.
+        ZectrixRtcSetEpoch((uint32_t)now);
         Application::GetInstance().UpdateStatusBarForUi();
     });
     esp_sntp_init();
@@ -312,6 +324,13 @@ void Application::Initialize(bool quiet) {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
     TransitionLifecycle(kLifecycleBoot, "init");
+    if (ZectrixAwakeWatchdogFired() != 0) {
+        // B (spec 2026-09-23): the PCF8563 alarm restarted us — the previous
+        // awake window wedged past its 15-minute deadline and the independent
+        // RTC broke the stall. Logged at boot; the counters already prove the
+        // window was still awake, this names the cause.
+        ESP_LOGW(kTag, "Awake watchdog fired: previous run hung past its window; rtc reset into a clean cycle");
+    }
 
     AudioCodec* codec = board.GetAudioCodec();
     if (codec == nullptr) {
@@ -1176,6 +1195,21 @@ void Application::ServicePowerPolicy() {
         if (in.mains) {
             RequestPromotion();
         }
+        // Awake-watchdog cadence (spec 2026-09-23 B): battery + no user flow
+        // ahead => arm 15 min out; every policy tick (15-60 s) re-arms, so
+        // legitimate activity keeps pushing the deadline and only a genuinely
+        // wedged run gets restarted. Mains and provisioning/pairing disarm —
+        // the user is present there and a restart would lose their flow.
+        {
+            const auto ls = GetLifecycleState();
+            const bool user_present =
+                (ls == kLifecycleApProvision || ls == kLifecyclePairWaitCode);
+            if (!in.mains && !user_present) {
+                ZectrixRtcArmAwakeWatchdog(15);
+            } else {
+                ZectrixRtcDisarmAwakeWatchdog();
+            }
+        }
         ESP_LOGI(kTag, "Stay awake (%u ms)", d.stay_awake_ms);
         RearmPowerTimer(d.stay_awake_ms);
         return;
@@ -1191,6 +1225,7 @@ void Application::ServicePowerPolicy() {
     ESP_LOGI(kTag, "Deep sleep %u s (mains=%d sync_ok=%d pin2=%d)", d.wake_s,
              (int)in.mains, (int)in.sync_ok, gpio_get_level(CHARGE_DETECT_GPIO));
     TransitionLifecycle(kLifecycleSleep, "power policy");
+    ZectrixRtcDisarmAwakeWatchdog();  // deep sleep: the alarm must not fire into it
     wifi_connected_.store(false, std::memory_order_release);
     // F5: both duration spans close HERE, at one shared end instant just
     // before the radio goes off (booking must precede esp_deep_sleep_start,
@@ -1281,6 +1316,7 @@ void Application::EnterManualSleep() {
     if (!Board::GetInstance().IsPowerPresent()) {
         EnableChargerInsertWakeup();
     }
+    ZectrixRtcDisarmAwakeWatchdog();  // manual sleep, same disarm as the policy path
     esp_deep_sleep_start();
 }
 
