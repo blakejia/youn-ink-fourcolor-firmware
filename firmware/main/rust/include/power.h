@@ -21,7 +21,8 @@ typedef struct {
     uint8_t  sync_ok;               // 最近一次 schedule 拉取成功
     uint8_t  screen_active;         // 服务端 policy.screen_active
     uint8_t  on_canvas;             // 当前屏是画板
-    uint8_t  _pad[2];
+    uint8_t  sleep_mode;            // 配网页「Enable Sleep Mode」（0 = 展示模式，恒不深睡）
+    uint8_t  _pad[1];
     uint64_t idle_ms;               // 距最后一次用户活动
     uint32_t grace_ms;              // NVS power:idle_grace_min * 60000
     uint32_t max_sleep_s;           // NVS power:max_sleep_min * 60

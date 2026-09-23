@@ -31,6 +31,7 @@
 #include "lifecycle.h"
 #include "power.h"
 #include "shim_power.h"
+#include <nvs.h>
 
 #include <ctime>
 
@@ -1104,6 +1105,20 @@ void Application::ServicePowerPolicy() {
     in.sync_ok = page_sync_sync_ok() ? 1 : 0;
     in.screen_active = page_sync_screen_active() ? 1 : 0;
     in.on_canvas = page_sync_is_displaying() ? 1 : 0;
+    // 配网页「Enable Sleep Mode」（NVS "wifi"/"sleep_mode"，未设置=开，行为零变化）。
+    // 每次判定直读 NVS 而非缓存成员：radio 为刷屏停机时 station 处于半拆状态，
+    // 读实例成员有生命周期陷阱；NVS 读在唤醒路径上成本可忽略。
+    in.sleep_mode = 1;
+    {
+        nvs_handle_t sm_nvs;
+        if (nvs_open("wifi", NVS_READONLY, &sm_nvs) == ESP_OK) {
+            uint8_t sm = 1;
+            if (nvs_get_u8(sm_nvs, "sleep_mode", &sm) == ESP_OK) {
+                in.sleep_mode = sm;
+            }
+            nvs_close(sm_nvs);
+        }
+    }
     // Negative last_activity_ms_ = quiet wake: backdate past any grace window
     // so the duty-cycle wake is computed straight away.
     in.idle_ms = (last_activity_ms_ < 0)

@@ -7,6 +7,7 @@ pub struct Inputs {
     pub sync_ok: bool,
     pub screen_active: bool,
     pub on_canvas: bool,
+    pub sleep_mode: bool,
     pub idle_ms: u64,
     pub grace_ms: u32,
     pub max_sleep_s: u32,
@@ -55,6 +56,14 @@ pub fn decide(i: &Inputs) -> Action {
         return Action::StayAwake { retry_ms: GRACE_RETRY_MS, reason: "grace" };
     }
 
+    // The provisioning page's "Enable Sleep Mode" switch, wired in: off =
+    // showroom/demo device — keep polling and painting on the mains-style
+    // re-evaluation cadence, but never duty-cycle. Checked after the
+    // user-activity holds, so their retry cadence is unaffected.
+    if !i.sleep_mode {
+        return Action::StayAwake { retry_ms: MAINS_RETRY_MS, reason: "sleep_mode_off" };
+    }
+
     let cap = poll_cap(i);
     let wake_s = if !i.sync_ok {
         // Nothing to paint until the server answers; back off instead of
@@ -79,10 +88,27 @@ mod tests {
     fn base() -> Inputs {
         Inputs {
             mains: false, notify_active: false, busy: false, sync_ok: true,
-            screen_active: true, on_canvas: true, idle_ms: 600_000,
+            screen_active: true, on_canvas: true, sleep_mode: true, idle_ms: 600_000,
             grace_ms: 180_000, max_sleep_s: 3600, poll_s: 600, sleep_poll_s: 3600,
             fail_streak: 0, seconds_until_next_page: Some(240),
         }
+    }
+
+    /// The provisioning page's "Enable Sleep Mode" checkbox, wired in: off
+    /// means a showroom/demo device that keeps polling and painting but
+    /// never duty-cycles (same shape as the mains hold).
+    #[test]
+    fn sleep_mode_off_holds_the_device_awake() {
+        let i = Inputs { sleep_mode: false, ..base() };
+        assert_eq!(decide(&i), Action::StayAwake { retry_ms: 60_000, reason: "sleep_mode_off" });
+    }
+
+    /// Flip test: the only difference from the off case is the flag — so the
+    /// flag, not some drift, is exactly what gates the duty cycle.
+    #[test]
+    fn sleep_mode_on_keeps_the_normal_duty_cycle() {
+        let i = Inputs { sleep_mode: true, ..base() };
+        assert_eq!(decide(&i), Action::Sleep { wake_s: 240, invalidate_panel: false });
     }
 
     #[test]
@@ -181,7 +207,8 @@ pub struct CInputs {
     pub sync_ok: u8,
     pub screen_active: u8,
     pub on_canvas: u8,
-    pub _pad: [u8; 2],
+    pub sleep_mode: u8,
+    pub _pad: [u8; 1],
     pub idle_ms: u64,
     pub grace_ms: u32,
     pub max_sleep_s: u32,
@@ -212,6 +239,7 @@ pub unsafe extern "C" fn rf_power_decide(inp: *const CInputs, out: *mut CDecisio
         sync_ok: i.sync_ok != 0,
         screen_active: i.screen_active != 0,
         on_canvas: i.on_canvas != 0,
+        sleep_mode: i.sleep_mode != 0,
         idle_ms: i.idle_ms,
         grace_ms: i.grace_ms,
         max_sleep_s: i.max_sleep_s,
