@@ -222,11 +222,18 @@ pub unsafe fn parse_url_authority(
     }
 
     let scheme_end = input.find("://").ok_or(())?;
-    let scheme = &input[..scheme_end];
-    let default_port = match scheme.as_bytes() {
-        b"https" | b"wss" => 443u16,
-        b"http" | b"ws" => 80u16,
-        _ => return Err(()),
+    let scheme = &input[..scheme_end].as_bytes();
+    let is_default_scheme = |expected: &[u8]| {
+        scheme.len() == expected.len() && scheme.iter().zip(expected).all(|(actual, wanted)| {
+            actual.to_ascii_lowercase() == *wanted
+        })
+    };
+    let default_port = if is_default_scheme(b"https") || is_default_scheme(b"wss") {
+        443u16
+    } else if is_default_scheme(b"http") || is_default_scheme(b"ws") {
+        80u16
+    } else {
+        return Err(());
     };
 
     let authority_start = scheme_end + 3;
@@ -951,6 +958,21 @@ mod tests {
         let mut host = [0u8; 256];
         assert_eq!(unsafe { parse_url_authority("http://example.com/", host.as_mut_ptr(), 256) }.unwrap().1, 80);
         assert_eq!(unsafe { parse_url_authority("ws://example.com/", host.as_mut_ptr(), 256) }.unwrap().1, 80);
+    }
+
+    #[test]
+    fn url_authority_accepts_uppercase_schemes() {
+        for (url, expected_port) in [
+            ("HTTP://example.com/", 80),
+            ("HTTPS://example.com/", 443),
+            ("WS://example.com/", 80),
+            ("WSS://example.com/", 443),
+        ] {
+            let mut host = [0u8; 256];
+            let (len, port) = unsafe { parse_url_authority(url, host.as_mut_ptr(), 256) }.unwrap();
+            assert_eq!(core::str::from_utf8(&host[..len]).unwrap(), "example.com");
+            assert_eq!(port, expected_port);
+        }
     }
 
     #[test]

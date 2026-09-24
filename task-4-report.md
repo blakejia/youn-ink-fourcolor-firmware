@@ -13,3 +13,4 @@
 - `idf.py build` (with ESP-IDF v6.0 export): PASS — project build complete; `xiaozhi.bin` generated.
 - Build emitted existing ESP-SR/Kconfig and linker notes only; no Task 4a compile errors.
 - `git diff --check`: PASS.
+- Final P2: Rust URL parser now preserves case-insensitive HTTP/HTTPS/WS/WSS schemes with an allocation-free ASCII lowering check; added host contract coverage for all four uppercase schemes. Post-fix `cargo test`: 261 passed; `idf.py build`: PASS.
