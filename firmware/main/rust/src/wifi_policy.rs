@@ -386,7 +386,7 @@ impl PolicyAction {
         }
     }
 
-    /// Defer and clear the IP cache (3a: current C++ behavior).
+    /// Defer and clear the IP cache (all probe failures except endpoint_missing).
     pub const fn defer_clear_ip() -> Self {
         Self {
             action_kind: ActionKind::DeferProbe as u8,
@@ -458,7 +458,9 @@ pub struct Inputs {
 ///
 /// Policy:
 /// - **IP fast active**: cache stale → `DeferProbe { clear_ip }`;
-///   endpoint missing → `DeferProbe { clear_ip }` (3a, preserved from current C++);
+///   endpoint missing → `DeferProbe { retain_ip: true }` (3b fix — retains
+///   the IP fast cache and the association cache/RTC mirror so the next
+///   attempt can probe once the endpoint resolves);
 ///   otherwise → `Probe`.
 /// - **Wi-Fi fast connect**: usable cache + within fail threshold → `DirectConnect`;
 ///   fail threshold exceeded → `Scan`; no cache → `Scan`; fast disabled → `Scan`.
@@ -470,9 +472,10 @@ pub fn decide(i: &Inputs) -> PolicyAction {
         }
 
         if !i.endpoint_present {
-            // 3a: endpoint_missing clears IP cache (current C++ behavior).
-            // 3b will change this to `defer_retain_ip()`.
-            return PolicyAction::defer_clear_ip();
+            // 3b: endpoint_missing retains IP cache and association/RTC cache.
+            // C++ must stop this IP fast attempt, restart DHCP, and return
+            // without DNS/TCP probe. All other fallbacks still clear IP cache.
+            return PolicyAction::defer_retain_ip();
         }
 
         // Probe in progress — no intervention needed.
@@ -1141,9 +1144,28 @@ mod tests {
     }
 
     #[test]
-    fn defer_clear_ip_when_endpoint_missing_3a() {
-        // 3a: endpoint_missing → clear IP cache (current C++ behavior).
-        // 3b changes this to DeferProbe { retain_ip: true }.
+    fn defer_clear_ip_when_endpoint_present_but_unrelated_probe_failure() {
+        // Regression guard: when the endpoint IS present, a probe-path
+        // deferral still clears the IP cache. Only the missing-endpoint
+        // branch retains it (see defer_retain_ip_when_endpoint_missing_3b).
+        // A stale cache with a present endpoint exercises this clear path.
+        let i = make_inputs(|i| {
+            i.ip_fast_active = true;
+            i.have_ip_cache = true;
+            i.ip_cache_age_ms = IP_FAST_MAX_AGE_MS + 1;
+            i.endpoint_present = true;
+        });
+        let a = decide(&i);
+        assert_eq!(a.action_kind, ActionKind::DeferProbe as u8);
+        assert!(a.clear_ip_cache, "stale cache with endpoint present clears IP cache");
+        assert!(!a.retain_ip);
+    }
+
+    #[test]
+    fn defer_retain_ip_when_endpoint_missing_3b() {
+        // 3b: endpoint_missing → DeferProbe { retain_ip: true }.
+        // The IP fast cache and the association cache/RTC mirror are
+        // retained so the next attempt can probe once the endpoint resolves.
         let i = make_inputs(|i| {
             i.ip_fast_active = true;
             i.have_ip_cache = true;
@@ -1152,8 +1174,49 @@ mod tests {
         });
         let a = decide(&i);
         assert_eq!(a.action_kind, ActionKind::DeferProbe as u8);
-        assert!(a.clear_ip_cache, "3a: endpoint_missing clears IP cache");
-        assert!(!a.retain_ip, "3a: endpoint_missing does NOT retain IP");
+        assert!(!a.clear_ip_cache, "3b: endpoint_missing must NOT clear IP cache");
+        assert!(a.retain_ip, "3b: endpoint_missing must retain IP");
+        assert!(!a.clear_wifi_cache, "3b: association cache is retained");
+    }
+
+    #[test]
+    fn c_abi_endpoint_missing_retains_ip_3b() {
+        // 3b: endpoint_missing → action=DeferProbe, clear_ip_cache=0, retain_ip=1.
+        let cin = CInputs {
+            version: 1,
+            invoke_count: 0,
+            wifi_connected: 1,
+            rssi: -50,
+            channel: 6,
+            _pad0: [0; 3],
+            reconnect_count: 0,
+            ip_fast_active: 1,
+            ip_fast_ready: 0,
+            ip_fast_cache_age_ms: 100_000,
+            have_wifi_cache: 1,
+            cache_bssid_valid: 1,
+            cache_channel: 6,
+            _pad1: 0,
+            cache_ssid: mk_ssid(b"Net"),
+            cache_ssid_len: 3,
+            cache_bssid: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            wifi_cache_age_ms: 1000,
+            have_ip_cache: 1,
+            _pad2: [0; 3],
+            ip_cache_age_ms: 100_000,
+            fast_fail_count: 0,
+            fast_enabled: 1,
+            endpoint_present: 0, // missing
+            probe_target: 0,
+            host_is_ip_literal: 0,
+        };
+
+        let mut cout = COutput::default();
+        unsafe { rf_wifi_policy_decide(&cin, &mut cout); }
+
+        assert_eq!(cout.action_kind, ActionKind::DeferProbe as u8);
+        assert_eq!(cout.clear_ip_cache, 0, "3b: endpoint_missing must NOT clear IP cache");
+        assert_eq!(cout.retain_ip, 1, "3b: endpoint_missing must retain IP");
     }
 
     #[test]
@@ -1216,8 +1279,9 @@ mod tests {
     }
 
     #[test]
-    fn c_abi_endpoint_missing_clears_ip_3a() {
-        // 3a: endpoint_missing → clear_ip_cache=true, retain_ip=false
+    fn c_abi_stale_cache_with_endpoint_present_clears_ip() {
+        // C-ABI guard for the non-endpoint clear path: stale cache with a
+        // present endpoint → clear_ip_cache=1, retain_ip=0.
         let cin = CInputs {
             version: 1,
             invoke_count: 0,
@@ -1228,7 +1292,7 @@ mod tests {
             reconnect_count: 0,
             ip_fast_active: 1,
             ip_fast_ready: 0,
-            ip_fast_cache_age_ms: 100_000,
+            ip_fast_cache_age_ms: IP_FAST_MAX_AGE_MS as u32 + 1,
             have_wifi_cache: 1,
             cache_bssid_valid: 1,
             cache_channel: 6,
@@ -1239,10 +1303,10 @@ mod tests {
             wifi_cache_age_ms: 1000,
             have_ip_cache: 1,
             _pad2: [0; 3],
-            ip_cache_age_ms: 100_000,
+            ip_cache_age_ms: IP_FAST_MAX_AGE_MS as i32 + 1,
             fast_fail_count: 0,
             fast_enabled: 1,
-            endpoint_present: 0, // missing
+            endpoint_present: 1, // present
             probe_target: 0,
             host_is_ip_literal: 0,
         };
@@ -1251,8 +1315,8 @@ mod tests {
         unsafe { rf_wifi_policy_decide(&cin, &mut cout); }
 
         assert_eq!(cout.action_kind, ActionKind::DeferProbe as u8);
-        assert_eq!(cout.clear_ip_cache, 1, "3a: endpoint_missing clears IP cache");
-        assert_eq!(cout.retain_ip, 0, "3a: endpoint_missing does NOT retain IP");
+        assert_eq!(cout.clear_ip_cache, 1, "stale cache with endpoint present clears IP");
+        assert_eq!(cout.retain_ip, 0);
     }
 
     #[test]
@@ -1261,14 +1325,16 @@ mod tests {
         // Must not panic
     }
 
-    // ── Sentinel mutation proof (Step 6) ─────────────────────────────────────
-    // To prove the test catches the wrong behavior:
-    // 1. In `decide()`, change `defer_clear_ip()` to `defer_retain_ip()` in
+    // ── Sentinel mutation proof (Task 4b) ────────────────────────────────────
+    // To prove the endpoint-missing tests catch the wrong behavior:
+    // 1. In `decide()`, change `defer_retain_ip()` to `defer_clear_ip()` in
     //    the `!i.endpoint_present` branch.
     // 2. Run: cargo test wifi_policy
-    // 3. `c_abi_endpoint_missing_clears_ip_3a` will FAIL:
-    //      assert_eq!(cout.clear_ip_cache, 1) → becomes 0, fails
-    //      assert_eq!(cout.retain_ip, 0) → becomes 1, fails
-    // 4. Restore the implementation (defer_clear_ip) and rerun → green.
-    // This proves the sentinel correctly rejects the 3b behavior in 3a.
+    // 3. `defer_retain_ip_when_endpoint_missing_3b` and
+    //    `c_abi_endpoint_missing_retains_ip_3b` will FAIL:
+    //      assert!(!a.clear_ip_cache) → clear_ip_cache becomes true, fails
+    //      assert!(a.retain_ip) → retain_ip becomes false, fails
+    // 4. Restore the implementation (defer_retain_ip) and rerun → green.
+    // This proves the sentinel correctly detects a regression to clearing
+    // the IP cache on endpoint_missing.
 }

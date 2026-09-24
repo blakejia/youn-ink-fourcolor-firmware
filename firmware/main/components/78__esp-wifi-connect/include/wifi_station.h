@@ -109,6 +109,7 @@ private:
     void StartIpFastTask();
     bool RunIpFast();
     void IpFastFallback(const char* reason);
+    void IpFastDeferRetainCache(const char* reason);
     void StopFastConnectTimer();
     static void IpFastTask(void* arg);
     static void WifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);

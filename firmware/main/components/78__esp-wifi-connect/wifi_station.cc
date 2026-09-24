@@ -1340,6 +1340,26 @@ void WifiStation::IpFastFallback(const char* reason) {
     }
 }
 
+void WifiStation::IpFastDeferRetainCache(const char* reason) {
+    int64_t t_ms = esp_timer_get_time() / 1000;
+    int64_t age_ms = (ip_fast_cached_ms_ > 0) ? (t_ms - ip_fast_cached_ms_) : -1;
+    ESP_LOGW(FAST_RC_TAG,
+             "stage=ip event=fast_defer scope=ip path=fast t_ms=%lld reason=%s cached_age_ms=%lld ready=%d retain_ip=1",
+             static_cast<long long>(t_ms), reason ? reason : "unknown",
+             static_cast<long long>(age_ms),
+             ip_fast_ready_ ? 1 : 0);
+    StopFastConnectTimer();
+    fast_attempt_ = false;
+    // 3b: retain the IP fast cache (g_fast_cache.have_ip + ip_fast_cached_ms_)
+    // and the association cache/RTC mirror — clear neither. Stop only this
+    // attempt's flags so the next STA connect/fast-attempt can probe again.
+    ip_fast_attempt_ = false;
+    ip_fast_ready_ = false;
+    if (station_netif_ != nullptr) {
+        esp_netif_dhcpc_start(station_netif_);
+    }
+}
+
 bool WifiStation::RunIpFast() {
     if (!ip_fast_attempt_ || station_netif_ == nullptr) {
         return false;
@@ -1490,8 +1510,12 @@ bool WifiStation::RunIpFast() {
             policy_input.ip_fast_active = ip_fast_attempt_ ? 1 : 0;
             policy_input.endpoint_present = 0;
             wifi_policy_action_v1_t policy_action{};
-            (void)wifi_policy_invoke_from_component(&policy_input, &policy_action);
-            IpFastFallback("endpoint_missing");
+            bool have_policy = wifi_policy_invoke_from_component(&policy_input, &policy_action);
+            if (have_policy && policy_action.action_kind == 20 && !policy_action.clear_ip_cache) {
+                IpFastDeferRetainCache("endpoint_missing");
+            } else {
+                IpFastFallback("endpoint_missing");
+            }
             return false;
         }
         resolved = ResolveHostWithTimeout(host, &server_addr, dns_budget);
