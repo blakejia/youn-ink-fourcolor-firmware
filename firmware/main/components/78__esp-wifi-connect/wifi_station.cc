@@ -1145,7 +1145,8 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
         wifi_policy_input_v1_t reconnect{};
         reconnect.version = WIFI_POLICY_SHIM_VERSION;
         reconnect.invoke_count = wifi_policy_invoke_count();
-        reconnect.reconnect_count = this_->reconnect_count_ + 1;
+        reconnect.reconnect_count = this_->reconnect_count_;
+        reconnect.wifi_connected = 0;
         reconnect.fast_fail_count = this_->fast_fail_count_;
         reconnect.fast_enabled = kFastRcEnable ? 1 : 0;
         wifi_policy_action_v1_t reconnect_action{};
@@ -1153,17 +1154,34 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
             if (reconnect_action.clear_wifi_cache) {
                 WifiManager::GetInstance().ClearFastReconnectCache("policy_stop");
             }
-            if (reconnect_action.action_kind == 13) {
-                esp_wifi_connect();
-                this_->reconnect_count_++;
+            switch (reconnect_action.action_kind) {
+                case 10:  // DirectConnect
+                    esp_wifi_connect();
+                    this_->reconnect_count_++;
+                    return;
+                case 13:  // Retry: reconnect only; never fall into scan timer.
+                    esp_wifi_connect();
+                    this_->reconnect_count_++;
+                    return;
+                case 12:  // Scan
+                    esp_wifi_scan_start(nullptr, false);
+                    if (this_->on_scan_begin_) this_->on_scan_begin_();
+                    return;
+                case 14:  // Stop
+                    if (!this_->connect_queue_.empty()) this_->StartConnect();
+                    else {
+                        esp_timer_start_once(this_->timer_handle_, this_->scan_current_interval_microseconds_);
+                        this_->UpdateScanInterval();
+                    }
+                    return;
+                case 20:  // DeferProbe is not a reconnect operation.
+                    return;
+                default:
+                    // Safe unknown-action default: reconnect current association.
+                    esp_wifi_connect();
+                    this_->reconnect_count_++;
+                    return;
             }
-            if (reconnect_action.action_kind == 14 && !this_->connect_queue_.empty()) {
-                this_->StartConnect();
-            } else {
-                esp_timer_start_once(this_->timer_handle_, this_->scan_current_interval_microseconds_);
-                this_->UpdateScanInterval();
-            }
-            return;
         }
     } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
         int64_t t_ms = esp_timer_get_time() / 1000;

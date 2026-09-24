@@ -485,27 +485,25 @@ pub fn decide(i: &Inputs) -> PolicyAction {
         return PolicyAction::probe();
     }
 
-    // ── Wi-Fi fast connect path ─────────────────────────────────────────────
-    if !i.ip_fast_active && !i.wifi_connected && !i.have_wifi_cache && i.reconnect_count > 0 {
-        return if i.reconnect_count < 5 {
-            PolicyAction::retry()
-        } else if i.fast_fail_count >= FAST_FAIL_THRESHOLD {
+    // Terminal disconnect count is authoritative; before that, cached fast
+    // association selection owns the first/subsequent attempt.
+    if !i.ip_fast_active && !i.wifi_connected && i.reconnect_count >= 5 {
+        return if i.fast_fail_count >= FAST_FAIL_THRESHOLD {
             PolicyAction::stop_clear_wifi()
         } else {
             PolicyAction::stop()
         };
     }
-    if i.have_wifi_cache && i.cache_bssid_valid && i.cache_channel != 0 {
-        if i.cache_ssid_len > 0 {
-            if i.fast_enabled && i.fast_fail_count < FAST_FAIL_THRESHOLD {
-                return PolicyAction::direct_connect();
-            } else {
-                return PolicyAction::scan();
-            }
+    if i.have_wifi_cache && i.cache_bssid_valid && i.cache_channel != 0 && i.cache_ssid_len > 0 {
+        if i.fast_enabled && i.fast_fail_count < FAST_FAIL_THRESHOLD {
+            return PolicyAction::direct_connect();
         }
+        return PolicyAction::scan();
+    }
+    if !i.ip_fast_active && !i.wifi_connected {
+        return PolicyAction::retry();
     }
 
-    // No usable cache or fast connect disabled → full scan.
     PolicyAction::scan()
 }
 
@@ -1118,7 +1116,7 @@ mod tests {
     #[test]
     fn scan_when_cache_miss() {
         let i = make_inputs(|i| {
-            i.have_wifi_cache = false;
+            i.wifi_connected = true;
         });
         let a = decide(&i);
         assert_eq!(a.action_kind, ActionKind::Scan as u8);
