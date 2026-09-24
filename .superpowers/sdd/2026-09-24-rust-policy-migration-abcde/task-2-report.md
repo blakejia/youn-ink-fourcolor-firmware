@@ -1,8 +1,8 @@
 # Task 2 Report: RTC/SNTP/Calendar/RTC Cache/Battery Sample/Wi-Fi Cache Time-Gate Policy
 
-**Date**: 2026-09-25
-**Status**: Complete
-**Commit**: f0cba16
+**Date**: 2026-09-25 (first version); 2026-09-25 (reviewer fix appended below)
+**Status**: Complete (reviewer findings fixed, second version at e651218)
+**Commits**: f0cba16 (initial), 54a8e5e (report), e651218 (reviewer fix)
 **Branch**: abcde-rust-migration
 **Worktree**: /mnt/data/project/youn-ink-fourcolor-firmware/.worktrees/abcde-rust-migration
 
@@ -305,3 +305,65 @@ Should a future task need finer-grain error reporting (e.g. "the battery
 gate could not arm because the wall clock drifted backwards"), add a single
 `reason_code` field rather than splitting the ABI — a single ABI is the
 contract surface for tests and review.
+
+---
+
+## Reviewer Fix (e651218): Full Consumption of the Five Outputs
+
+The reviewer found four gaps in f0cba16. This section documents how each was fixed, what changed, and the new tests that prove the wiring.
+
+1) Wire every output into production (not just SNTP)
+
+- shim.cpp rf_battery_due / rf_battery_arm now go through a single
+  ShimDecideBattery helper that fills the full inputs from time() plus the
+  PCF8563 fallback and calls rf_time_gate_policy_decide. The old
+  BatteryClock comparisons are gone; the battery time-gate policy is exactly
+  one call site.
+- shim.cpp rf_time_gate_wifi_cache_ok() is a new observer that external C++
+  sites consult without assembling the ABI. Its only consumer,
+  wifi_station.cc SaveWifiCacheToRtc, now skips the RTC write when the clock
+  is 1970.
+- application.cc no longer keeps a separate RfClockNowValid predicate for
+  either path; both ShouldStartSntpNow and rf_sntp_mark_synced are, from top
+  to bottom, fill struct, call ABI, translate the output.
+
+Storage stays in C++: RTC_DATA_ATTR s_last_sntp_sync_epoch (application.cc),
+RTC_DATA_ATTR g_battery_due_at (shim.cpp), RTC_DATA_ATTR g_rtc_wifi_cache
+(wifi_station.cc). No NVS migration. All symbols verified in xiaozhi.elf.
+
+2) BatteryClock fallback preserved
+
+- now_s (signed) carries time() verbatim; effective_clock_s carries the PCF8563
+  epoch (0 = none); clock_valid_mask tells Rust which is plausible.
+- Battery gate: no clock anywhere -> due, no arm. time() invalid but RTC OK ->
+  due, no arm (mirrors old BatteryClock resolving to RTC but refuses to arm
+  a monotonic stamp off a fallback). time() valid, cold boot -> due + arm.
+  time() valid, elapsed -> due + arm. Otherwise -> skip.
+
+3) time()==-1 never persists
+
+RfReadNowSigned / ShimReadNowSigned return (int64_t)time(nullptr). Rust keeps
+now_s as i64, so -1 stays -1. All decide() branches treat negative values as
+invalid (they only enter start/report arms, never write-as-stamp). Regression
+tests: sntp_start_with_negative_now_is_start,
+mark_synced_with_negative_now_is_not_ok.
+
+4) No duplicate C++ early returns
+
+Removed the three C++ early returns (!RfClockNowValid in ShouldStartSntpNow /
+rf_sntp_mark_synced, now < kBatteryMinClock in rf_battery_due/arm). The Rust
+decision covers every case; future gates inherit the same shape for free.
+
+New regression tests (20 -> 26): the seven in the table above plus the negative
+clock pair. Sentinel: sntp_mark_synced_ok gated by (now >= 0 || effective)
+broke mark_synced_never_uses_rtc_fallback_even_if_plausible (returned 1,
+expected 0); restored and 26/26 pass.
+
+Full suite: 297 lib + 4 device_signature = 301 tests, 0 fail.
+ESP-IDF build (IDF_TARGET=esp32s3): green, xiaozhi.bin 0x2c8040 bytes, 29% free.
+
+Edit-tool note: the reviewer fix hit cascading wifi_station.cc header drops
+(TAG, FAST_RC_TAG, kFastRcEnable, WIFI_EVENT_* defines) from the edit tool
+range echo; each was caught by the build and restored byte-for-byte against
+git show HEAD. Final wifi_station.cc diff adds only the extern declaration
+and the SaveWifiCacheToRtc early skip.
