@@ -17,7 +17,14 @@
 extern "C" {
 #endif
 
-/** Facts from a pair-start response: HTTP status + what cJSON established. */
+/**
+ * Facts from a pair-start response: HTTP status + what cJSON established.
+ *
+ * Layout contract with `pairing_response.rs` (`#[repr(C)]` + a Rust test
+ * asserting offsets/size): `int32_t status` at 0, then four `uint8_t` flags
+ * at 4..7 and one pad byte — 8 bytes total, identical on both sides. Keep
+ * field order, types and count in step with the Rust struct.
+ */
 typedef struct {
     int32_t status;         /**< HTTP status, or a negative transport status. */
     uint8_t json_valid;     /**< The body parsed as JSON. */
@@ -26,7 +33,12 @@ typedef struct {
     uint8_t _pad;
 } rf_pair_start_facts_t;
 
-/** Facts from a pair-claim response: HTTP status + what cJSON established. */
+/**
+ * Facts from a pair-claim response: HTTP status + what cJSON established.
+ *
+ * Same layout contract as `rf_pair_start_facts_t`: 8 bytes, `int32_t status`
+ * at 0 then four `uint8_t` flags at 4..7. Asserted by the same Rust test.
+ */
 typedef struct {
     int32_t status;         /**< HTTP status, or a negative transport status. */
     uint8_t json_valid;     /**< The body parsed as JSON. */

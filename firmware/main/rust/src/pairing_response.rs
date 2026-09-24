@@ -10,26 +10,40 @@
 //! behaviour it pins.
 
 /// Facts the C side extracted from a pair-start response (HTTP + cJSON).
+///
+/// `#[repr(C)]` + explicit padding pins the layout against
+/// `rf_pair_start_facts_t` in `rust/include/pairing_response.h`; a layout
+/// contract test asserts the offsets and size. `bool` is one byte with
+/// 0/1 values, matching the header's `uint8_t` fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct PairStartFacts {
     /// HTTP status, or a negative transport status.
     pub status: i32,
     pub json_valid: bool,
     pub code_is_string: bool,
     pub expires_is_number: bool,
+    /// Explicit tail padding: keeps the struct 8 bytes on every target.
+    pub _pad: u8,
 }
 
 /// Facts the C side extracted from a pair-claim response (HTTP + cJSON).
+///
+/// Same layout contract as `PairStartFacts` (see above).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct ClaimFacts {
     /// HTTP status, or a negative transport status.
     pub status: i32,
     pub json_valid: bool,
+    /// `token` is present and is a string.
     pub token_is_string: bool,
     /// `token` is a string with a first byte. The C side must pass this
     /// separately: `cJSON_IsString` alone does not tell an empty string from a
     /// non-empty one.
     pub token_nonempty: bool,
+    /// Explicit tail padding: keeps the struct 8 bytes on every target.
+    pub _pad: u8,
 }
 
 /// What a pair-start response means. Maps onto `rf_pairing_outcome_t`.
@@ -136,11 +150,11 @@ mod tests {
         code_is_string: bool,
         expires_is_number: bool,
     ) -> PairStartFacts {
-        PairStartFacts { status, json_valid, code_is_string, expires_is_number }
+        PairStartFacts { status, json_valid, code_is_string, expires_is_number, _pad: 0 }
     }
 
     fn claim(status: i32, json_valid: bool, token_is_string: bool, token_nonempty: bool) -> ClaimFacts {
-        ClaimFacts { status, json_valid, token_is_string, token_nonempty }
+        ClaimFacts { status, json_valid, token_is_string, token_nonempty, _pad: 0 }
     }
 
     #[test]
@@ -265,5 +279,26 @@ mod tests {
             unsafe { rf_pairing_classify_claim(&neterr) },
             RF_PAIR_OUTCOME_CLAIM_NETWORK_ERROR
         );
+    }
+
+    #[test]
+    fn fact_structs_match_the_c_header_layout() {
+        // Layout contract with rust/include/pairing_response.h: int32_t status
+        // at 0, then four uint8_t/bool flags at 4..8, total 8 bytes. A silent
+        // re-order or a bool/u8 mismatch would read garbage across the FFI.
+        use core::mem::{offset_of, size_of};
+        assert_eq!(size_of::<PairStartFacts>(), 8);
+        assert_eq!(offset_of!(PairStartFacts, status), 0);
+        assert_eq!(offset_of!(PairStartFacts, json_valid), 4);
+        assert_eq!(offset_of!(PairStartFacts, code_is_string), 5);
+        assert_eq!(offset_of!(PairStartFacts, expires_is_number), 6);
+        assert_eq!(offset_of!(PairStartFacts, _pad), 7);
+
+        assert_eq!(size_of::<ClaimFacts>(), 8);
+        assert_eq!(offset_of!(ClaimFacts, status), 0);
+        assert_eq!(offset_of!(ClaimFacts, json_valid), 4);
+        assert_eq!(offset_of!(ClaimFacts, token_is_string), 5);
+        assert_eq!(offset_of!(ClaimFacts, token_nonempty), 6);
+        assert_eq!(offset_of!(ClaimFacts, _pad), 7);
     }
 }
