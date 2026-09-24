@@ -699,6 +699,16 @@ extern "C" bool ZectrixReadBatteryPercentForFactoryTest(int* level) {
     auto& board = static_cast<CustomBoard&>(Board::GetInstance());
     return board.ReadBatteryPercentForFactoryTest(level);
 }
+// Shared charge encoding: snapshot -> the `c=` wire byte (0=unknown
+// 1=no-power 2=charging 3=full 4=discharging). charge_status.cc:66-75
+// guarantees power_present => exactly one of full/charging/no_battery, so
+// the else arm is kNoPower (battery only).
+static uint8_t EncodeCharge(const ChargeStatus::Snapshot& s) {
+    if (s.full)            return 3;
+    if (s.charging)        return 2;
+    return 4;
+}
+
 extern "C" bool ZectrixReadBatterySample(uint16_t* mv, uint8_t* pct, uint8_t* charge) {
     if (mv == nullptr || pct == nullptr || charge == nullptr) return false;
     auto& board = static_cast<CustomBoard&>(Board::GetInstance());
@@ -712,15 +722,20 @@ extern "C" bool ZectrixReadBatterySample(uint16_t* mv, uint8_t* pct, uint8_t* ch
     if (!board.ReadBatterySampleForTelemetry(&v, &p)) return false;
     *mv = v;
     *pct = p;
-    // charge encoding: 0=unknown 1=no-power 2=charging 3=full 4=discharging.
-    // Mains IS sampled (spec amendment 2026-09-22): charging states only exist
-    // while plugged, and the 3.7→4.2 V charge ramp is worth plotting.
-    // charge_status.cc:66-75 guarantees power_present ⇒ exactly one of
-    // full/charging/no_battery, so the else arm is kNoPower (battery only).
-    if (s.full)            *charge = 3;
-    else if (s.charging)   *charge = 2;
-    else                    *charge = 4;
+    // Mains IS sampled (spec amendment 2026-09-22): charging states only
+    // exist while plugged, and the 3.7→4.2 V charge ramp is worth plotting.
+    *charge = EncodeCharge(s);
     return true;
+}
+
+// Charge fact WITHOUT the ADC burst: the task-4 battery gate needs the
+// direction before deciding whether to spend the 10-sample read. Same
+// snapshot and same encoding as ZectrixReadBatterySample, minus voltage —
+// called by shim.cpp's rf_battery_activity_context (mechanism, extern "C").
+extern "C" uint8_t ZectrixReadChargeEncoding(void) {
+    auto& board = static_cast<CustomBoard&>(Board::GetInstance());
+    board.RefreshChargeSnapshotForFactoryTest();
+    return EncodeCharge(board.GetChargeSnapshot());
 }
 
 // ─── PCF8563 bridges for app/shim (mechanism layer, extern "C") ───

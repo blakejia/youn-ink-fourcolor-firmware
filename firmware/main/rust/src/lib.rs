@@ -16,6 +16,7 @@
 // needs). Nothing here uses std either way.
 #![cfg_attr(target_arch = "xtensa", no_std)]
 
+pub mod battery_activity_policy;
 pub mod charge_policy;
 pub mod led_policy;
 pub mod time_gate_policy;

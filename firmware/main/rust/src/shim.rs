@@ -100,12 +100,29 @@ unsafe extern "C" {
     pub fn rf_panel_activity_counters(refreshes: *mut u32, busy_ms: *mut u32);
     /// `esp_reset_reason()` at boot (shim.cpp caches it once; Rust only reads).
     pub fn rf_last_reset_reason() -> u32;
-    pub fn rf_battery_sample(mv: *mut u16, pct: *mut u8, charge: *mut u8) -> i32;
-    /// One-hour battery-report gate (spec 2026-09-23): peek with
-    /// `rf_battery_due`, arm with `rf_battery_arm` after a real report.
-    /// C++ impl in shim.cpp keeps the stamp in RTC slow memory.
-    pub fn rf_battery_due() -> i32;
-    pub fn rf_battery_arm();
+    // ── battery relative-activity sample path (task 4) ──
+    // `battery_activity_policy.rs` owns accept/filter/direction/activity/
+    // next-gate; shim.cpp owns the cheap facts, the ADC burst and the RTC
+    // stamp + baseline bytes. Struct layout lives in
+    // `rust/include/battery_activity_policy.h`.
+    /// Fill the cheap facts (charge, effective clock, RTC stamps, baseline).
+    /// Returns 1 on success, 0 if the board cannot supply facts.
+    pub fn rf_battery_activity_context(
+        inp: *mut crate::battery_activity_policy::SampleInputs,
+    ) -> i32;
+    /// The 10-sample ADC burst + mV/% (C++ mechanism). Called only after
+    /// `battery_activity_policy::gate_open` opened the window. Fills
+    /// `voltage_mv`/`has_sample` and returns the existing display percent
+    /// (`p=`, a C++ protocol value) through `percent_out`.
+    pub fn rf_battery_activity_read(
+        inp: *mut crate::battery_activity_policy::SampleInputs,
+        percent_out: *mut u8,
+    ) -> i32;
+    /// Persist the decision: advance the RTC report stamp (guarded by the
+    /// implausible-clock sentinel) and record the new activity baseline.
+    /// Returns 1 when the stamp advanced, 0 when refused.
+    pub fn rf_battery_activity_commit(next_sample_s: i64, voltage_mv: u16,
+                                      direction: u8) -> i32;
 
     // ── notify pull gate (notify_policy.rs decides; C++ owns the storage) ──
     /// Wall clock seconds (`time(nullptr)`), signed like the time-gate inputs.
@@ -272,6 +289,7 @@ pub(crate) mod host {
         *FAIL_STREAK.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         *NOTIFY_GATE.lock().unwrap_or_else(|e| e.into_inner()) = (-1, -1, 0);
         *TIME_NOW.lock().unwrap_or_else(|e| e.into_inner()) = 1_700_000_000;
+        reset_battery_staging();
         *POWER.lock().unwrap_or_else(|e| e.into_inner()) = [0; 5];
         AUDIO_ON.store(true, std::sync::atomic::Ordering::SeqCst);
         guard
@@ -474,34 +492,27 @@ pub(crate) mod host {
         *RESET_REASON.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    // NOTE: this host-stub collides with the C++ rf_battery_sample at firmware
-    // link time.  #[cfg(test)] gates it so cargo test uses the stub while
-    // firmware linking resolves the C++ symbol.  (Task 2 gate.)
-    #[cfg(test)]
-    #[unsafe(no_mangle)]
-    pub extern "C" fn rf_battery_sample(mv: *mut u16, pct: *mut u8, charge: *mut u8) -> i32 {
-        let b = *BATTERY.lock().unwrap_or_else(|e| e.into_inner());
-        match b {
-            Some((m, p, c)) => {
-                unsafe {
-                    if !mv.is_null() { *mv = m; }
-                    if !pct.is_null() { *pct = p; }
-                    if !charge.is_null() { *charge = c; }
-                }
-                1
-            }
-            None => 0,
-        }
-    }
+    // ── battery sample path (task 4) ──
+    // Device side resolves these against shim.cpp; on the host they stage
+    // the facts / ADC outcome / report the tests script. The whole `host`
+    // module is cfg(test)-gated, so nothing here collides with the C++
+    // symbols at firmware link time.
     /// Scripted battery sample for the `?v=&p=&c=` query params. `None` = no
-    /// valid reading this cycle (sensor absent, ADC failure, or mains-powered
-    /// skip) — the URL omits the params entirely rather than sending zeros.
+    /// valid reading this cycle (sensor absent, ADC failure, or no battery) —
+    /// the URL omits the params entirely rather than sending zeros.
     static BATTERY: Mutex<Option<(u16, u8, u8)>> = Mutex::new(None);
     pub fn set_battery_sample(mv: u16, pct: u8, charge: u8) {
         *BATTERY.lock().unwrap_or_else(|e| e.into_inner()) = Some((mv, pct, charge));
     }
     pub fn set_battery_sample_none() {
         *BATTERY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Explicit activity baseline (last REPORTED sample). `None` = derive it
+    /// from the staged sample itself, which models "first report after boot".
+    static BATTERY_PREV: Mutex<Option<(u16, u8)>> = Mutex::new(None);
+    pub fn set_battery_prev(mv: u16, charge: u8) {
+        *BATTERY_PREV.lock().unwrap_or_else(|e| e.into_inner()) = Some((mv, charge));
     }
 
     /// Staged one-hour report-gate state. `DUE` defaults to true, mirroring
@@ -518,16 +529,83 @@ pub(crate) mod host {
         *BATTERY_ARMED.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    #[cfg(test)]
-    #[unsafe(no_mangle)]
-    pub extern "C" fn rf_battery_due() -> i32 {
-        *BATTERY_DUE.lock().unwrap_or_else(|e| e.into_inner()) as i32
+    /// Reset the staged battery state: no sample, no baseline, cold-boot
+    /// gate (due), gate not yet slid for this wake.
+    pub fn reset_battery_staging() {
+        *BATTERY_PREV.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *BATTERY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *BATTERY_DUE.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *BATTERY_ARMED.lock().unwrap_or_else(|e| e.into_inner()) = false;
     }
 
-    #[cfg(test)]
     #[unsafe(no_mangle)]
-    pub extern "C" fn rf_battery_arm() {
+    pub extern "C" fn rf_battery_activity_context(
+        inp: *mut crate::battery_activity_policy::SampleInputs,
+    ) -> i32 {
+        let b = *BATTERY.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = (*BATTERY_PREV.lock().unwrap_or_else(|e| e.into_inner()))
+            .or_else(|| b.map(|x| (x.0, x.2)));
+        let due = *BATTERY_DUE.lock().unwrap_or_else(|e| e.into_inner());
+        let now = TIME_NOW.lock().unwrap_or_else(|e| e.into_inner()).max(0);
+        if inp.is_null() {
+            return 0;
+        }
+        unsafe {
+            let i = &mut *inp;
+            i.voltage_mv = 0;
+            i.charge = b.map(|x| x.2).unwrap_or(0);
+            i.has_sample = false;
+            i._pad = [0; 4];
+            i.now_s = now;
+            // DUE models the RTC report stamp: due => the last report is old
+            // enough to open the window; not due => stamped this very second
+            // (elapsed 0 keeps it closed).
+            i.last_sample_s = if due { now.saturating_sub(7200) } else { now };
+            i.prev_mv = prev.map(|x| x.0).unwrap_or(0);
+            i.prev_charge = prev.map(|x| x.1).unwrap_or(0);
+            i.prev_valid = prev.is_some();
+            i.min_interval_s = 3600;
+        }
+        1
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_battery_activity_read(
+        inp: *mut crate::battery_activity_policy::SampleInputs,
+        percent_out: *mut u8,
+    ) -> i32 {
+        note("battery_read");
+        let b = *BATTERY.lock().unwrap_or_else(|e| e.into_inner());
+        match b {
+            Some((m, p, _c)) => unsafe {
+                if !inp.is_null() {
+                    (*inp).voltage_mv = m;
+                    (*inp).has_sample = true;
+                }
+                if !percent_out.is_null() {
+                    *percent_out = p;
+                }
+                1
+            },
+            None => unsafe {
+                if !inp.is_null() {
+                    (*inp).has_sample = false;
+                }
+                0
+            },
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_battery_activity_commit(
+        _next_sample_s: i64,
+        _voltage_mv: u16,
+        _direction: u8,
+    ) -> i32 {
+        // The device additionally refuses implausible-clock stamps; the host
+        // models the outcome the tests assert — the gate slid.
         *BATTERY_ARMED.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        1
     }
 
     /// Any request whose URL contains `suffix` gets `status` + `body`.

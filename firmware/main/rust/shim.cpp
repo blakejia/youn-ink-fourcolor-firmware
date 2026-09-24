@@ -44,6 +44,7 @@
 #include "page_sync.h"
 #include "server_pairing.h"
 #include "rust/include/time_gate_policy.h"
+#include "rust/include/battery_activity_policy.h"
 
 namespace {
 
@@ -456,35 +457,31 @@ extern "C" uint32_t rf_last_reset_reason(void) {
     }
     return g_last_reset_reason;
 }
-// Forward declaration: ZectrixReadBatterySample is defined in the board .cc
-// and compiled into the firmware, but no header exports it to this TU.
+// Forward declarations: the board .cc exports these without a header.
 extern "C" bool ZectrixReadBatterySample(uint16_t* mv, uint8_t* pct, uint8_t* charge);
+extern "C" uint8_t ZectrixReadChargeEncoding(void);
 
-// Battery telemetry: page_sync rides ?v=&p=&c= on the schedule GET. Values
-// come from the board's ADC + charge snapshot; 0 / false return = no valid
-// reading (mains / no battery / ADC failure), which Rust maps to "omit params".
-extern "C" int rf_battery_sample(uint16_t* mv, uint8_t* pct, uint8_t* charge) {
-    return ZectrixReadBatterySample(mv, pct, charge) ? 1 : 0;
-}
-
-// One-hour sliding battery-report gate (spec 2026-09-23): deep sleep clears
-// RAM, so the due-at stamp lives in RTC slow memory — it survives every
-// duty-cycle wake and is zeroed on cold boot (flash => report on first wake).
-// Clock resolution (A): prefer SNTP time(); fall back to the PCF8563, which
-// SNTP writes on every sync (so it holds time across power loss too). An
-// implausible clock (< 2020) reports but never stamps — a 1970 boot cannot
-// poison the window, and the first post-sync report arms it. Peek and arm are
-// separate: page_sync arms only after a real sample reached the URL, so an
-// ADC hiccup never buys an hour of silence.
+// ── battery relative-activity sample path (task 4, design §5) ──
+// The decision lives in `battery_activity_policy.rs` — accept / outlier
+// filter / direction / relative activity / next gate; this shim owns only
+// the facts and the bytes (ADC, charge GPIO, RTC stamps, the `p=` percent).
+// Deep sleep clears RAM, so the one-hour report stamp AND the last reported
+// sample (the activity baseline) live in RTC slow memory: they survive every
+// duty-cycle wake and are zeroed on cold boot (=> first wake reports with an
+// empty baseline => resting).
 //
-// The decision now lives in `time_gate_policy.rs`. This shim only owns the
-// RTC slow-memory stamp (`g_battery_due_at`) and reads the wall clock +
-// PCF8563 fallback. The Rust policy returns `battery_sample_ok` plus the
-// next arm stamp, and `time()==-1` is propagated as a negative `now_s`
-// before any u32 narrowing (see RfReadNowSigned() in application.cc — we
-// keep that helper mirrored here to avoid a header dependency on the
+// Clock resolution mirrors the old BatteryClock gate: prefer SNTP time();
+// fall back to the PCF8563, which SNTP writes on every sync (so it holds
+// time across power loss too). An implausible clock (< 2020) reports but
+// never stamps — a 1970 boot cannot poison the window, and the first
+// post-sync report arms it. `time()==-1` propagates as a negative `now_s`
+// before any u32 narrowing (see RfReadNowSigned() in application.cc — that
+// helper stays mirrored here to avoid a header dependency on the
 // application-side observer).
 RTC_DATA_ATTR static uint32_t g_battery_due_at;
+RTC_DATA_ATTR static uint16_t g_battery_prev_mv;
+RTC_DATA_ATTR static uint8_t g_battery_prev_charge;
+RTC_DATA_ATTR static uint8_t g_battery_prev_valid;
 extern "C" int ZectrixRtcNowEpoch(uint32_t* epoch);  // board .cc (mechanism)
 
 static int64_t ShimReadNowSigned(void) {
@@ -497,43 +494,69 @@ static uint32_t ShimReadRtcEpoch(void) {
     }
     return 0;
 }
-static int ShimDecideBattery(uint32_t last_arm, uint32_t* next_arm_out) {
+// Effective clock for the battery gate: wall clock when plausible, else the
+// PCF8563 fallback, else -1 (unset => report every wake, never arm).
+static int64_t ShimBatteryNow(void) {
     const int64_t now = ShimReadNowSigned();
+    if (now >= (int64_t)RF_TIME_GATE_NEVER) return now;
     const uint32_t effective = ShimReadRtcEpoch();
-    const bool now_valid = (now >= (int64_t)RF_TIME_GATE_NEVER);
-    const bool rtc_valid = (effective >= RF_TIME_GATE_NEVER);
-    rf_time_gate_policy_inputs_t in{};
-    in.now_s = now;
-    in.effective_clock_s = effective;
-    in.last_sntp_sync_s = RF_TIME_GATE_NEVER;
-    in.last_battery_arm_s = last_arm;
-    in.sntp_min_period_s = 24u * 60u * 60u;
-    in.battery_min_period_s = 60u * 60u;
-    in.clock_valid_mask =
-        (now_valid ? RF_TIME_GATE_CLOCK_NOW_VALID : 0u) |
-        (rtc_valid ? RF_TIME_GATE_CLOCK_RTC_VALID : 0u) |
-        (now_valid ? RF_TIME_GATE_CLOCK_EVER_SYNCED : 0u);
-    rf_time_gate_policy_output_t out{};
-    rf_time_gate_policy_decide(&in, &out);
-    if (next_arm_out != nullptr) {
-        *next_arm_out = out.next_last_battery_arm_s;
-    }
-    return (int)out.battery_sample_ok;
+    if (effective >= RF_TIME_GATE_NEVER) return (int64_t)effective;
+    return -1;
 }
 
-extern "C" int rf_battery_due(void) {
-    return ShimDecideBattery(g_battery_due_at, nullptr);
+// Cheap facts: charge encoding (GPIO snapshot), effective clock, the RTC
+// report stamp and the last reported sample. NO ADC burst here — Rust's
+// gate_open decides whether the read below is worth performing.
+extern "C" int rf_battery_activity_context(rf_battery_activity_inputs_t* inp) {
+    if (inp == nullptr) return 0;
+    memset(inp, 0, sizeof(*inp));
+    inp->charge = ZectrixReadChargeEncoding();
+    inp->now_s = ShimBatteryNow();
+    inp->last_sample_s =
+        (g_battery_due_at >= RF_TIME_GATE_NEVER) ? (int64_t)g_battery_due_at : -1;
+    inp->prev_mv = g_battery_prev_mv;
+    inp->prev_charge = g_battery_prev_charge;
+    inp->prev_valid = g_battery_prev_valid;
+    inp->min_interval_s = 60u * 60u;
+    return 1;
 }
-extern "C" void rf_battery_arm(void) {
-    uint32_t next_arm = RF_TIME_GATE_NEVER;
-    if (ShimDecideBattery(g_battery_due_at, &next_arm)) {
-        // Rust tells us to arm only when the wall clock is plausible.
-        // On fallback / 1970 paths `next_arm` stays at NEVER (sentinel),
-        // so we never poison g_battery_due_at.
-        if (next_arm != RF_TIME_GATE_NEVER) {
-            g_battery_due_at = next_arm;
-        }
+
+// The 10-sample ADC burst + voltage->mV/% (C++ mechanism; the percent map is
+// the existing display/protocol value feeding `p=`, deliberately not a Rust
+// output). Called only after Rust's gate_open opened the window.
+extern "C" int rf_battery_activity_read(rf_battery_activity_inputs_t* inp,
+                                        uint8_t* percent_out) {
+    if (inp == nullptr || percent_out == nullptr) return 0;
+    uint16_t v = 0;
+    uint8_t p = 0;
+    uint8_t ignored_charge = 0;  // the context's snapshot is the policy's fact
+    if (!ZectrixReadBatterySample(&v, &p, &ignored_charge)) {
+        inp->has_sample = 0;
+        inp->voltage_mv = 0;
+        return 0;
     }
+    inp->voltage_mv = v;
+    inp->has_sample = 1;
+    *percent_out = p;
+    return 1;
+}
+
+// Persist the decision bytes: the new activity baseline (this sample was
+// accepted, so the next transition/activity comparison starts here) and —
+// when the clock is plausible — the next report stamp. Same NEVER guard the
+// old rf_battery_arm had: an unset/1970 clock reports but never advances
+// the window.
+extern "C" int rf_battery_activity_commit(int64_t next_sample_s,
+                                          uint16_t voltage_mv,
+                                          uint8_t direction) {
+    g_battery_prev_mv = voltage_mv;
+    g_battery_prev_charge = direction;
+    g_battery_prev_valid = 1;
+    if (next_sample_s >= (int64_t)RF_TIME_GATE_NEVER) {
+        g_battery_due_at = (uint32_t)next_sample_s;
+        return 1;
+    }
+    return 0;
 }
 
 extern "C" int rf_time_gate_wifi_cache_ok(void) {

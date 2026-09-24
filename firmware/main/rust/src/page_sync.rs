@@ -16,6 +16,7 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::json;
+use crate::battery_activity_policy;
 use crate::{log_e, log_i, log_w};
 
 use crate::shim::{self, CBuf};
@@ -160,7 +161,6 @@ pub(crate) fn reset_for_test() {
 
 
 // ── fetching ───────────────────────────────────────────────────────────────
-
 /// GET `/api/pages/schedule` into `buf`; returns the body length.
 ///
 /// The caller must hold no lock: `rf_build_endpoint`/HTTP can block for seconds.
@@ -177,18 +177,43 @@ fn fetch_schedule(buf: &mut [u8]) -> Option<usize> {
         "?w={}&a={}&r={}&g={}&f={}&er={}&eb={}&rr={}",
         c[0], c[1], c[2], c[3], c[4], panel[0], panel[1], rr);
 
-    // One-hour sliding gate (spec 2026-09-23): v/p/c ride only when due, and
-    // arming happens AFTER a real sample lands on the wire — peek and arm are
-    // split so one ADC hiccup can't silence an hour of telemetry. Inside the
-    // window we also skip the read itself, so the 10-sample ADC burst rides
-    // only on reporting wakes.
-    if unsafe { shim::rf_battery_due() } != 0 {
-        let mut b_mv: u16 = 0;
-        let mut b_pct: u8 = 0;
-        let mut b_chg: u8 = 0;
-        if unsafe { shim::rf_battery_sample(&mut b_mv, &mut b_pct, &mut b_chg) } == 1 && b_mv > 0 {
-            let _ = write!(path, "&v={}&p={}&c={}", b_mv, b_pct, b_chg);
-            unsafe { shim::rf_battery_arm() };
+    // Battery relative-activity report (task 4, design §5): C++ supplies the
+    // facts, Rust owns accept / outlier-filter / direction / relative
+    // activity / next-gate. The cheap gate runs BEFORE the 10-sample ADC
+    // burst, so inside the window with no direction change no read happens
+    // at all; v/p/c ride only when the policy accepts, and the RTC stamp
+    // advances only after an accepted sample — one ADC hiccup can't silence
+    // an hour of telemetry. `c=` carries Rust's `direction`; `p=` stays the
+    // C++ display mapping (protocol value, deliberately not a Rust output).
+    let mut bat = battery_activity_policy::SampleInputs {
+        voltage_mv: 0,
+        charge: battery_activity_policy::DIRECTION_UNKNOWN,
+        has_sample: false,
+        _pad: [0; 4],
+        now_s: 0,
+        last_sample_s: -1,
+        prev_mv: 0,
+        prev_charge: battery_activity_policy::DIRECTION_UNKNOWN,
+        prev_valid: false,
+        min_interval_s: 0,
+    };
+    if unsafe { shim::rf_battery_activity_context(&mut bat) } == 1
+        && battery_activity_policy::gate_open(&bat)
+    {
+        let mut pct: u8 = 0;
+        if unsafe { shim::rf_battery_activity_read(&mut bat, &mut pct) } == 1 {
+            let out = battery_activity_policy::decide(&bat);
+            if out.accept == 1 {
+                let _ = write!(path, "&v={}&p={}&c={}", bat.voltage_mv, pct, out.direction);
+                unsafe {
+                    shim::rf_battery_activity_commit(
+                        out.next_sample_s, bat.voltage_mv, out.direction);
+                }
+            }
+            log_i!("PageSync",
+                   "battery v={} p={} dir={} act={} accept={} filtered={}",
+                   bat.voltage_mv, pct, out.direction, out.relative_activity,
+                   out.accept, out.filtered);
         }
     }
 
@@ -1735,6 +1760,10 @@ mod tests {
             .expect("schedule GET");
         assert!(!sched.contains("v="), "inside the window v/p/c must be omitted: {sched}");
         assert!(!shim::host::battery_armed(), "a peek must not arm the gate");
+        // The cheap gate must also spare the 10-sample ADC burst inside the
+        // window: no read, no report, no arm.
+        assert!(shim::host::calls_matching("battery_read").is_empty(),
+                "inside the window the ADC burst must be skipped");
     }
 
     #[test]
@@ -1751,6 +1780,8 @@ mod tests {
         assert!(gets.iter().any(|c| c.contains("v=3980&p=76&c=4")),
                 "due report missing from the schedule URL: {gets:?}");
         assert!(shim::host::battery_armed(), "a real report must slide the gate");
+        assert!(!shim::host::calls_matching("battery_read").is_empty(),
+                "a due wake must perform the ADC burst");
     }
 
     #[test]
@@ -1767,6 +1798,26 @@ mod tests {
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
         sync_once();
         assert!(!shim::host::battery_armed(), "failed sample must not arm the gate");
+    }
+
+    #[test]
+    fn a_direction_transition_reports_inside_the_window() {
+        // Task 4 rule (design §5): a charging->discharging flip must not wait
+        // out the one-hour window — the transition sample rides even though
+        // the time gate says "not due", and `c=` carries Rust's direction.
+        let _g = shim::host::lock();
+        shim::host::set_counters(1, 100, 50, 1, 0);
+        shim::host::set_reset_reason(3);
+        shim::host::set_battery_sample(4050, 80, 4);  // now: unplugged, discharging
+        shim::host::set_battery_prev(4100, 2);         // last report: charging
+        shim::host::set_battery_due(false);            // window closed
+        shim::host::clear_battery_armed();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+        let gets = shim::host::calls_matching("http_get");
+        assert!(gets.iter().any(|c| c.contains("v=4050&p=80&c=4")),
+                "transition sample missing from the schedule URL: {gets:?}");
+        assert!(shim::host::battery_armed(), "an accepted transition arms the gate");
     }
 
     #[test]
