@@ -379,6 +379,35 @@ extern "C" void rf_fail_streak_set(uint32_t streak) {
     g_fail_streak = streak;
 }
 
+// ── notify pull-gate stats (notify_policy.rs decides; this owns storage) ──
+// Deep sleep clears RAM (same reason as g_fail_streak above), so the pull
+// attempt/failure stamps and the failure streak live in RTC slow memory.
+// The fetch task records each outcome here (rf_notify_gate_record); the C++
+// pull call sites read them (rf_notify_gate_stats) before asking the Rust
+// gate whether to pull now.
+RTC_DATA_ATTR static int64_t g_notify_last_pull_s = -1;
+RTC_DATA_ATTR static int64_t g_notify_last_failure_s = -1;
+RTC_DATA_ATTR static uint32_t g_notify_fail_streak;
+
+extern "C" int64_t rf_time_now_s(void) {
+    return (int64_t)time(nullptr);
+}
+
+extern "C" void rf_notify_gate_stats(int64_t* last_pull_s,
+                                     int64_t* last_failure_s,
+                                     uint32_t* streak) {
+    if (last_pull_s) *last_pull_s = g_notify_last_pull_s;
+    if (last_failure_s) *last_failure_s = g_notify_last_failure_s;
+    if (streak) *streak = g_notify_fail_streak;
+}
+
+extern "C" void rf_notify_gate_record(int64_t now_s, uint8_t failed,
+                                      uint32_t streak) {
+    g_notify_last_pull_s = now_s;
+    if (failed) g_notify_last_failure_s = now_s;
+    g_notify_fail_streak = streak;
+}
+
 extern "C" int rf_wakeup_cause(void) {
     // esp_sleep_get_wakeup_cause() is deprecated in v6.0; the replacement
     // returns a bitmap whose bit index is the esp_sleep_wakeup_cause_t value.

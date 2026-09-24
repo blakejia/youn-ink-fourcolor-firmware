@@ -9,6 +9,7 @@
 #define NOTIFY_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,6 +45,13 @@ bool notify_is_active(void);
  * stranded、通知永久丢失。见实现注释。
  */
 bool notify_is_fetching(void);
+
+/**
+ * @brief 当前通知模块状态（0=IDLE 1=FETCHING 2=NOTIFYING，RF_NOTIFY_STATE_*）
+ *
+ * 供 C++ 拉取门（notify_policy.h）读取事实：只有 IDLE 才允许发起拉取。
+ */
+uint8_t notify_state(void);
 
 /**
  * @brief 提交 ack 并关闭展示（上/下键触发）

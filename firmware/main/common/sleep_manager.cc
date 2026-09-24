@@ -34,6 +34,11 @@ void SleepManager::SetBusy(SleepBusySrc src, bool busy) {
     }
 }
 
+bool SleepManager::Busy(SleepBusySrc src) const {
+    return (g_sm.busy_mask.load(std::memory_order_acquire) &
+            static_cast<uint32_t>(src)) != 0;
+}
+
 void SleepManager::Kick(uint32_t delay_ms, const char* /*reason*/) {
     const int64_t new_deadline = NowMs() + static_cast<int64_t>(delay_ms);
     int64_t cur = g_sm.deadline_ms.load(std::memory_order_acquire);

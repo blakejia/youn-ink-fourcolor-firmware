@@ -20,6 +20,9 @@ use crate::json;
 use crate::page_sync;
 use crate::shim::{self, CBuf};
 use crate::{log_e, log_i, log_w};
+use crate::notify_policy::{self, CONSUME_NONE_EMPTY, CONSUME_RETRY_BACKOFF,
+    CONSUME_SHOW, CONSUME_SKIP_DUPLICATE, RESPONSE_BINARY_NOTIFY,
+    RESPONSE_EMPTY, RESPONSE_JSON_FALLBACK, RESPONSE_JSON_NOTIFY, ResponseFacts};
 
 const TAG: &str = "Notify";
 const HTTP_TIMEOUT_MS: i32 = 10_000;
@@ -47,9 +50,22 @@ struct Shared(UnsafeCell<[u8; ID_CAP]>);
 unsafe impl Sync for Shared {}
 static ID: Shared = Shared(UnsafeCell::new([0; ID_CAP]));
 
+/// Dedup memory: the id of the last notification shown this boot. Kept
+/// separate from [`ID`] because dismiss clears that one — a server re-offer
+/// of an already-consumed id must skip instead of repainting after the
+/// popup went away.
+static LAST_ID: Shared = Shared(UnsafeCell::new([0; ID_CAP]));
+
 fn with_id<R>(f: impl FnOnce(&mut [u8; ID_CAP]) -> R) -> R {
     unsafe { shim::rf_state_lock() };
     let out = f(unsafe { &mut *ID.0.get() });
+    unsafe { shim::rf_state_unlock() };
+    out
+}
+
+fn with_last<R>(f: impl FnOnce(&mut [u8; ID_CAP]) -> R) -> R {
+    unsafe { shim::rf_state_lock() };
+    let out = f(unsafe { &mut *LAST_ID.0.get() });
     unsafe { shim::rf_state_unlock() };
     out
 }
@@ -68,6 +84,19 @@ fn store_id(id: &[u8]) {
         let n = id.len().min(ID_CAP - 1);
         slot[..n].copy_from_slice(&id[..n]);
     });
+}
+
+/// Record the id as consumed for dedup purposes (survives dismiss).
+fn remember_id(id: &[u8; ID_CAP]) {
+    with_last(|slot| {
+        slot.fill(0);
+        slot.copy_from_slice(id);
+    });
+}
+
+/// True when this id was already shown this boot (server re-offer).
+fn is_duplicate(id: &[u8; ID_CAP]) -> bool {
+    with_last(|prev| prev == id)
 }
 
 fn copy_id_into(dst: *mut u8) {
@@ -169,31 +198,61 @@ pub fn parse_binary_next(body: &[u8]) -> Option<(&[u8], [u8; ID_CAP])> {
     Some((&body[BINARY_ID_LEN..], out))
 }
 
-/// Apply a `.bin` /next response body (status already checked by caller).
-fn handle_binary_next(body: &[u8], bitmap: *mut u8) -> bool {
+/// Run the Rust consume decision for one (maybe) parsed notification and
+/// perform the show side effects only when Rust says show. Returns the
+/// consume action so `fetch_once` can book the pull outcome (a retry means
+/// the pull failed and the failure streak must advance).
+fn consume_parsed(class: u8, id: Option<&[u8; ID_CAP]>, bitmap: *mut u8) -> u8 {
+    let duplicate = id.is_some_and(|i| is_duplicate(i));
+    let action = notify_policy::decide_consume(class, id.is_some(), duplicate);
+    let label = id
+        .map(|i| {
+            let n = i.iter().position(|b| *b == 0).unwrap_or(i.len());
+            core::str::from_utf8(&i[..n]).unwrap_or("?")
+        })
+        .unwrap_or("?");
+    match action {
+        CONSUME_SHOW => {
+            // decide_consume only returns Show for a parsed id.
+            let id = id.expect("show implies a parsed id");
+            store_id(id);
+            remember_id(id);
+            show_bitmap(bitmap);
+            set_state(NOTIFYING);
+            unsafe { shim::rf_timer_start() };
+            log_i!(TAG, "notify {} displaying", label);
+            action
+        }
+        CONSUME_SKIP_DUPLICATE => {
+            log_i!(TAG, "duplicate notification {} skipped", label);
+            action
+        }
+        _ => {
+            log_w!(TAG, "notification body unusable (class={})", class);
+            action
+        }
+    }
+}
+
+/// Apply a `.bin` /next response body (status already checked by caller);
+/// returns the consume action (see [`consume_parsed`]).
+fn handle_binary_next(body: &[u8], bitmap: *mut u8) -> u8 {
     match parse_binary_next(body) {
         Some((raw, id)) => {
             let dst = unsafe {
                 core::slice::from_raw_parts_mut(bitmap, page_sync::PAGE_BITMAP_SIZE)
             };
             dst.copy_from_slice(raw);
-            store_id(&id);
-            show_bitmap(bitmap);
-            set_state(NOTIFYING);
-            unsafe { shim::rf_timer_start() };
-            log_i!(TAG, "notify {:?} displaying (binary)",
-                   core::str::from_utf8(&id[..BINARY_ID_LEN]).unwrap_or("?"));
-            true
+            consume_parsed(RESPONSE_BINARY_NOTIFY, Some(&id), bitmap)
         }
-        None => false,
+        None => consume_parsed(RESPONSE_BINARY_NOTIFY, None, bitmap),
     }
 }
 
 /// JSON `/next` fallback for servers predating `.bin` (404 on the binary
 /// path). Runs its own GET; the caller's `buf` still holds the failed binary
 /// response, so this allocates a fresh one. The fallback shares handle_next
-/// with the original JSON flow so both paths keep one parse/ack semantics.
-fn fetch_json_fallback(device_id: &[u8], bitmap: *mut u8) -> bool {
+fn fetch_json_fallback(device_id: &[u8], bitmap: *mut u8) -> u8 {
     use core::fmt::Write as _;
     let mut path = CBuf::<96>::new();
     let _ = write!(
@@ -204,14 +263,14 @@ fn fetch_json_fallback(device_id: &[u8], bitmap: *mut u8) -> bool {
     let mut url = CBuf::<320>::new();
     if unsafe { shim::rf_build_endpoint(path.as_ptr(), url.as_mut_ptr(), 320) } == 0 {
         log_w!(TAG, "fallback: cannot build endpoint");
-        return false;
+        return CONSUME_RETRY_BACKOFF;
     }
     let mut token = CBuf::<80>::new();
     unsafe { shim::rf_get_token(token.as_mut_ptr(), 80) };
     let buf = unsafe { shim::rf_alloc(RESPONSE_BUF + 1) };
     if buf.is_null() {
         log_e!(TAG, "fallback: alloc failed");
-        return false;
+        return CONSUME_RETRY_BACKOFF;
     }
     let mut len = (RESPONSE_BUF + 1) as i32;
     let status = unsafe {
@@ -220,9 +279,9 @@ fn fetch_json_fallback(device_id: &[u8], bitmap: *mut u8) -> bool {
     };
     let len = (len.max(0) as usize).min(RESPONSE_BUF + 1);
     let body = unsafe { core::slice::from_raw_parts(buf, len) };
-    let shown = handle_next(status, body, bitmap);
+    let action = handle_next(status, body, bitmap);
     unsafe { shim::rf_free(buf) };
-    shown
+    action
 }
 
 /// Decode `b64` straight into the caller's bitmap buffer.
@@ -241,32 +300,29 @@ fn decode_next(b64: &[u8], out_bitmap: *mut u8) -> bool {
     }
 }
 
-/// Apply a `/next` response.
-///
-/// Returns true only when a notification is now on screen, i.e. the response
-/// carried both a decodable bitmap and a usable id.
-fn handle_next(status: i32, body: &[u8], bitmap: *mut u8) -> bool {
-    match status {
-        200 => match parse_next(body) {
-            Some((b64, id)) if decode_next(b64, bitmap) => {
-                store_id(&id);
-                show_bitmap(bitmap);
-                set_state(NOTIFYING);
-                unsafe { shim::rf_timer_start() };
-                let id_len = id.iter().position(|b| *b == 0).unwrap_or(id.len());
-                log_i!(TAG, "notify {:?} displaying",
-                       core::str::from_utf8(&id[..id_len]).unwrap_or("?"));
-                true
+/// Apply a `/next` response on the JSON path: classify through the Rust
+/// policy, then consume. Returns the consume action.
+fn handle_next(status: i32, body: &[u8], bitmap: *mut u8) -> u8 {
+    let class = notify_policy::classify_response(&ResponseFacts {
+        status,
+        binary_path: false,
+        _pad: [0; 3],
+    });
+    match class {
+        RESPONSE_JSON_NOTIFY => {
+            let parsed = parse_next(body).map(|(b64, id)| (decode_next(b64, bitmap), id));
+            match parsed {
+                Some((true, id)) => consume_parsed(class, Some(&id), bitmap),
+                _ => consume_parsed(class, None, bitmap),
             }
-            _ => false,
-        },
-        204 => {
+        }
+        RESPONSE_EMPTY => {
             log_i!(TAG, "no pending notification (204)");
-            false
+            CONSUME_NONE_EMPTY
         }
         other => {
-            log_w!(TAG, "next fetch failed (status={})", other);
-            false
+            log_w!(TAG, "next fetch failed (status={})", status);
+            notify_policy::decide_consume(other, false, false)
         }
     }
 }
@@ -294,11 +350,27 @@ fn ack_body(decision: &[u8]) -> CBuf<64> {
 pub(crate) fn reset_for_test() {
     set_state(IDLE);
     with_id(|slot| slot.fill(0));
+    with_last(|slot| slot.fill(0));
 }
 
 extern "C" fn fetch_task(_arg: *mut c_void) {
     fetch_once();
     unsafe { shim::rf_task_exit() };
+}
+
+/// Persist one pull outcome for the Rust pull gate. The stamps and streak
+/// live in RTC slow memory (shim.cpp owns the storage — RAM clears on every
+/// duty-cycle wake); the streak step itself comes from
+/// `notify_policy::record_result`.
+fn record_pull_outcome(ok: bool) {
+    let mut last_pull = 0i64;
+    let mut last_failure = 0i64;
+    let mut streak = 0u32;
+    unsafe {
+        shim::rf_notify_gate_stats(&mut last_pull, &mut last_failure, &mut streak);
+        let next = notify_policy::record_result(ok, streak);
+        shim::rf_notify_gate_record(shim::rf_time_now_s(), (!ok) as u8, next);
+    }
 }
 
 /// Pull `/next` and act on it. Runs in its own task on the device so the button
@@ -357,24 +429,35 @@ fn fetch_once() {
 
     let len = (len.max(0) as usize).min(RESPONSE_BUF + 1);
     let body = unsafe { core::slice::from_raw_parts(buf, len) };
-    let shown = match status {
-        200 => handle_binary_next(body, bitmap),
-        204 => {
+    // Classification and the consume decision come from the Rust policy
+    // (notify_policy.rs): 200 binary / 204 empty / 404 -> JSON fallback /
+    // anything else -> failure, exactly like the old `match status`.
+    let class = notify_policy::classify_response(&ResponseFacts {
+        status,
+        binary_path: true,
+        _pad: [0; 3],
+    });
+    let action = match class {
+        RESPONSE_BINARY_NOTIFY => handle_binary_next(body, bitmap),
+        RESPONSE_EMPTY => {
             log_i!(TAG, "no pending notification (204, binary)");
-            false
+            CONSUME_NONE_EMPTY
         }
         // Older server without /next.bin: fall back to the JSON endpoint so a
         // firmware newer than its server keeps working (rolling deploy).
-        404 => fetch_json_fallback(device_id.as_bytes(), bitmap),
+        RESPONSE_JSON_FALLBACK => fetch_json_fallback(device_id.as_bytes(), bitmap),
         other => {
-            log_w!(TAG, "binary next fetch failed (status={})", other);
-            false
+            log_w!(TAG, "binary next fetch failed (status={})", status);
+            notify_policy::decide_consume(other, false, false)
         }
     };
-    if !shown && state() == FETCHING {
+    if action != CONSUME_SHOW && state() == FETCHING {
         // Neither path moved the state machine to NOTIFYING; reset the guard.
         set_state(IDLE);
     }
+    // Book the outcome so the pull gate's failure backoff can climb (or
+    // reset) on the next evaluation.
+    record_pull_outcome(action != CONSUME_RETRY_BACKOFF);
 
     unsafe {
         shim::rf_free(buf);
@@ -609,6 +692,12 @@ pub extern "C" fn notify_is_active() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn notify_is_fetching() -> bool {
     is_fetching()
+}
+
+/// The raw module state (`RF_NOTIFY_STATE_*`), read by the C++ pull gate.
+#[unsafe(no_mangle)]
+pub extern "C" fn notify_state() -> u8 {
+    state()
 }
 
 /// `decision` must be NUL-terminated.
@@ -935,6 +1024,60 @@ mod tests {
     fn binary_layout_matches_server_contract() {
         assert_eq!(BINARY_ID_LEN, 32);
         assert_eq!(binary_body_len(), 32 + page_sync::PAGE_BITMAP_SIZE);
+    }
+
+    #[test]
+    fn a_re_offered_notification_is_skipped_after_dismiss() {
+        // The server re-offers the same id (ack race / handout already
+        // marked shown elsewhere). The consume policy says skip: the pull
+        // still runs, but the panel is not touched and no popup returns.
+        let _g = shim::host::lock();
+        boot_with(0x5a, "abcd1234abcd1234abcd1234abcd1234");
+        assert!(is_active(), "the first handout shows");
+        dismiss();
+        let refreshes_after_dismiss = shim::host::refreshes();
+
+        fetch_once();
+
+        assert!(!is_active(), "a duplicate id must not come back on screen");
+        assert_eq!(
+            shim::host::refreshes(),
+            refreshes_after_dismiss,
+            "and the panel is not touched"
+        );
+        assert_eq!(
+            shim::host::calls_matching("/api/notifications/next").len(),
+            2,
+            "the pull itself still ran"
+        );
+    }
+
+    #[test]
+    fn pull_outcomes_feed_the_failure_streak() {
+        // A status error fails the pull (stamped + streaked); the next
+        // healthy round-trip resets the streak but keeps the failure stamp.
+        let _g = shim::host::lock();
+        page_sync::reset_for_test();
+        reset_for_test();
+        shim::host::set_fb();
+
+        shim::host::set_time_s(1_000);
+        shim::host::script_get("/api/notifications/next.bin", 500, b"boom");
+        fetch_once();
+        assert_eq!(
+            shim::host::notify_gate_stats(),
+            (1_000, 1_000, 1),
+            "a status error is a failure: attempt and failure stamped, streak 1"
+        );
+
+        shim::host::set_time_s(2_000);
+        shim::host::script_get("/api/notifications/next.bin", 204, b"");
+        fetch_once();
+        assert_eq!(
+            shim::host::notify_gate_stats(),
+            (2_000, 1_000, 0),
+            "a healthy 204 resets the streak and re-stamps only the attempt"
+        );
     }
 
 }

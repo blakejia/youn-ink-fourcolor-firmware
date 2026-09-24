@@ -26,6 +26,11 @@ public:
     // Gate: busy == 0 && now >= deadline (plus Application::CanEnterSleepMode).
     bool CanSleepNow() const;
 
+    // Read one busy source's raw vote, without folding in the lifecycle
+    // gate or the deadline (CanSleepNow folds those). For callers that need
+    // "is the panel refreshing right now", e.g. the notify pull gate.
+    bool Busy(SleepBusySrc src) const;
+
 private:
     SleepManager() = default;
 };

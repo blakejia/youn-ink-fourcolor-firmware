@@ -26,6 +26,7 @@ pub mod json;
 pub mod lifecycle;
 pub mod log;
 pub mod notify;
+pub mod notify_policy;
 pub mod page_sync;
 pub mod pairing;
 pub mod pairing_response;

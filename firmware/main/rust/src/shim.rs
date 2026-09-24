@@ -106,6 +106,17 @@ unsafe extern "C" {
     /// C++ impl in shim.cpp keeps the stamp in RTC slow memory.
     pub fn rf_battery_due() -> i32;
     pub fn rf_battery_arm();
+
+    // ── notify pull gate (notify_policy.rs decides; C++ owns the storage) ──
+    /// Wall clock seconds (`time(nullptr)`), signed like the time-gate inputs.
+    pub fn rf_time_now_s() -> i64;
+    /// RTC-backed pull-gate stamps: last attempt, last failure, streak.
+    /// Null pointers are ignored.
+    pub fn rf_notify_gate_stats(last_pull_s: *mut i64, last_failure_s: *mut i64,
+                                streak: *mut u32);
+    /// Persist one pull outcome: stamp the attempt, plus the failure stamp
+    /// and the streak step computed by `notify_policy::record_result`.
+    pub fn rf_notify_gate_record(now_s: i64, failed: u8, streak: u32);
 }
 
 /// `abort()`, used by the panic handler.
@@ -259,6 +270,8 @@ pub(crate) mod host {
         ALLOCS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *FAIL_STREAK.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        *NOTIFY_GATE.lock().unwrap_or_else(|e| e.into_inner()) = (-1, -1, 0);
+        *TIME_NOW.lock().unwrap_or_else(|e| e.into_inner()) = 1_700_000_000;
         *POWER.lock().unwrap_or_else(|e| e.into_inner()) = [0; 5];
         AUDIO_ON.store(true, std::sync::atomic::Ordering::SeqCst);
         guard
@@ -326,6 +339,53 @@ pub(crate) mod host {
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_fail_streak_set(streak: u32) {
         *FAIL_STREAK.lock().unwrap_or_else(|e| e.into_inner()) = streak;
+    }
+
+    // ── notify pull-gate stats (device: RTC-backed in shim.cpp) ──
+    /// `(last_pull_s, last_failure_s, streak)`; `-1` stamps mean "never".
+    static NOTIFY_GATE: Mutex<(i64, i64, u32)> = Mutex::new((-1, -1, 0));
+    static TIME_NOW: Mutex<i64> = Mutex::new(1_700_000_000);
+
+    /// Stage the fake wall clock (tests only).
+    pub fn set_time_s(t: i64) {
+        *TIME_NOW.lock().unwrap_or_else(|e| e.into_inner()) = t;
+    }
+
+    pub fn notify_gate_stats() -> (i64, i64, u32) {
+        *NOTIFY_GATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_time_now_s() -> i64 {
+        *TIME_NOW.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_notify_gate_stats(last_pull_s: *mut i64,
+                                           last_failure_s: *mut i64,
+                                           streak: *mut u32) {
+        let g = *NOTIFY_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            if !last_pull_s.is_null() {
+                *last_pull_s = g.0;
+            }
+            if !last_failure_s.is_null() {
+                *last_failure_s = g.1;
+            }
+            if !streak.is_null() {
+                *streak = g.2;
+            }
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_notify_gate_record(now_s: i64, failed: u8, streak: u32) {
+        let mut g = NOTIFY_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = now_s;
+        if failed != 0 {
+            g.1 = now_s;
+        }
+        g.2 = streak;
     }
 
     #[unsafe(no_mangle)]

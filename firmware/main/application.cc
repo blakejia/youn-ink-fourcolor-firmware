@@ -33,6 +33,7 @@
 #include "shim_power.h"
 #include "power.h"
 #include "rust/include/time_gate_policy.h"
+#include "rust/include/notify_policy.h"
 #include <nvs.h>
 
 #include <sys/time.h>
@@ -58,6 +59,14 @@ RTC_DATA_ATTR static std::atomic<uint32_t> s_last_sntp_sync_epoch{0};
 
 constexpr uint32_t kSntpMinPeriodS = 24u * 60u * 60u;
 constexpr uint32_t kBatteryMinPeriodS = 60u * 60u;
+
+// Task 3 (notify pull gate): settings fed to `notify_policy.rs`. C++ owns
+// the values, Rust owns the decision. Conservative: the rate limit only
+// suppresses back-to-back pulls (the old path pulled unconditionally), the
+// backoff mirrors the sync-failure ladder shape and caps at 15 min.
+constexpr uint32_t kNotifyMinIntervalS = 5;
+constexpr uint32_t kNotifyBackoffBaseS = 60;
+constexpr uint32_t kNotifyBackoffMaxS = 900;
 
 // Read `time()` as a signed value so `time()==-1` propagates as -1 instead
 // of becoming 0xFFFFFFFF when narrowed to u32.
@@ -976,13 +985,34 @@ void Application::RouteInput(uint8_t button, uint8_t gesture) {
             notify_dismiss();
             return;
 
-        case RF_INPUT_ACTION_NOTIFY_FETCH_NEXT:
-            notify_request_next();
+        case RF_INPUT_ACTION_NOTIFY_FETCH_NEXT: {
+            // Task 3: the pull decision comes from the Rust policy. Facts C++
+            // already holds: module state, the panel's Display busy vote, the
+            // wall clock and the RTC-backed pull-gate stamps.
+            rf_notify_pull_inputs_t nin = {};
+            nin.state = notify_state();
+            nin.epd_busy =
+                SleepManager::GetInstance().Busy(SleepBusySrc::Display) ? 1 : 0;
+            nin.now_s = RfReadNowSigned();
+            rf_notify_gate_stats(&nin.last_pull_s, &nin.last_failure_s,
+                                 &nin.fail_streak);
+            nin.min_interval_s = kNotifyMinIntervalS;
+            nin.base_backoff_s = kNotifyBackoffBaseS;
+            nin.max_backoff_s = kNotifyBackoffMaxS;
+            rf_notify_pull_output_t nout = {};
+            rf_notify_pull_decide(&nin, &nout);
+            if (nout.action == RF_NOTIFY_PULL_ACTION_PULL) {
+                notify_request_next();
+            } else {
+                ESP_LOGI(kTag, "notify pull held (action=%u wait=%us)",
+                         (unsigned)nout.action, (unsigned)nout.wait_s);
+            }
             // Re-evaluate promptly: the paint-cut radio stays off during a
             // normal display busy window, but an active /next pull must restore
             // it well before the 10 s HTTP timeout (the EPD wave can take 15-25 s).
             RearmPowerTimer(250);
             return;
+        }
 
         case RF_INPUT_ACTION_CANVAS_PREV:
             page_sync_prev();
@@ -1191,7 +1221,28 @@ void Application::RunPowerCycle() {
     // is a whole radio round-trip for nothing. Absent-safe: an old server
     // sends no field, which reads as pending (behave as today: fetch).
     if (page_sync_notify_pending()) {
-        notify_request_next();
+        // Task 3: ask the Rust pull gate before pulling — only IDLE, panel
+        // idle, rate window open and failure backoff elapsed pull now; the
+        // pending notification stays server-side for the next cycle otherwise
+        // (the server TTL keeps offering it).
+        rf_notify_pull_inputs_t nin = {};
+        nin.state = notify_state();
+        nin.epd_busy =
+            SleepManager::GetInstance().Busy(SleepBusySrc::Display) ? 1 : 0;
+        nin.now_s = RfReadNowSigned();
+        rf_notify_gate_stats(&nin.last_pull_s, &nin.last_failure_s,
+                             &nin.fail_streak);
+        nin.min_interval_s = kNotifyMinIntervalS;
+        nin.base_backoff_s = kNotifyBackoffBaseS;
+        nin.max_backoff_s = kNotifyBackoffMaxS;
+        rf_notify_pull_output_t nout = {};
+        rf_notify_pull_decide(&nin, &nout);
+        if (nout.action == RF_NOTIFY_PULL_ACTION_PULL) {
+            notify_request_next();
+        } else {
+            ESP_LOGI(kTag, "notify pull deferred (action=%u wait=%us)",
+                     (unsigned)nout.action, (unsigned)nout.wait_s);
+        }
     }
     // Unconditional, even on an empty schedule: that call draws and records
     // the empty hint, which is what makes the canvas's display-ownership
