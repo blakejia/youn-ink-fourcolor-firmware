@@ -222,7 +222,29 @@ void StartSntpClockSyncOnce() {
         // A (spec 2026-09-23): hand the wall clock to the PCF8563 so it holds
         // time across power loss — the battery gate's clock fallback and any
         // cold boot then know the time without waiting for SNTP.
-        ZectrixRtcSetEpoch((uint32_t)now);
+        // RTC cache write path: the Rust time-gate policy owns "is this
+        // epoch safe to persist?", C++ owns the I2C write itself.
+        // time() arrives signed (it can be -1 before the first settimeofday);
+        // the (uint32_t) cast below is only reached when Rust confirms the
+        // clock is plausible, so -1 can never become a 2106 stamp.
+        {
+            // rtc_cache_ok depends only on now_valid, so no PCF8563 read
+            // is needed here (avoids an extra I2C transaction in the
+            // SNTP callback — the write below is already one).
+            const int64_t now_s = (int64_t)now;
+            const bool now_valid = (now_s >= (int64_t)RF_TIME_GATE_NEVER);
+            rf_time_gate_policy_inputs_t in{};
+            RfFillTimeGateInputs(now_s, /*effective*/ 0,
+                                 s_last_sntp_sync_epoch.load(std::memory_order_acquire),
+                                 RF_TIME_GATE_NEVER,
+                                 now_valid, /*rtc_valid*/ false, /*ever_synced*/ true,
+                                 &in);
+            rf_time_gate_policy_output_t out{};
+            rf_time_gate_policy_decide(&in, &out);
+            if (out.rtc_cache_ok) {
+                ZectrixRtcSetEpoch((uint32_t)now_s);
+            }
+        }
         // Daily gate (RTC-persisted, see rf_sntp_last_sync): SNTP restarts on
         // every duty-cycle wake otherwise — DNS + 1-3 NTP round-trips per
         // wake to re-learn a time the PCF8563 already holds. One resync a day

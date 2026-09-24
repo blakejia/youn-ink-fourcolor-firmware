@@ -161,38 +161,49 @@ pub fn decide(i: &Inputs) -> Output {
     o.rtc_cache_ok = if now_valid(i.clock_valid_mask) { 1 } else { 0 };
 
     // ── 4) Battery sample one-hour gate ──────────────────────────────────────
-    // Mirrors shim.cpp::BatteryClock + rf_battery_due/arm semantics:
-    //   - No clock anywhere (no time(), no RTC fallback)  -> due, do not arm.
-    //   - time() invalid but RTC fallback is plausible     -> due (BatteryClock
-    //                                                       resolves to RTC),
-    //                                                       do not arm.
-    //   - time() plausible, last_arm < NEVER (cold boot)  -> due, arm now+1h.
-    //   - time() plausible, now >= last_arm + period      -> due, arm now+1h.
-    //   - otherwise                                       -> skip.
+    // Mirrors the legacy shim.cpp::BatteryClock + rf_battery_due/arm
+    // semantics exactly:
     //
-    // The fallback path "time() invalid but RTC plausible" is the one the
-    // reviewer flagged: it must preserve the BatteryClock fallback so the
-    // first battery sample of a cold boot is reported, not skipped.
-    let have_effective = (now >= NEVER as i64) || (rtc_valid(i.clock_valid_mask) && i.effective_clock_s >= NEVER);
-    if !have_effective {
-        // No clock anywhere — must report at least once, but never arm.
-        o.battery_sample_ok = 1;
-        o.next_last_battery_arm_s = S;
-    } else if now < NEVER as i64 {
-        // Fallback path: time() invalid but RTC fallback worked. Sample,
-        // but do NOT arm: the next wall-clock tick without a real SNTP
-        // sync could jump backward and re-trigger the gate.
-        o.battery_sample_ok = 1;
-        o.next_last_battery_arm_s = S;
-    } else if i.last_battery_arm_s < NEVER {
-        o.battery_sample_ok = 1;
-        o.next_last_battery_arm_s = (now as u32).saturating_add(i.battery_min_period_s);
-    } else if (now as u64) >= (i.last_battery_arm_s as u64) + (i.battery_min_period_s as u64) {
-        o.battery_sample_ok = 1;
-        o.next_last_battery_arm_s = (now as u32).saturating_add(i.battery_min_period_s);
+    //   effective = time()       if time() is plausible
+    //             = PCF8563 RTC  else if the fallback epoch is plausible
+    //             = none         otherwise
+    //
+    //   - no effective clock                    -> due, do not arm.
+    //   - effective, last_arm < NEVER (cold)    -> due, arm = effective + 1h.
+    //   - effective >= last_arm + period        -> due, arm = effective + 1h.
+    //   - otherwise (within window)             -> skip, keep last_arm.
+    //
+    // The fallback path uses the SAME comparison and the SAME arming rule
+    // as the wall-clock path, keyed off the RTC epoch instead of time().
+    // The old code did exactly this (BatteryClock() fed both the due
+    // check and the arm write), so a pre-SNTP wake with a plausible RTC
+    // samples at most once per hour — not on every wake.
+    let effective: Option<u32> = if now >= NEVER as i64 {
+        Some(now as u32)
+    } else if rtc_valid(i.clock_valid_mask) && i.effective_clock_s >= NEVER {
+        Some(i.effective_clock_s)
     } else {
-        o.battery_sample_ok = 0;
-        o.next_last_battery_arm_s = i.last_battery_arm_s;
+        None
+    };
+    match effective {
+        None => {
+            // No clock anywhere — must report at least once, but never arm.
+            o.battery_sample_ok = 1;
+            o.next_last_battery_arm_s = S;
+        }
+        Some(e) if i.last_battery_arm_s < NEVER => {
+            // Cold boot — first sample, arm the gate off the effective clock.
+            o.battery_sample_ok = 1;
+            o.next_last_battery_arm_s = e.saturating_add(i.battery_min_period_s);
+        }
+        Some(e) if (e as u64) >= (i.last_battery_arm_s as u64) + (i.battery_min_period_s as u64) => {
+            o.battery_sample_ok = 1;
+            o.next_last_battery_arm_s = e.saturating_add(i.battery_min_period_s);
+        }
+        _ => {
+            o.battery_sample_ok = 0;
+            o.next_last_battery_arm_s = i.last_battery_arm_s;
+        }
     }
 
     // ── 5) Wi-Fi cache write-back ────────────────────────────────────────────
@@ -467,16 +478,41 @@ mod tests {
     }
 
     #[test]
-    fn battery_sample_with_rtc_fallback_is_due_no_arm() {
-        // Reviewer-flagged fallback case: time() invalid but the
-        // PCF8563 holds a plausible epoch. Old `BatteryClock` returned
-        // that epoch; the gate must keep sampling to surface a first
-        // battery report, but must NOT arm — the stamp belongs to a
-        // monotonic clock, not to a one-shot fallback.
-        let r = decide(&inp_with(0, NOW as u32, S - 1, S - 1, CLOCK_RTC_FALLBACK, 86_400, 3_600));
+    fn battery_sample_with_rtc_fallback_first_sample_is_due_and_arms() {
+        // Round-2 fix: time() invalid but the PCF8563 holds a plausible
+        // epoch. The legacy BatteryClock() fed that epoch to both the
+        // due check and the arm write, so a pre-SNTP wake arms the same
+        // one-hour window — keyed off the RTC epoch, not off time().
+        let eff = NOW as u32;
+        let r = decide(&inp_with(0, eff, S - 1, S - 1, CLOCK_RTC_FALLBACK, 86_400, 3_600));
         assert_eq!(r.battery_sample_ok, 1);
-        assert_eq!(r.next_last_battery_arm_s, NEVER,
-                   "RTC-fallback sample must not arm the wall-clock stamp");
+        assert_eq!(r.next_last_battery_arm_s, eff + 3_600,
+                   "fallback sample must arm fallback_epoch + period");
+    }
+
+    #[test]
+    fn battery_sample_with_rtc_fallback_within_window_is_skipped() {
+        // The companion case: the fallback epoch is 30 min past the last
+        // fallback arm, so the window is still closed. Old code computed
+        // `effective >= last_arm + period` via BatteryClock() and would
+        // skip — the reviewer's "do not report every wake" requirement.
+        let eff = NOW as u32;
+        let last_arm = eff - 1_800; // armed 30 min ago (fallback clock)
+        let r = decide(&inp_with(0, eff, S - 1, last_arm, CLOCK_RTC_FALLBACK, 86_400, 3_600));
+        assert_eq!(r.battery_sample_ok, 0,
+                   "fallback sample within its window must not re-report");
+        assert_eq!(r.next_last_battery_arm_s, last_arm);
+    }
+
+    #[test]
+    fn battery_sample_with_rtc_fallback_elapsed_window_is_due() {
+        // Fallback epoch is 2 h past the last fallback arm: due again,
+        // re-arm off the fallback epoch.
+        let eff = NOW as u32;
+        let last_arm = eff - 7_200; // armed 2 h ago (fallback clock)
+        let r = decide(&inp_with(0, eff, S - 1, last_arm, CLOCK_RTC_FALLBACK, 86_400, 3_600));
+        assert_eq!(r.battery_sample_ok, 1);
+        assert_eq!(r.next_last_battery_arm_s, eff + 3_600);
     }
 
     // ── Wi-Fi cache write-back gate ──────────────────────────────────────────
