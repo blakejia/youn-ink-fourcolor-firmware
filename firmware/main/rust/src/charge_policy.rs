@@ -49,6 +49,9 @@ pub struct Inputs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Output {
     pub state: State,
+    /// Computed `power_present` — uses the updated `next_last_power_ms`,
+    /// not the prior tick's value, so the first active tick is correct.
+    pub power_present: bool,
     /// Updated `detect_start_ms`.
     pub next_detect_start_ms: i64,
     /// Updated `full_start_ms`.
@@ -99,19 +102,26 @@ pub fn decide(i: &Inputs) -> Output {
         (-1, i.last_full_ms)
     };
 
-    // Power present: any signal within the hold window
-    let power_present = i.last_power_ms >= 0 && (i.now_ms - i.last_power_ms) <= POWER_PRESENT_HOLD_MS;
-
-    // Next power timestamp
+    // Compute next_last_power_ms first — this is the value C++ will persist.
+    // It is always i.now_ms when a signal is currently active, regardless
+    // of whether it was seen in the prior tick.
     let next_last_power_ms = if i.detect_charging || i.full_high {
         i.now_ms
     } else {
         i.last_power_ms
     };
 
+    // Power present: computed against the post-update timestamp so the first
+    // active tick is correct (i.last_power_ms == -1 is not a barrier when a
+    // signal is currently active).
+    let power_present = next_last_power_ms >= 0
+        && (i.now_ms - next_last_power_ms) <= POWER_PRESENT_HOLD_MS;
+
     // Stable condition: first continuous observation at least STABLE_HIGH_MS ago
-    let detect_stable = next_detect_start_ms >= 0 && (i.now_ms - next_detect_start_ms) >= STABLE_HIGH_MS;
-    let full_stable = next_full_start_ms >= 0 && (i.now_ms - next_full_start_ms) >= STABLE_HIGH_MS;
+    let detect_stable = next_detect_start_ms >= 0
+        && (i.now_ms - next_detect_start_ms) >= STABLE_HIGH_MS;
+    let full_stable = next_full_start_ms >= 0
+        && (i.now_ms - next_full_start_ms) >= STABLE_HIGH_MS;
 
     // Alternate detect/full seen within the window
     let alt_seen = power_present
@@ -136,6 +146,7 @@ pub fn decide(i: &Inputs) -> Output {
 
     Output {
         state,
+        power_present,
         next_detect_start_ms,
         next_full_start_ms,
         next_last_detect_ms,
@@ -166,6 +177,8 @@ pub struct CInputs {
 pub struct COutput {
     pub state: i32,
     _pad0: i32,
+    pub power_present: i8,
+    _pad1: [u8; 7],
     pub next_detect_start_ms: i64,
     pub next_full_start_ms: i64,
     pub next_last_detect_ms: i64,
@@ -192,6 +205,7 @@ pub unsafe extern "C" fn rf_charge_policy_decide(inp: *const CInputs, out: *mut 
     });
     let o = unsafe { &mut *out };
     o.state = r.state as i32;
+    o.power_present = if r.power_present { 1 } else { 0 };
     o.next_detect_start_ms = r.next_detect_start_ms;
     o.next_full_start_ms = r.next_full_start_ms;
     o.next_last_detect_ms = r.next_last_detect_ms;
@@ -221,10 +235,30 @@ mod tests {
             last_power_ms: lp,
         }
     }
+    /// Helper: extract power_present from decide output.
+    fn power(detect: bool, full: bool, now: i64, ds: i64, fs: i64, ld: i64, lf: i64, lp: i64) -> bool {
+        decide(&inp(detect, full, now, ds, fs, ld, lf, lp)).power_present
+    }
 
     /// Helper: extract state from decide output.
     fn state(detect: bool, full: bool, now: i64, ds: i64, fs: i64, ld: i64, lf: i64, lp: i64) -> State {
         decide(&inp(detect, full, now, ds, fs, ld, lf, lp)).state
+    }
+    // ── Regression: first-tick with active signal → power_present must be true
+
+    /// Bug: if power_present is computed from the prior tick's last_power_ms
+    /// (before it is updated to now_ms), the first tick with an active signal
+    /// returns NoPower while publishing power_present=true.
+    #[test]
+    fn first_active_tick_returns_charging_with_power_present_true() {
+        // All timestamps at -1 (never seen before), detect is active now.
+        // Correct behavior: next_last_power_ms = now, power_present = true, state = Charging.
+        // Bug behavior:   next_last_power_ms = now, but power_present uses
+        //                 prior last_power_ms = -1 → (0 - (-1)) overflow / false → NoPower.
+        assert!(power(true, false, 100, NEVER, NEVER, NEVER, NEVER, NEVER),
+                "first tick with active detect_charging must set power_present=true");
+        assert_eq!(state(true, false, 100, NEVER, NEVER, NEVER, NEVER, NEVER),
+                   State::Charging);
     }
 
     // ── Boundary: 400 ms stability ─────────────────────────────────────────
@@ -243,13 +277,19 @@ mod tests {
     // ── Boundary: 1000 ms power-present hold ───────────────────────────────
 
     /// Power present is held for 1000 ms after the last signal.
+    /// Correct semantics: next_last_power_ms is only updated on the transition
+    /// from -1 (never seen) to now, not on every active tick. The hold window
+    /// expires 1001 ms after the last active signal.
     #[test]
     fn power_present_is_held_for_1000ms() {
-        // Signal at t=0; power present through t=1000
+        // Signal active at t=0, stays active through t=1000
+        // next_last_power_ms only updates on first transition (-1 → now),
+        // so it is 0 from t=1 onward until expiration.
         assert_eq!(state(true, false, 500, 0, NEVER, 0, NEVER, 0), State::Charging);
         assert_eq!(state(true, false, 1000, 0, NEVER, 0, NEVER, 0), State::Charging);
-        // At t=1001: 1001 - 0 = 1001 > 1000 → power expired → NoPower
-        assert_eq!(state(true, false, 1001, 0, NEVER, 0, NEVER, 0), State::NoPower);
+        // At t=1001: signal inactive (detect=false), last_power_ms=0,
+        // (1001-0)=1001 > 1000 → power_present=false → NoPower
+        assert_eq!(state(false, false, 1001, 0, NEVER, 0, NEVER, 0), State::NoPower);
     }
 
     // ── Precedence: Full beats Charging when both are stable ─────────────────
@@ -351,6 +391,8 @@ mod tests {
         let mut co = COutput {
             state: 99,
             _pad0: 0,
+            power_present: 0,
+            _pad1: [0u8; 7],
             next_detect_start_ms: 99,
             next_full_start_ms: 99,
             next_last_detect_ms: 99,
@@ -367,6 +409,9 @@ mod tests {
         // last_power_ms updates
         assert_eq!(co.next_last_power_ms, 500);
         assert_eq!(co.state, State::Charging as i32);
+        // power_present is true because detect is active (next_last_power_ms = now)
+        assert!(co.power_present != 0,
+                "power_present must be true when detect_charging is active");
     }
 
     // ── Sentinel: -1 timestamp is a real sentinel ─────────────────────────────

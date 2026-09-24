@@ -59,8 +59,9 @@ void ChargeStatus::Tick(int64_t now_ms) {
         case 3: state = State::kNoBattery; break;
     }
 
-    const bool power_present = (last_power_present_ms_ >= 0) &&
-        ((now_ms - last_power_present_ms_) <= kPowerPresentHoldMs);
+    // Use power_present from Rust output — it is computed against the
+    // post-update timestamp, so the first active tick is correct.
+    const bool power_present = out.power_present != 0;
     UpdateSnapshot(state, power_present, state == State::kFull, state == State::kNoBattery);
 }
 

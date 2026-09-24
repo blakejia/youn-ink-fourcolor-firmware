@@ -61,6 +61,11 @@ typedef struct {
     /** Decided state (0=NoPower, 1=Charging, 2=Full, 3=NoBattery). */
     int32_t  state;
     int32_t  _pad0;
+    /** Computed `power_present` — uses post-update timestamp; first active
+     *  tick is correct (unlike the prior C++ code that computed power_present
+     *  before writing next_last_power_ms). */
+    int8_t   power_present;
+    int8_t   _pad1[7];
     /** Updated `detect_start_ms` for C++ to persist. */
     int64_t  next_detect_start_ms;
     /** Updated `full_start_ms` for C++ to persist. */
