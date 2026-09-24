@@ -15,3 +15,4 @@
 - `git diff --check`: PASS.
 - Final P2: Rust URL parser now preserves case-insensitive HTTP/HTTPS/WS/WSS schemes with an allocation-free ASCII lowering check; added host contract coverage for all four uppercase schemes. Post-fix `cargo test`: 261 passed; `idf.py build`: PASS.
 - Final review fixes: explicit `retain_ip` action bit is preserved by the adapter; endpoint presence is checked before ARP/GW/DNS/TCP and endpoint-missing defer retains IP/association/RTC cache while restarting DHCP; reconnect decisions now flow through Rust Retry/Stop/clear-Wi-Fi-cache actions. Added reconnect host coverage. `cargo test`: 275 passed; full `idf.py build`: PASS.
+- Initial-disconnect regression fixed: C++ now passes the effective first-attempt count (`reconnect_count_ + 1`) to Rust, preserving automatic reconnect while Rust retains terminal Stop/cache-clear transitions. `cargo test`: 275 passed; full `idf.py build`: PASS.

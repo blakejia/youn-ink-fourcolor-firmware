@@ -486,7 +486,7 @@ pub fn decide(i: &Inputs) -> PolicyAction {
     }
 
     // ── Wi-Fi fast connect path ─────────────────────────────────────────────
-    if !i.ip_fast_active && i.wifi_connected == false && i.reconnect_count > 0 {
+    if !i.ip_fast_active && !i.wifi_connected && !i.have_wifi_cache && i.reconnect_count > 0 {
         return if i.reconnect_count < 5 {
             PolicyAction::retry()
         } else if i.fast_fail_count >= FAST_FAIL_THRESHOLD {

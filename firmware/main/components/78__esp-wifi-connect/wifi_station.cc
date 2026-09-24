@@ -1145,7 +1145,7 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
         wifi_policy_input_v1_t reconnect{};
         reconnect.version = WIFI_POLICY_SHIM_VERSION;
         reconnect.invoke_count = wifi_policy_invoke_count();
-        reconnect.reconnect_count = this_->reconnect_count_;
+        reconnect.reconnect_count = this_->reconnect_count_ + 1;
         reconnect.fast_fail_count = this_->fast_fail_count_;
         reconnect.fast_enabled = kFastRcEnable ? 1 : 0;
         wifi_policy_action_v1_t reconnect_action{};
