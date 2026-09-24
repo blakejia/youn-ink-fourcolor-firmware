@@ -2,15 +2,18 @@
  * wifi_policy_adapter.cc — main-owned Wi-Fi policy adapter
  *
  * Calls wifi_policy_shim (component) for registration/invocation.
- * Policy decisions will land here in Task 4.
+ * PolicyCallback maps the narrow component facts to the rich Rust POD,
+ * calls rf_wifi_policy_decide, and maps the result back to the shim action.
  */
 
 #include "wifi_policy_adapter.h"
 
+#include <cstdint>
+
 #include <esp_log.h>
 
 #include "components/78__esp-wifi-connect/wifi_policy_shim.h"
-
+#include "wifi_policy.h"
 #define TAG "WifiPolicyAdapter"
 
 namespace {
@@ -22,31 +25,41 @@ static bool s_registered = false;
 static uint32_t s_invoke_count = 0;
 
 /*
+/*
  * Policy callback bound at registration.
- *
- * In Task 4 this will call into Rust.  For now it is a pass-through stub
- * that accepts any input and returns a no-op action, so that the shim
- * wiring can be verified without changing Wi-Fi behaviour.
  *
  * input  — immutable, may not be retained.
  * output — caller-allocated, must be filled.
  */
 static bool PolicyCallback(
     void*                         /* context */,
-    const wifi_policy_input_v1_t*  input,
+    const wifi_policy_input_v1_t* input,
     wifi_policy_action_v1_t*       output) {
-
-    if (input == nullptr || output == nullptr) {
+    if (!s_registered || input == nullptr || output == nullptr) {
         return false;
     }
 
     ++s_invoke_count;
 
-    // TODO(Task 4): call Rust wifi_policy_decide() here.
-    // For now, return a safe no-op action.
-    (void)input;
-    (void)output;  // zeroed by caller
+    rf_wifi_policy_inputs_t rust_input{};
+    rust_input.version = RF_WIFI_POLICY_VERSION;
+    rust_input.invoke_count = input->invoke_count;
+    rust_input.wifi_connected = input->wifi_connected;
+    rust_input.rssi = input->rssi;
+    rust_input.channel = static_cast<uint8_t>(input->channel);
+    rust_input.reconnect_count = input->reconnect_count;
+    rust_input.ip_fast_active = input->ip_fast_active;
+    rust_input.ip_fast_ready = input->ip_fast_ready;
+    rust_input.ip_fast_cache_age_ms = input->ip_fast_cache_age_ms;
 
+    rf_wifi_policy_output_t rust_output{};
+    rf_wifi_policy_decide(&rust_input, &rust_output);
+
+    output->version = WIFI_POLICY_SHIM_VERSION;
+    output->action_kind = rust_output.action_kind;
+    output->retry_delay_ms = rust_output.retry_delay_ms;
+    output->clear_wifi_cache = rust_output.clear_wifi_cache != 0;
+    output->clear_ip_cache = rust_output.clear_ip_cache != 0;
     return true;
 }
 

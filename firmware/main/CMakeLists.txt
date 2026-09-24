@@ -192,7 +192,8 @@ set(RUST_SOURCES
     "${RUST_DIR}/src/power.rs"
     "${RUST_DIR}/src/settings.rs"
     "${RUST_DIR}/src/charge_policy.rs"
-    "${RUST_DIR}/src/led_policy.rs")
+    "${RUST_DIR}/src/led_policy.rs"
+    "${RUST_DIR}/src/wifi_policy.rs")
 
 # DEVICE_MASTER_KEY is baked into the archive, so it has to take part in
 # dependency tracking: without this stamp, changing -DDEVICE_MASTER_KEY would

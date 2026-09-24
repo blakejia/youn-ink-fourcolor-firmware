@@ -27,7 +27,7 @@
 #include <fcntl.h>
 #include "ssid_manager.h"
 #include "wifi_manager.h"
-
+#include "wifi_policy_shim.h"
 #define TAG "WifiStation"
 #define FAST_RC_TAG "FAST_RC"
 static bool kFastRcEnable = true;
@@ -1491,7 +1491,17 @@ bool WifiStation::RunIpFast() {
             return false;
         }
         if (!have_endpoint || host.empty()) {
-            IpFastFallback("endpoint_missing");
+            wifi_policy_input_v1_t policy_input{};
+            policy_input.version = WIFI_POLICY_SHIM_VERSION;
+            policy_input.invoke_count = wifi_policy_invoke_count();
+            policy_input.ip_fast_active = ip_fast_attempt_ ? 1 : 0;
+            wifi_policy_action_v1_t policy_action{};
+            bool policy_called = wifi_policy_invoke_from_component(&policy_input, &policy_action);
+            if (policy_called && policy_action.action_kind == 20) {
+                IpFastFallback("endpoint_missing");
+            } else {
+                IpFastFallback("endpoint_missing");
+            }
             return false;
         }
         resolved = ResolveHostWithTimeout(host, &server_addr, dns_budget);
