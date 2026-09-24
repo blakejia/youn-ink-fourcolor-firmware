@@ -11,10 +11,8 @@
  *     cleared g_callback.
  *   - Because invoke() holds the lock for the full callback, any call to
  *     unregister() while a callback is in flight MUST block until that callback
- *     returns and releases the lock.  There is no way for unregister() to
- *     clear g_callback while cb() is executing.
- *   - register() also acquires g_shim_mutex to make re-registration safe against
- *     concurrent unregister()/invoke().
+ *     returns and releases the lock.
+ *   - register() also acquires g_shim_mutex to make re-registration safe.
  */
 
 #include "wifi_policy_shim.h"
@@ -67,32 +65,24 @@ extern "C" bool wifi_policy_invoke_from_component(
         return false;
     }
 
-    wifi_policy_callback_t cb   = nullptr;
-    void*                 ctx  = nullptr;
+    // unique_lock at function scope: the mutex is held until this function
+    // returns — including during the cb() call below.  unregister() cannot
+    // clear g_callback while cb() is running.
+    std::unique_lock<std::mutex> lock(g_shim_mutex);
 
-    // Acquire the lock and hold it for the ENTIRE callback execution.
-    // This is the key invariant: unregister() cannot clear g_callback
-    // while cb() is running, because cb() holds g_shim_mutex.
-    {
-        std::lock_guard<std::mutex> lock(g_shim_mutex);
-        cb  = g_callback;
-        ctx = g_context;
-        if (cb == nullptr) {
-            return false;
-        }
-        ++g_invoke_count;
-        // Keep the lock for the cb() call below.
+    wifi_policy_callback_t cb = g_callback;
+    void* ctx = g_context;
+    if (cb == nullptr) {
+        return false;
     }
+    ++g_invoke_count;
 
-    // g_shim_mutex is NOT held here.
-    // cb is non-null and stable because:
-    //   - unregister() would have blocked on g_shim_mutex above, waiting for us.
-    //   - register() would also have blocked on g_shim_mutex.
-    // Copy input before the call.
+    // Copy input before the lock is released on the stack.
     wifi_policy_input_v1_t in_copy = *input;
 
     bool ok = cb(ctx, &in_copy, output);
     return ok;
+    // lock destructor runs here — AFTER cb() returns.
 }
 
 extern "C" uint32_t wifi_policy_invoke_count(void) {
