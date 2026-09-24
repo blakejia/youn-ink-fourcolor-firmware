@@ -1,9 +1,11 @@
 #include <stdio.h>
 #include <driver/gpio.h>
 #include <esp_timer.h>
-#include <freertos/FreeRTOS.h>
+#include <atomic>
 #include "board_power_bsp.h"
 #include "charge_status.h"
+// led_policy.h must come after charge_status.h so ChargeStatus is fully defined.
+#include "led_policy.h"
 
 // PowerLedTask 判定纯函数：把 LED 语义逐条编码，任务侧只负责应用电平与等待。
 // 与改前 PowerLedTask 分支（:18-:65）逐条对应（以改前代码为准：charging = 亮 200ms /
@@ -30,35 +32,42 @@
 // 2000ms 会把两个方向推到约 2.4s/3.8s，影响面超出 LED 本身。另注意 sdkconfig 里
 // tickless 是关的（:3230）且 HZ=100（:3176），500ms→1000ms 只是把该任务的每秒唤醒
 // 从 2 次减到 1 次，省电收益本就有限——不要把这条报成大头。
-static constexpr uint32_t kLedStaticPollMs = 1000;
-
+// LED action struct — used by led_decide and PowerLedTask.
 struct LedAction {
-    bool level;          // 本轮第一个电平：全部六个分支统一经由它写 GPIO
-    uint32_t first_ms;   // 第一段等待（blink 500 翻转周期 / pulse 120 / charge 头段 200 / static 有界等待）
-    bool has_second;     // 是否有第二段（仅 pulse / charge）
-    bool second_level;   // 第二段电平（pulse / charge 均为 1；无第二段时忽略）
-    uint32_t second_ms;  // 第二段等待（pulse 180 / charge 尾段 2800；无第二段时忽略）
-    bool consume_pulse;  // 是否消耗一个活动脉冲（仅 pulse）
+    bool level;
+    uint32_t first_ms;
+    bool has_second;
+    bool second_level;
+    uint32_t second_ms;
+    bool consume_pulse;
+    bool first_wait_notify;
+    bool second_wait_notify;
 };
+
+// Calls Rust LED policy; C++ callers see the same LedAction shape as before.
 static LedAction led_decide(bool ovr, bool ovr_blink, bool phase,
                             const ChargeStatus::Snapshot& s, uint32_t pulses) {
-    if (ovr && ovr_blink) {
-        return LedAction{phase, 500, false, true, 0, false};
-    }
-    if (ovr) {
-        return LedAction{true, kLedStaticPollMs, false, true, 0, false};
-    }
-    if (!s.charging && !s.full && pulses > 0) {
-        return LedAction{false, 120, true, true, 180, true};
-    }
-    if (s.full) {
-        return LedAction{false, kLedStaticPollMs, false, true, 0, false};
-    }
-    if (s.charging) {
-        return LedAction{false, 200, true, true, 2800, false};
-    }
-    return LedAction{true, kLedStaticPollMs, false, true, 0, false};
+    rf_led_policy_inputs_t in{};
+    in.override_enabled = ovr ? 1 : 0;
+    in.override_blink   = ovr_blink ? 1 : 0;
+    in.phase            = phase ? 1 : 0;
+    in.charging         = s.charging ? 1 : 0;
+    in.full             = s.full ? 1 : 0;
+    in.pulses           = pulses;
+    rf_led_policy_output_t out{};
+    rf_led_policy_decide(&in, &out);
+    return LedAction{
+        /* level */             static_cast<bool>(out.level),
+        /* first_ms */          out.first_ms,
+        /* has_second */        static_cast<bool>(out.has_second),
+        /* second_level */      static_cast<bool>(out.second_level),
+        /* second_ms */         out.second_ms,
+        /* consume_pulse */     static_cast<bool>(out.consume_pulse),
+        /* first_wait_notify */ static_cast<bool>(out.first_wait_notify),
+        /* second_wait_notify*/static_cast<bool>(out.second_wait_notify),
+    };
 }
+
 
 void BoardPowerBsp::PowerLedTask(void *arg) {
     auto* self = static_cast<BoardPowerBsp*>(arg);
@@ -82,46 +91,58 @@ void BoardPowerBsp::PowerLedTask(void *arg) {
         const uint32_t pulses =
             static_cast<uint32_t>(self->led_activity_pulses_.load(std::memory_order_relaxed));
         const LedAction action = led_decide(ovr, ovr_blink, phase, snap, pulses);
-        // 分派只看结构标志（consume_pulse / has_second），不看时长数值——改任一行的
-        // 时长只改节奏，永远串不了分支。电平只看 level/second_level。
         if (ovr && ovr_blink) {
-            // 第 1 行（原 :21-:27 逐字）：相位取反 → hold 包住写电平 → vTaskDelay(500)。
-            // 闪烁的规则性是可见属性，段内事件不提前打断（F3）：500ms 用普通等待，
-            // 落在段内的事件只把堆积的 notify 计一次，下轮重判时消费（无丢失唤醒窗口）。
             self->led_override_phase_.store(!phase, std::memory_order_relaxed);
             gpio_hold_dis((gpio_num_t)GPIO_NUM_3);
             gpio_set_level(GPIO_NUM_3, action.level ? 1 : 0);
             gpio_hold_en((gpio_num_t)GPIO_NUM_3);
-            vTaskDelay(pdMS_TO_TICKS(action.first_ms));
+            if (action.first_wait_notify) {
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(action.first_ms));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(action.first_ms));
+            }
             continue;
         }
         if (action.consume_pulse) {
-            // 第 3 行（原 :43-:50 逐字）：亮 120ms / 灭 180ms，耗一个脉冲。
-            // 脉冲形状不可抢占：两段都用 vTaskDelay，与改前逐字一致。
             self->led_activity_pulses_.fetch_sub(1, std::memory_order_relaxed);
             gpio_hold_dis((gpio_num_t)GPIO_NUM_3);
             gpio_set_level(GPIO_NUM_3, action.level ? 1 : 0);
-            vTaskDelay(pdMS_TO_TICKS(action.first_ms));
+            if (action.first_wait_notify) {
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(action.first_ms));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(action.first_ms));
+            }
             gpio_set_level(GPIO_NUM_3, action.second_level ? 1 : 0);
             gpio_hold_en((gpio_num_t)GPIO_NUM_3);
-            vTaskDelay(pdMS_TO_TICKS(action.second_ms));
+            if (action.second_wait_notify) {
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(action.second_ms));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(action.second_ms));
+            }
         } else if (action.has_second) {
-            // 第 5 行（原 :55-:60 逐字顺序）：先 0（亮）200ms，再 1（灭）2800ms。
-            // 头段 200ms 用 vTaskDelay（逐字）；尾段 2800ms 用 notify 等待（F3 保留）：
-            // 充电中来活动脉冲/override 变化可提前响应，这是事件驱动应有的特性。
             gpio_hold_dis((gpio_num_t)GPIO_NUM_3);
             gpio_set_level(GPIO_NUM_3, action.level ? 1 : 0);
-            vTaskDelay(pdMS_TO_TICKS(action.first_ms));
+            if (action.first_wait_notify) {
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(action.first_ms));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(action.first_ms));
+            }
             gpio_set_level(GPIO_NUM_3, action.second_level ? 1 : 0);
             gpio_hold_en((gpio_num_t)GPIO_NUM_3);
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(action.second_ms));
+            if (action.second_wait_notify) {
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(action.second_ms));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(action.second_ms));
+            }
         } else {
-            // 第 2/4/6 行（原 :29-:31 / :51-:54 / :61-:64）：单电平 + hold 成对，电平逐字。
-            // 等待是事件 + 1000ms 有界慢轮询（kLedStaticPollMs 见上注）。
             gpio_hold_dis((gpio_num_t)GPIO_NUM_3);
             gpio_set_level(GPIO_NUM_3, action.level ? 1 : 0);
             gpio_hold_en((gpio_num_t)GPIO_NUM_3);
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(action.first_ms));
+            if (action.first_wait_notify) {
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(action.first_ms));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(action.first_ms));
+            }
         }
     }
 }
