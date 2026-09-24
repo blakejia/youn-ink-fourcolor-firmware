@@ -16,6 +16,7 @@
 // needs). Nothing here uses std either way.
 #![cfg_attr(target_arch = "xtensa", no_std)]
 
+pub mod charge_policy;
 pub mod device_signature;
 pub mod input;
 pub mod json;

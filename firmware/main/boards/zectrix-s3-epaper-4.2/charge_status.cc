@@ -2,8 +2,8 @@
 
 #include <driver/gpio.h>
 #include <esp_err.h>
-#include "config.h"
-
+#include "charge_policy.h"
+#include "boards/zectrix-s3-epaper-4.2/config.h"
 void ChargeStatus::Init(gpio_num_t detect_gpio, gpio_num_t full_gpio, int64_t now_ms) {
     detect_gpio_ = detect_gpio;
     full_gpio_ = full_gpio;
@@ -25,56 +25,43 @@ void ChargeStatus::OnStateChanged(std::function<void(const Snapshot&)> cb) {
 }
 
 void ChargeStatus::Tick(int64_t now_ms) {
-    const bool detect_high = gpio_get_level(detect_gpio_) == CHARGE_DETECT_CHARGING_LEVEL;
+    // Read and normalize GPIO facts (C++ owns this contract)
+    const bool detect_charging = gpio_get_level(detect_gpio_) == CHARGE_DETECT_CHARGING_LEVEL;
     const bool full_high = gpio_get_level(full_gpio_) == 1;
 
-    if (detect_high) {
-        last_power_present_ms_ = now_ms;
-        last_detect_seen_ms_ = now_ms;
-        if (detect_high_start_ms_ < 0) {
-            detect_high_start_ms_ = now_ms;
-        }
-    } else {
-        detect_high_start_ms_ = -1;
-    }
+    // Delegate decision to Rust — returns next timestamps for C++ to persist
+    rf_charge_policy_inputs_t in = {};
+    in.detect_charging = detect_charging ? 1 : 0;
+    in.full_high = full_high ? 1 : 0;
+    in.now_ms = now_ms;
+    in.detect_start_ms = detect_high_start_ms_;
+    in.full_start_ms = full_high_start_ms_;
+    in.last_detect_ms = last_detect_seen_ms_;
+    in.last_full_ms = last_full_seen_ms_;
+    in.last_power_ms = last_power_present_ms_;
 
-    if (full_high) {
-        last_power_present_ms_ = now_ms;
-        last_full_seen_ms_ = now_ms;
-        if (full_high_start_ms_ < 0) {
-            full_high_start_ms_ = now_ms;
-        }
-    } else {
-        full_high_start_ms_ = -1;
+    rf_charge_policy_output_t out = {};
+    rf_charge_policy_decide(&in, &out);
+
+    // Persist the updated timestamps returned by Rust
+    detect_high_start_ms_ = out.next_detect_start_ms;
+    full_high_start_ms_ = out.next_full_start_ms;
+    last_detect_seen_ms_ = out.next_last_detect_ms;
+    last_full_seen_ms_ = out.next_last_full_ms;
+    last_power_present_ms_ = out.next_last_power_ms;
+
+    // Map Rust state enum back to C++ enum
+    State state = State::kNoPower;
+    switch (out.state) {
+        case 0: state = State::kNoPower; break;
+        case 1: state = State::kCharging; break;
+        case 2: state = State::kFull; break;
+        case 3: state = State::kNoBattery; break;
     }
 
     const bool power_present = (last_power_present_ms_ >= 0) &&
         ((now_ms - last_power_present_ms_) <= kPowerPresentHoldMs);
-
-    const bool detect_stable = (detect_high_start_ms_ >= 0) &&
-        ((now_ms - detect_high_start_ms_) >= kStableHighMs);
-    const bool full_stable = (full_high_start_ms_ >= 0) &&
-        ((now_ms - full_high_start_ms_) >= kStableHighMs);
-
-    const bool alt_seen = power_present &&
-        (last_detect_seen_ms_ >= 0) && (last_full_seen_ms_ >= 0) &&
-        ((now_ms - last_detect_seen_ms_) <= kAltWindowMs) &&
-        ((now_ms - last_full_seen_ms_) <= kAltWindowMs);
-
-    const bool no_battery = alt_seen && !detect_stable && !full_stable;
-
-    State state = State::kNoPower;
-    if (!power_present) {
-        state = State::kNoPower;
-    } else if (full_stable && !no_battery) {
-        state = State::kFull;
-    } else if (detect_stable || no_battery) {
-        state = no_battery ? State::kNoBattery : State::kCharging;
-    } else {
-        state = State::kCharging;
-    }
-
-    UpdateSnapshot(state, power_present, state == State::kFull, no_battery);
+    UpdateSnapshot(state, power_present, state == State::kFull, state == State::kNoBattery);
 }
 
 void ChargeStatus::UpdateSnapshot(State state, bool power_present, bool full, bool no_battery) {
