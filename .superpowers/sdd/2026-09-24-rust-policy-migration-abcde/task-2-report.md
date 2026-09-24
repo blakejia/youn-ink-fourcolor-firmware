@@ -367,3 +367,45 @@ Edit-tool note: the reviewer fix hit cascading wifi_station.cc header drops
 range echo; each was caught by the build and restored byte-for-byte against
 git show HEAD. Final wifi_station.cc diff adds only the extern declaration
 and the SaveWifiCacheToRtc early skip.
+
+---
+
+## Reviewer Fix Round 2 (48f4728)
+
+Two findings, both fixed. Prior fixes (e651218) kept intact.
+
+1) rtc_cache_ok now gates the actual RTC cache write path
+
+The SNTP success callback in application.cc called
+ZectrixRtcSetEpoch((uint32_t)now) unconditionally. That is the design's
+"calibration bridge / RTC cache write-back" path, and rtc_cache_ok existed
+but was consumed nowhere. Now the callback fills the Rust inputs, calls
+rf_time_gate_policy_decide, and only performs the I2C write when
+out.rtc_cache_ok is set. Prior write behavior preserved: SNTP-synced time
+is plausible, so the write still happens on every sync; -1 can never reach
+the (uint32_t) cast because it fails the now_valid check first. No extra
+I2C read: rtc_cache_ok depends only on now_valid, so the callback passes
+effective=0/rtc_valid=false. Storage (PCF8563 via ZectrixRtcSetEpoch) stays
+in C++; the board .cc mechanism is untouched.
+
+2) Fallback battery path matches legacy BatteryClock exactly
+
+The e651218 fallback always reported and never armed, which would fire the
+battery query params on every pre-SNTP wake (extra radio per wake). The gate
+is now a uniform effective-clock match: effective = time() if plausible,
+else the PCF8563 epoch if plausible, else none. Cold boot arms
+effective+period; elapsed window re-arms effective+period off whichever
+clock is effective; within-window skips. A pre-SNTP wake with a plausible
+RTC therefore samples at most once per hour, keyed off the RTC epoch —
+byte-for-byte the old BatteryClock-then-compare-then-arm flow, with the sign
+safety added (now_s stays i64 until the arm write).
+
+Tests: the old battery_sample_with_rtc_fallback_is_due_no_arm (which pinned
+the wrong no-arm behavior) is replaced by three tests distinguishing due vs
+not-due fallback: first-sample due+arms fallback_epoch+3600, within-window
+skipped, elapsed-window due+re-arm. Sentinel (fallback branch returns None)
+fails all three (1/0 mismatch on sample_ok plus NEVER vs armed stamp);
+restored, 28/28 pass.
+
+Full suite: 299 lib + 4 device_signature = 303 tests, 0 fail.
+ESP-IDF build (IDF_TARGET=esp32s3): green, xiaozhi.bin 0x2c80f0, 29% free.
