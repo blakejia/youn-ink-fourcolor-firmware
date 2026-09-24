@@ -1086,6 +1086,22 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
         bool have_fast_cache = LoadFastConnectCache(&fast_ssid, fast_bssid, &fast_channel);
         bool have_fast_last = LoadFastLastMs(&fast_last_ms);
         int64_t fast_age_ms = have_fast_last ? (t_ms - fast_last_ms) : -1;
+        wifi_policy_input_v1_t wifi_policy_input{};
+        wifi_policy_input.version = WIFI_POLICY_SHIM_VERSION;
+        wifi_policy_input.invoke_count = wifi_policy_invoke_count();
+        wifi_policy_input.have_wifi_cache = have_fast_cache ? 1 : 0;
+        wifi_policy_input.cache_bssid_valid = IsValidBssid(fast_bssid) ? 1 : 0;
+        wifi_policy_input.cache_channel = fast_channel;
+        memcpy(wifi_policy_input.cache_ssid, fast_ssid.data(), std::min(fast_ssid.size(), sizeof(wifi_policy_input.cache_ssid)));
+        wifi_policy_input.cache_ssid_len = static_cast<uint8_t>(std::min(fast_ssid.size(), sizeof(wifi_policy_input.cache_ssid)));
+        memcpy(wifi_policy_input.cache_bssid, fast_bssid, sizeof(fast_bssid));
+        wifi_policy_input.wifi_cache_age_ms = static_cast<int32_t>(fast_age_ms < 0 ? 0 : fast_age_ms);
+        wifi_policy_input.fast_enabled = kFastRcEnable ? 1 : 0;
+        wifi_policy_input.fast_fail_count = this_->fast_fail_count_;
+        wifi_policy_action_v1_t wifi_policy_action{};
+        bool wifi_policy_called = wifi_policy_invoke_from_component(&wifi_policy_input, &wifi_policy_action);
+        bool wifi_direct_allowed = !wifi_policy_called || wifi_policy_action.action_kind == 10;
+        bool wifi_scan_forced = wifi_policy_called && wifi_policy_action.action_kind == 12;
         ESP_LOGI(FAST_RC_TAG,
                  "stage=wifi event=fast_cache path=fast t_ms=%lld have=%d ssid=%s channel=%u "
                  "bssid=%02x:%02x:%02x:%02x:%02x:%02x last_age_ms=%lld fail_count=%d",
@@ -1097,7 +1113,7 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
                  fast_bssid[3], fast_bssid[4], fast_bssid[5],
                  static_cast<long long>(fast_age_ms),
                  this_->fast_fail_count_);
-        if (kFastRcEnable && this_->fast_fail_count_ < kFastFailThreshold) {
+        if (kFastRcEnable && this_->fast_fail_count_ < kFastFailThreshold && !wifi_scan_forced && wifi_direct_allowed) {
             if (have_fast_cache && IsValidBssid(fast_bssid)) {
                 const auto& ssid_list = SsidManager::GetInstance().GetSsidList();
                 auto it = std::find_if(ssid_list.begin(), ssid_list.end(),
@@ -1483,6 +1499,45 @@ bool WifiStation::RunIpFast() {
         }
     }
 
+    int64_t policy_now_ms = esp_timer_get_time() / 1000;
+    std::string policy_ssid;
+    uint8_t policy_bssid[6] = {0};
+    uint8_t policy_channel = 0;
+    int64_t policy_wifi_last_ms = 0;
+    bool policy_have_wifi = LoadFastConnectCache(&policy_ssid, policy_bssid, &policy_channel);
+    int64_t policy_wifi_age = 0;
+    if (LoadFastLastMs(&policy_wifi_last_ms)) {
+        policy_wifi_age = policy_now_ms - policy_wifi_last_ms;
+        if (policy_wifi_age < 0) policy_wifi_age = 0;
+    }
+    int64_t policy_ip_age = ip_fast_cached_ms_ > 0 ? (policy_now_ms - ip_fast_cached_ms_) : 0;
+    if (policy_ip_age < 0) policy_ip_age = 0;
+    wifi_policy_input_v1_t ip_policy_input{};
+    ip_policy_input.version = WIFI_POLICY_SHIM_VERSION;
+    ip_policy_input.invoke_count = wifi_policy_invoke_count();
+    ip_policy_input.ip_fast_active = ip_fast_attempt_ ? 1 : 0;
+    ip_policy_input.ip_fast_ready = ip_fast_ready_ ? 1 : 0;
+    ip_policy_input.ip_fast_cache_age_ms = static_cast<uint32_t>(policy_ip_age);
+    ip_policy_input.have_wifi_cache = policy_have_wifi ? 1 : 0;
+    ip_policy_input.cache_bssid_valid = IsValidBssid(policy_bssid) ? 1 : 0;
+    ip_policy_input.cache_channel = policy_channel;
+    memcpy(ip_policy_input.cache_ssid, policy_ssid.data(), std::min(policy_ssid.size(), sizeof(ip_policy_input.cache_ssid)));
+    ip_policy_input.cache_ssid_len = static_cast<uint8_t>(std::min(policy_ssid.size(), sizeof(ip_policy_input.cache_ssid)));
+    memcpy(ip_policy_input.cache_bssid, policy_bssid, sizeof(policy_bssid));
+    ip_policy_input.wifi_cache_age_ms = static_cast<int32_t>(policy_wifi_age);
+    ip_policy_input.have_ip_cache = 1;
+    ip_policy_input.ip_cache_age_ms = static_cast<int32_t>(policy_ip_age);
+    ip_policy_input.fast_fail_count = fast_fail_count_;
+    ip_policy_input.fast_enabled = kFastRcEnable ? 1 : 0;
+    ip_policy_input.endpoint_present = have_endpoint && !host.empty() ? 1 : 0;
+    ip_policy_input.probe_target = static_cast<uint8_t>(probe_target_);
+    ip_policy_input.host_is_ip_literal = host_is_ip ? 1 : 0;
+    wifi_policy_action_v1_t ip_policy_action{};
+    if (wifi_policy_invoke_from_component(&ip_policy_input, &ip_policy_action) &&
+        ip_policy_action.action_kind == 20) {
+        IpFastFallback("policy_defer_probe");
+        return false;
+    }
     now_ms = esp_timer_get_time() / 1000;
     if (!host_is_ip) {
         int dns_budget = kIpFastDnsBudgetMs;
@@ -1495,13 +1550,10 @@ bool WifiStation::RunIpFast() {
             policy_input.version = WIFI_POLICY_SHIM_VERSION;
             policy_input.invoke_count = wifi_policy_invoke_count();
             policy_input.ip_fast_active = ip_fast_attempt_ ? 1 : 0;
+            policy_input.endpoint_present = 0;
             wifi_policy_action_v1_t policy_action{};
-            bool policy_called = wifi_policy_invoke_from_component(&policy_input, &policy_action);
-            if (policy_called && policy_action.action_kind == 20) {
-                IpFastFallback("endpoint_missing");
-            } else {
-                IpFastFallback("endpoint_missing");
-            }
+            (void)wifi_policy_invoke_from_component(&policy_input, &policy_action);
+            IpFastFallback("endpoint_missing");
             return false;
         }
         resolved = ResolveHostWithTimeout(host, &server_addr, dns_budget);

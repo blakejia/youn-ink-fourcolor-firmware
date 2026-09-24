@@ -9,6 +9,7 @@
 #include "wifi_policy_adapter.h"
 
 #include <cstdint>
+#include <cstring>
 
 #include <esp_log.h>
 
@@ -24,7 +25,6 @@ static bool s_registered = false;
 // Counts invocations for diagnostics.
 static uint32_t s_invoke_count = 0;
 
-/*
 /*
  * Policy callback bound at registration.
  *
@@ -51,7 +51,20 @@ static bool PolicyCallback(
     rust_input.ip_fast_active = input->ip_fast_active;
     rust_input.ip_fast_ready = input->ip_fast_ready;
     rust_input.ip_fast_cache_age_ms = input->ip_fast_cache_age_ms;
-
+    rust_input.have_wifi_cache = input->have_wifi_cache;
+    rust_input.cache_bssid_valid = input->cache_bssid_valid;
+    rust_input.cache_channel = input->cache_channel;
+    std::memcpy(rust_input.cache_ssid, input->cache_ssid, sizeof(rust_input.cache_ssid));
+    rust_input.cache_ssid_len = input->cache_ssid_len;
+    std::memcpy(rust_input.cache_bssid, input->cache_bssid, sizeof(rust_input.cache_bssid));
+    rust_input.wifi_cache_age_ms = input->wifi_cache_age_ms;
+    rust_input.have_ip_cache = input->have_ip_cache;
+    rust_input.ip_cache_age_ms = input->ip_cache_age_ms;
+    rust_input.fast_fail_count = input->fast_fail_count;
+    rust_input.fast_enabled = input->fast_enabled;
+    rust_input.endpoint_present = input->endpoint_present;
+    rust_input.probe_target = input->probe_target;
+    rust_input.host_is_ip_literal = input->host_is_ip_literal;
     rf_wifi_policy_output_t rust_output{};
     rf_wifi_policy_decide(&rust_input, &rust_output);
 

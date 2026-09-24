@@ -37,12 +37,25 @@ typedef struct wifi_policy_input_v1 {
     int      rssi;                  /**< dBm, valid only when connected > 0 */
     int      channel;               /**< 0 when disconnected               */
     uint32_t reconnect_count;        /**< Current reconnect attempt number  */
-    int      ip_fast_active;        /**< 0 = not running, 1 = running       */
-    int      ip_fast_ready;         /**< 0 = not done, 1 = probe succeeded */
-    uint32_t ip_fast_cache_age_ms;  /**< 0 when ip_fast_active == 0         */
-    /* Fields for future ABI versions are zeroed by the component if the
-     * calling code passes a struct initialised with {}. */
+    int      ip_fast_active;        /* 0 = not running, 1 = running       */
+    int      ip_fast_ready;         /* 0 = not done, 1 = probe succeeded */
+    uint32_t ip_fast_cache_age_ms;  /* 0 when ip_fast_active == 0         */
+    uint8_t  have_wifi_cache;
+    uint8_t  cache_bssid_valid;
+    uint8_t  cache_channel;
+    uint8_t  cache_ssid[32];
+    uint8_t  cache_ssid_len;
+    uint8_t  cache_bssid[6];
+    int32_t  wifi_cache_age_ms;
+    uint8_t  have_ip_cache;
+    int32_t  ip_cache_age_ms;
+    int32_t  fast_fail_count;
+    uint8_t  fast_enabled;
+    uint8_t  endpoint_present;
+    uint8_t  probe_target;
+    uint8_t  host_is_ip_literal;
 } wifi_policy_input_v1_t;
+
 
 /* ── Action POD ────────────────────────────────────────────────────────────
  *

@@ -1,0 +1,152 @@
+/*
+ * wifi_policy.h — Wi-Fi policy C ABI
+ *
+ * Rust owns the codec, endpoint parser, and decision table.
+ * C++ gathers facts, calls `rf_wifi_policy_decide`, and executes the action.
+ *
+ * ABI version 1 — structs are fixed-size POD; no pointers, no strings.
+ */
+
+#ifndef WIFI_POLICY_H
+#define WIFI_POLICY_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ── Version ─────────────────────────────────────────────────────────────── */
+
+#define RF_WIFI_POLICY_VERSION 1
+
+/* ── Input POD ────────────────────────────────────────────────────────────
+ *
+ * All fields are copied in; the callee owns nothing.
+ */
+typedef struct rf_wifi_policy_inputs {
+    uint32_t version;
+
+    /* ── Wi-Fi state ─────────────────────────────────────────── */
+    uint32_t invoke_count;
+    int32_t  wifi_connected;          /* 0 = disconnected, 1 = connected */
+    int32_t  rssi;                   /* dBm, valid only when connected > 0 */
+    uint8_t  channel;                 /* 0 when disconnected              */
+    uint8_t  _pad0[3];
+    uint32_t reconnect_count;
+
+    /* ── IP fast state ───────────────────────────────────────── */
+    int32_t  ip_fast_active;         /* 0 = not running, 1 = running      */
+    int32_t  ip_fast_ready;          /* 0 = not done, 1 = probe succeeded */
+    uint32_t ip_fast_cache_age_ms;   /* valid when ip_fast_active == 1    */
+
+    /* ── Wi-Fi fast cache ────────────────────────────────────── */
+    uint8_t  have_wifi_cache;
+    uint8_t  cache_bssid_valid;
+    uint8_t  cache_channel;
+    uint8_t  _pad1;
+    uint8_t  cache_ssid[32];         /* NOT NUL-terminated                */
+    uint8_t  cache_ssid_len;
+    uint8_t  cache_bssid[6];
+    int32_t  wifi_cache_age_ms;
+
+    /* ── IP fast cache ───────────────────────────────────────── */
+    uint8_t  have_ip_cache;
+    uint8_t  _pad2[3];
+    int32_t  ip_cache_age_ms;
+
+    /* ── Policy knobs ─────────────────────────────────────────── */
+    int32_t  fast_fail_count;        /* consecutive fast-connect failures */
+    uint8_t  fast_enabled;            /* 0 = disabled, 1 = enabled        */
+    uint8_t  endpoint_present;        /* 0 = missing, 1 = present        */
+    uint8_t  probe_target;           /* 0=MQTT, 1=WebSocket, 2=HttpOta  */
+    uint8_t  host_is_ip_literal;      /* 0 = DNS name, 1 = IPv4 literal  */
+} rf_wifi_policy_inputs_t;
+
+/* ── Output POD ──────────────────────────────────────────────────────────── */
+
+typedef struct rf_wifi_policy_output {
+    uint32_t version;
+
+    /* Action kind (matches wifi_policy_shim.h::wifi_policy_action_v1_t::action_kind):
+     *   0  = no-op
+     *   10 = DirectConnect
+     *   11 = Probe
+     *   12 = Scan
+     *   13 = Retry
+     *   14 = Stop
+     *   20 = DeferProbe
+     */
+    uint8_t  action_kind;
+    uint8_t  clear_wifi_cache;
+    uint8_t  clear_ip_cache;
+    uint32_t retry_delay_ms;          /* 0 = use component default       */
+    uint8_t  retain_ip;               /* for DeferProbe: keep IP cache    */
+} rf_wifi_policy_output_t;
+
+/* ── Decision entry point ───────────────────────────────────────────────── */
+
+/**
+ * Decide the Wi-Fi policy action from the given inputs.
+ *
+ * @param inp  Immutable inputs gathered by C++.
+ * @param out  Caller-allocated output; all fields written on return.
+ *
+ * # Safety
+ * Both pointers must be non-null and point to valid, aligned structs.
+ */
+void rf_wifi_policy_decide(
+    const rf_wifi_policy_inputs_t* inp,
+    rf_wifi_policy_output_t*       out);
+
+/* ── Endpoint parsing helpers ────────────────────────────────────────────── */
+
+/**
+ * Parse an MQTT endpoint (plain host[:port]) and write the host to a buffer.
+ *
+ * @param input       NUL-terminated endpoint string.
+ * @param host_buf    Output buffer for the parsed host (min 256 bytes).
+ * @param host_buf_len Length of host_buf.
+ * @param port        Output port (set to 8883 if no port in string).
+ * @return true on success, false on parse failure.
+ *
+ * # Safety
+ * `input` must be a valid NUL-terminated string.
+ * `host_buf` must point to at least 256 writable bytes.
+ * `port` must not be null.
+ */
+uint8_t rf_wifi_parse_endpoint(
+    const char* input,
+    uint8_t*   host_buf,
+    uint32_t   host_buf_len,
+    uint16_t*  port);
+
+/**
+ * Parse a URL authority (scheme://host[:port]/...) and write the host to a buffer.
+ *
+ * Requires http://, https://, ws://, or wss://.
+ * Default ports: http/ws → 80, https/wss → 443.
+ *
+ * @param input       NUL-terminated URL string.
+ * @param host_buf    Output buffer for the parsed host (min 256 bytes).
+ * @param host_buf_len Length of host_buf.
+ * @param port        Output port.
+ * @return true on success, false on parse failure.
+ *
+ * # Safety
+ * `input` must be a valid NUL-terminated string.
+ * `host_buf` must point to at least 256 writable bytes.
+ * `port` must not be null.
+ */
+uint8_t rf_wifi_parse_url_authority(
+    const char* input,
+    uint8_t*   host_buf,
+    uint32_t   host_buf_len,
+    uint16_t*  port);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* WIFI_POLICY_H */

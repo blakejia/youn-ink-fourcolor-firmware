@@ -7,6 +7,7 @@
 
 ## Verification
 
-- `cargo test`: BLOCKED — `cargo` is not installed / not on PATH in this environment (`command not found: cargo`).
-- `idf.py build`: BLOCKED — `idf.py` is not installed / not on PATH in this environment (`which idf.py` returned no path).
+- `cargo test` (with `PATH=$HOME/.cargo/bin:$PATH`): PASS — 260 tests passed across 3 suites.
+- `idf.py build` (with ESP-IDF v6.0 export): PASS — project build complete; `xiaozhi.bin` generated.
+- Build emitted existing ESP-SR/Kconfig and linker notes only; no Task 4a compile errors.
 - `git diff --check`: PASS.
