@@ -62,6 +62,12 @@ C++/ESP-IDF 仍负责：
 若仍无法归因，EPD 迁移保持阻塞，除非另有明确批准的豁免。其他阶段按顺序独立
 推进，任何阶段出现回归都停在该阶段回滚。
 
+用户已裁定的集成约束：
+
+- Wi‑Fi 使用组件 shim 回调，不新建第二个 Rust staticlib。
+- EPD diff 在 `dirty_mutex` 外对已完成的只读 snapshot 执行。
+- rr=4 采用诊断先行，不预先增加新的 panic 元数据协议。
+
 ## 4. 阶段 0：rr=4 panic 诊断
 
 `ESP_RST_PANIC=4` 只说明发生过 panic/abort，不区分 C++ `assert`、ESP-IDF fatal
@@ -144,12 +150,6 @@ firmware/main/rust/include/led_policy.h
 - `consume_pulse`。
 - `first_wait_notify` 与 `second_wait_notify`，显式表示 `vTaskDelay` 或 `ulTaskNotifyTake`。
 
-对应当前 C++ 分派：activity pulse 两段都 delay；charging 首段 delay、次段 notify；
-override/static 单段 notify。C++ 继续拥有 `BoardPowerBsp::PowerLedTask`、GPIO hold、
-FreeRTOS delay/notify 和原子计数操作。
-
-该阶段目标是可测试性，不是宣称省电收益。
-
 ## 7. 阶段 3：Wi-Fi cache、快连/重连、endpoint/OTA
 
 ### Rust 负责
@@ -179,13 +179,28 @@ Rust 接管：
 - IP fast cache 的保留/清理决策。
 - endpoint/OTA URL 缺失时的决策。
 
-C++ 继续拥有：
+### Wi-Fi 组件 shim 回调
 
-- `RTC_DATA_ATTR` 的实际存储位置。
-- NVS 实际读写。
-- `esp_wifi_*`、`esp_netif_*`。
-- DNS/ARP/TCP probe。
-- mutex、event group、timer 和异步 callback。
+`78__esp-wifi-connect` 是独立 ESP-IDF component，不能直接调用 main 的 Rust
+staticlib，也不复制第二套 Rust library。组件新增窄的 C ABI 注册/注销层，main
+在初始化和退出边界注册 Rust policy 回调：
+
+```text
+component shim 注册/注销
+        ↓
+main adapter 持有回调上下文
+        ↓
+rust/wifi_policy 的固定 POD 输入/Action 输出
+```
+
+回调契约必须是同步、不可阻塞、不可回调组件、不可直接访问 Rust 内部状态；
+只返回决策和需要组件执行的 Action。main adapter 在 Application/Board 初始化
+完成后注册，在 Wi-Fi manager 停止/销毁边界注销；注销幂等。注册成功、注册失败、
+注销幂等和未注册调用都必须有 C++ 编译级契约。
+
+组件仍负责 `esp_wifi_*`、`esp_netif_*`、NVS、RTC_DATA_ATTR、DNS/ARP/TCP、
+mutex、event group 和异步 callback；main adapter 负责把实际采样事实传入 Rust。
+
 
 ### endpoint_missing 修复与 cache 语义
 
@@ -254,9 +269,11 @@ firmware/main/rust/src/epd_policy.rs
 firmware/main/rust/include/epd_policy.h
 ```
 
-Rust 负责 frame diff 本身：C++ 在同一把 display mutex 下提供只读的 `prev_buffer`
-和 `tx_buffer` 指针、buffer 长度、宽高及 `bytes_per_row`；Rust 从这些指针计算
-`diff_bits` 和 `diff_ratio`。C++ 不再保留 `analyze_frame_diff` 的策略计算副本。
+Rust 负责 frame diff 本身：C++ 先完成 `tx_buf` 快照并释放 `dirty_mutex`，然后
+在锁外把只读 `prev_buffer`/`tx_buffer` 指针、buffer 长度、宽高及 `bytes_per_row`
+交给固定 ABI；Rust 从这些指针计算 `diff_bits` 和 `diff_ratio`。Rust 不获取
+FreeRTOS mutex、不调用 C++ 回调、不访问 framebuffer 生产路径。C++ 不再保留
+`analyze_frame_diff` 的策略计算副本。
 
 Rust 输入必须显式携带当前 C++ refresh loop 的所有策略事实：
 
