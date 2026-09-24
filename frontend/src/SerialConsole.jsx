@@ -18,7 +18,7 @@ export default function SerialConsole() {
   const [err, setErr] = useState('');
   const [paused, setPaused] = useState(false);
   const [filter, setFilter] = useState('');
-  const [stamp, setStamp] = useState(false);
+  const [stamp, setStamp] = useState(true);
   const [text, setText] = useState('');
   const [lineCount, setLineCount] = useState(0);
 
