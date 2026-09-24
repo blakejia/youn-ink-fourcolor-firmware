@@ -15,7 +15,6 @@
 // `cargo test`, and a no_std host build cannot unwind (which the test harness
 // needs). Nothing here uses std either way.
 #![cfg_attr(target_arch = "xtensa", no_std)]
-pub mod abi_contract;
 
 pub mod charge_policy;
 pub mod led_policy;

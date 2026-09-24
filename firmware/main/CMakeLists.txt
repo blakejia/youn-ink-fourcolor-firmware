@@ -192,7 +192,6 @@ set(RUST_SOURCES
     "${RUST_DIR}/src/pairing_response.rs"
     "${RUST_DIR}/src/power.rs"
     "${RUST_DIR}/src/settings.rs"
-    "${RUST_DIR}/src/abi_contract.rs"
     "${RUST_DIR}/src/charge_policy.rs"
     "${RUST_DIR}/src/led_policy.rs"
     "${RUST_DIR}/src/wifi_policy.rs")
