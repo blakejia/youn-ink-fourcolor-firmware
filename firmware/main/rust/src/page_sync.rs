@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::json;
 use crate::battery_activity_policy;
+use crate::page_compare_policy;
 use crate::{log_e, log_i, log_w};
 
 use crate::shim::{self, CBuf};
@@ -469,12 +470,23 @@ fn sync_schedule(body: &[u8]) -> bool {
             new_policy.poll_s, new_policy.sleep_poll_s, new_policy.screen_active);
     }
 
-    // 99% path: the schedule is unchanged — but the server's position still
-    // moved on, so the index/wake answer is picked up and any manual override
-    // is released here. No bitmaps are involved either way: whatever the paint
-    // path needs it fetches on demand itself.
-    let unchanged = with_table(|t| t.have_schedule_md5 && t.schedule_md5 == new_md5);
-    if unchanged {
+    // 99% path (Task 5, design §6): the schedule comparison decision lives
+    // in `page_compare_policy::decide_schedule` — same-hash short-circuit
+    // vs changed-hash/cold-cache rebuild. The position answer applies and
+    // the manual override releases on both update paths; no bitmaps are
+    // involved either way (the paint path fetches on demand itself).
+    let sched_decision = {
+        let (cached, have) = with_table(|t| (t.schedule_md5, t.have_schedule_md5));
+        page_compare_policy::decide_schedule(&page_compare_policy::ScheduleInputs {
+            fetch_ok: 1,
+            body_usable: 1,
+            has_cached: have as u8,
+            _pad: [0; 5],
+            cached_md5: cached,
+            server_md5: new_md5,
+        })
+    };
+    if sched_decision.action == page_compare_policy::COMPARE_SKIP_SAME {
         with_table(|t| {
             t.server_index = new_index.min(t.count.saturating_sub(1));
             t.next_wake_s = new_wake_s;
@@ -616,6 +628,44 @@ fn blit_and_refresh(idx: usize, slot: *mut u8) -> bool {
     true
 }
 
+// ── page-level comparison (Task 5, design §6) ─────────────────────────────
+// The record-trust + glass-match comparison lives in
+// `page_compare_policy::decide_page`; these helpers only translate the
+// caller's facts (RTC record bytes, RAM residency, sync result) into the
+// policy inputs. Magic AND valid gate trust (an all-zero power-on record
+// is "no known content", never a match); the index participates only in
+// `prepare_paint` (the target must be the recorded one), while
+// `paint_if_changed` keys Content on the md5 alone — matching today's
+// exact behaviour.
+fn record_trusted(rec: &[u8; 48]) -> bool {
+    record_magic_ok(rec) && rec[4] != 0
+}
+
+/// Page decision for the `prepare_paint` path (index-scoped).
+fn prepare_decision(idx: usize, md5: &[u8; MD5_LEN], resident: bool, rec: &[u8; 48]) -> page_compare_policy::PageDecision {
+    page_compare_policy::decide_page(&page_compare_policy::PageInputs {
+        bitmap_resident: resident as u8,
+        record_trusted: record_trusted(rec) as u8,
+        glass_matches: (record_index(rec) == idx as i32 && rec[8..40] == md5[..]) as u8,
+        sync_ok: 1,
+        has_target: 1,
+        _pad: [0; 3],
+    })
+}
+
+/// Page decision for the `paint_if_changed` path (md5-scoped, index-free).
+fn paint_decision(md5: &[u8; MD5_LEN], rec: &[u8; 48]) -> page_compare_policy::PageDecision {
+    let resident = false; // decided by the caller via ensure_bitmap below
+    page_compare_policy::decide_page(&page_compare_policy::PageInputs {
+        bitmap_resident: resident as u8,
+        record_trusted: record_trusted(rec) as u8,
+        glass_matches: (rec[8..40] == md5[..]) as u8,
+        sync_ok: LAST_SYNC_OK.load(Ordering::Acquire) as u8,
+        has_target: 1,
+        _pad: [0; 3],
+    })
+}
+
 /// Fetch the page that is about to be painted, without touching the panel.
 ///
 /// The power wiring turns the radio off before a full refresh (15-25 s of
@@ -631,17 +681,17 @@ pub fn prepare_paint() -> bool {
     };
     let rec = read_panel_record();
     let md5 = with_table(|t| t.pages[idx].md5);
-    if !with_table(|t| t.pages[idx].bitmap.is_null()) {
-        return true;
+    let resident = !with_table(|t| t.pages[idx].bitmap.is_null());
+    // Task 5 (design §6): the fetch/skip decision is the policy's —
+    // SkipSame (trusted record matches index+md5) and UseCache (bitmap
+    // already resident) both mean "nothing to download"; Fetch and
+    // InvalidateCache fall through to the on-demand download.
+    let decision = prepare_decision(idx, &md5, resident, &rec.0);
+    match decision.action {
+        page_compare_policy::COMPARE_SKIP_SAME
+        | page_compare_policy::COMPARE_USE_CACHE => true,
+        _ => !ensure_bitmap(idx, &md5).is_null(),
     }
-    if record_magic_ok(&rec.0)
-        && rec.0[4] != 0
-        && record_index(&rec.0) == idx as i32
-        && rec.0[8..40] == md5
-    {
-        return true; // glass already shows it: no fetch
-    }
-    !ensure_bitmap(idx, &md5).is_null()
 }
 
 /// Paint the target page only if the glass does not already show it.
@@ -650,24 +700,25 @@ pub fn paint_if_changed() -> bool {
         return false;
     }
     let Some(idx) = target_index() else {
-        // Empty table after a FAILED sync means "schedule unknown", not "the
-        // server says there are no pages": every deep-sleep wake starts with
-        // an empty table, so painting the hint here would white-refresh over
-        // the last good page (15-25 s with the radio up) and spend a second
-        // full refresh restoring it on the next wake. Spec §13 requires
-        // keeping the image while backing off, so a failed sync leaves the
-        // glass alone. Gate on this module's own last-sync result.
-        if !LAST_SYNC_OK.load(Ordering::Acquire) {
-            return false;
-        }
-        // Empty schedule: the hint is a recorded state (index -1), not an
-        // unrecorded draw. Key on the index only: the md5 payload is 32 zero
-        // bytes, which the shim stores as an empty string, so comparing md5
-        // here would never match. Returning true leaves the panel showing
-        // something the canvas chose, which is what makes start()'s ownership
-        // claim honest.
+        // Task 5 (design §6): the failure fallback is the policy's —
+        // failed sync + empty table -> UseCache (keep the glass: every
+        // deep-sleep wake starts empty, so painting here would white-refresh
+        // over the last good page and spend a second refresh restoring it);
+        // successful empty sync with the hint already recorded (index -1)
+        // -> SkipSame; otherwise -> InvalidateCache, draw the hint. The
+        // hint is a recorded STATE, not unrecorded draw: keyed on the index
+        // only (its md5 payload is 32 zero bytes, which the shim stores as
+        // an empty string, so md5 comparison here would never match).
         let rec = read_panel_record();
-        if record_magic_ok(&rec.0) && rec.0[4] != 0 && record_index(&rec.0) == -1 {
+        let decision = page_compare_policy::decide_page(&page_compare_policy::PageInputs {
+            bitmap_resident: 0,
+            record_trusted: record_trusted(&rec.0) as u8,
+            glass_matches: (record_index(&rec.0) == -1) as u8,
+            sync_ok: LAST_SYNC_OK.load(Ordering::Acquire) as u8,
+            has_target: 0,
+            _pad: [0; 3],
+        });
+        if decision.continue_paint == 0 {
             return false;
         }
         show_empty_hint();
@@ -676,9 +727,10 @@ pub fn paint_if_changed() -> bool {
     let md5 = with_table(|t| if idx < t.count { Some(t.pages[idx].md5) } else { None });
     let Some(md5) = md5 else { return false; };
     let rec = read_panel_record();
-    // Magic AND valid: an all-zero record (power-on RTC memory) is "no known
-    // content", never a match — the device only ever sets the two together.
-    if record_magic_ok(&rec.0) && rec.0[4] != 0 && rec.0[8..40] == md5 {
+    // Task 5 (design §6): the same-glass short-circuit is the policy's
+    // decision — magic AND valid gate trust, md5 equality gates the match.
+    // The log line stays at the call site (mechanism, not policy).
+    if paint_decision(&md5, &rec.0).action == page_compare_policy::COMPARE_SKIP_SAME {
         log_i!("PageSync", "glass already shows {:?}, skipping repaint",
             core::str::from_utf8(&md5[..8]).unwrap_or("?"));
         return false;

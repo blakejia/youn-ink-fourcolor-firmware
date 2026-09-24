@@ -196,6 +196,7 @@ set(RUST_SOURCES
     "${RUST_DIR}/src/battery_activity_policy.rs"
     "${RUST_DIR}/src/time_gate_policy.rs"
     "${RUST_DIR}/src/notify_policy.rs"
+    "${RUST_DIR}/src/page_compare_policy.rs"
     "${RUST_DIR}/src/led_policy.rs"
     "${RUST_DIR}/src/wifi_policy.rs")
 
