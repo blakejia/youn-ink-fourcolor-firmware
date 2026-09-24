@@ -1180,6 +1180,51 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_first_dispatch_endpoint_missing_retains_ip_full_facts() {
+        // Reviewer P1: RunIpFast's FIRST policy invocation carries the full
+        // input set (have_ip_cache=1, ip_fast_active=1, endpoint_present=0)
+        // and must return DeferProbe with clear_ip_cache=0 so C++ executes
+        // the retain path (stop attempt, restart DHCP, retain IP/assoc/RTC
+        // cache, no DNS/TCP probe) — NOT the legacy clear fallback.
+        let cin = CInputs {
+            version: 1,
+            invoke_count: 0,
+            wifi_connected: 1,
+            rssi: -50,
+            channel: 6,
+            _pad0: [0; 3],
+            reconnect_count: 0,
+            ip_fast_active: 1,
+            ip_fast_ready: 0,
+            ip_fast_cache_age_ms: 100_000,
+            have_wifi_cache: 1,
+            cache_bssid_valid: 1,
+            cache_channel: 6,
+            _pad1: 0,
+            cache_ssid: mk_ssid(b"Net"),
+            cache_ssid_len: 3,
+            cache_bssid: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            wifi_cache_age_ms: 1000,
+            have_ip_cache: 1,
+            _pad2: [0; 3],
+            ip_cache_age_ms: 100_000,
+            fast_fail_count: 0,
+            fast_enabled: 1,
+            endpoint_present: 0, // missing on the first dispatch
+            probe_target: 0,
+            host_is_ip_literal: 0,
+        };
+
+        let mut cout = COutput::default();
+        unsafe { rf_wifi_policy_decide(&cin, &mut cout); }
+
+        assert_eq!(cout.action_kind, ActionKind::DeferProbe as u8);
+        assert_eq!(cout.clear_ip_cache, 0, "first dispatch must retain IP cache on endpoint_missing");
+        assert_eq!(cout.retain_ip, 1, "first dispatch must set retain_ip on endpoint_missing");
+        assert_eq!(cout.clear_wifi_cache, 0, "first dispatch must retain association cache");
+    }
+
+    #[test]
     fn c_abi_endpoint_missing_retains_ip_3b() {
         // 3b: endpoint_missing → action=DeferProbe, clear_ip_cache=0, retain_ip=1.
         let cin = CInputs {

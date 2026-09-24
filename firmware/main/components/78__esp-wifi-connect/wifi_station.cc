@@ -1493,7 +1493,15 @@ bool WifiStation::RunIpFast() {
     wifi_policy_action_v1_t ip_policy_action{};
     if (wifi_policy_invoke_from_component(&ip_policy_input, &ip_policy_action) &&
         ip_policy_action.action_kind == 20) {
-        IpFastFallback("policy_defer_probe");
+        // 3b: honor the policy cache directive. Retain (clear_ip_cache == 0)
+        // is only returned for the endpoint_missing branch — retain the IP
+        // fast cache and association/RTC mirror, restart DHCP, skip the
+        // DNS/TCP probe. All other DeferProbe reasons keep clearing.
+        if (!ip_policy_action.clear_ip_cache) {
+            IpFastDeferRetainCache("endpoint_missing");
+        } else {
+            IpFastFallback("policy_defer_probe");
+        }
         return false;
     }
     now_ms = esp_timer_get_time() / 1000;
