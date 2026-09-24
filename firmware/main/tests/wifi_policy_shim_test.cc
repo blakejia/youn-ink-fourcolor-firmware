@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -27,12 +28,19 @@
 
 static int g_callback_calls = 0;
 static std::atomic<int> g_in_flight{0};
-static std::atomic<bool> g_block_invoke{false};
+
+// Blocks the callback body so it holds the invoke mutex for a measurable time.
+static std::atomic<bool> g_block_callback{false};
+
+// Set by the callback body when it has entered — confirms the callback holds
+// the invoke mutex and is still running.
+static std::atomic<bool> g_callback_ready{false};
 
 static void reset_counters(void) {
     g_callback_calls = 0;
     g_in_flight.store(0, std::memory_order_release);
-    g_block_invoke.store(false, std::memory_order_release);
+    g_block_callback.store(false, std::memory_order_release);
+    g_callback_ready.store(false, std::memory_order_release);
 }
 
 static bool test_callback(
@@ -42,8 +50,13 @@ static bool test_callback(
     ++g_callback_calls;
     ++g_in_flight;
 
-    // Signal that we're in-flight so unregister can detect a race.
-    while (g_block_invoke.load(std::memory_order_acquire)) {
+    // Signal to the main thread that we are inside the callback body.
+    // At this point we are definitely holding the invoke mutex.
+    g_callback_ready.store(true, std::memory_order_release);
+
+    // Block until g_block_callback is cleared.  While we are blocked here,
+    // we still hold g_invoke_mutex, so unregister() will be forced to wait.
+    while (g_block_callback.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
@@ -54,7 +67,6 @@ static bool test_callback(
     // Set output version so callers can verify the right struct was received.
     std::memset(output, 0, sizeof(*output));
     output->version = WIFI_POLICY_SHIM_VERSION;
-    (void)output;
 
     --g_in_flight;
     return true;
@@ -85,7 +97,6 @@ static void test_null_callback(void) {
 
 static void test_unregister_noop(void) {
     printf("TEST: unregister before register -> success/no-op ... ");
-    // Must not crash and must return true.
     bool ok = wifi_policy_unregister();
     assert(ok && "unregister with no prior registration must return true");
     printf("PASS\n");
@@ -147,46 +158,100 @@ static void test_invoke_with_callback(void) {
     printf("PASS\n");
 }
 
+/*
+ * test_callback_in_flight_unregister
+ *
+ * Correctly tests the core invariant: unregister() must not return until any
+ * in-flight callback has fully completed and released g_invoke_mutex.
+ *
+ * Protocol (three threads, coordinated by mutex+cv):
+ *   invoker  — calls invoke(); holds g_invoke_mutex from before reading the
+ *               callback pointer through the entire callback body.
+ *   unregistrar — waits for go signal, then calls unregister(); unregister()
+ *                  blocks on g_invoke_mutex until the callback finishes.
+ *   main     — coordinates: waits for g_callback_ready (callback entered),
+ *               gives go signal, waits for unregistrar to finish.
+ *
+ * By guaranteeing unregister() is called while the callback is still inside
+ * (g_callback_ready was true at the time we gave the go signal), we know
+ * unregister() must have blocked: the callback holds g_invoke_mutex, and
+ * unregister() acquires the same mutex before clearing g_callback.
+ */
 static void test_callback_in_flight_unregister(void) {
     printf("TEST: callback in flight while unregister begins -> callback finishes ... ");
 
     reset_counters();
 
-    // Block the callback to make it take a while.
-    g_block_invoke.store(true, std::memory_order_release);
+    // Block the callback body so it holds g_invoke_mutex for a measurable time.
+    g_block_callback.store(true, std::memory_order_release);
 
-    // Register first.
+    // Register the blocking callback.
     assert(wifi_policy_register(test_callback, nullptr));
 
-    // Start invoke in a background thread (it will block inside the callback).
-    std::atomic<bool> invoke_started{false};
-    std::atomic<bool> invoke_done{false};
+    // Coordination primitives for the three-thread dance.
+    std::mutex coord_mutex;
+    std::condition_variable unregistrar_cv;
+    bool unregistrar_may_proceed = false;   // main → unregistrar
+    bool unregistrar_done = false;           // unregistrar → main
+
+    // Launch the invoker thread: it will call invoke(), acquire the invoke mutex,
+    // enter the callback, set g_callback_ready, then block on g_block_callback.
     std::thread invoker([&]() {
-        invoke_started.store(true, std::memory_order_release);
         wifi_policy_input_v1_t  in  = make_input();
         wifi_policy_action_v1_t out = {};
         wifi_policy_invoke_from_component(&in, &out);
-        invoke_done.store(true, std::memory_order_release);
     });
 
-    // Wait for the invoker to enter the callback.
-    while (!invoke_started.load(std::memory_order_acquire)) {
+    // Launch the unregistrar thread: it waits for permission, then calls unregister().
+    // Because g_invoke_mutex is held by the callback at the time permission is granted,
+    // unregister() will block until the callback releases it.
+    std::thread unregistrar([&]() {
+        std::unique_lock<std::mutex> lock(coord_mutex);
+        unregistrar_cv.wait(lock, [&]() { return unregistrar_may_proceed; });
+        lock.unlock();
+
+        bool ok = wifi_policy_unregister();
+        assert(ok && "unregister must succeed");
+
+        lock.lock();
+        unregistrar_done = true;
+        lock.unlock();
+        unregistrar_cv.notify_one();
+    });
+
+    // Wait for the callback to have entered (it holds g_invoke_mutex now).
+    while (!g_callback_ready.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    // Give it a moment to actually reach g_block_invoke.
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-    // The callback is now in-flight.  Unregister from the main thread.
-    g_block_invoke.store(false, std::memory_order_release);  // unblock callback
-    bool ok = wifi_policy_unregister();
-    assert(ok && "unregister must succeed");
-    assert(!wifi_policy_is_registered() && "must not be registered after unregister");
+    // Give the unregistrar permission to call unregister().
+    // At this point the callback is confirmed to be in-flight, holding g_invoke_mutex.
+    // Therefore unregister() MUST block on that mutex.
+    {
+        std::lock_guard<std::mutex> lock(coord_mutex);
+        unregistrar_may_proceed = true;
+    }
+    unregistrar_cv.notify_one();
+
+    // Wait for the unregistrar to finish (it signals after unregister() returns).
+    {
+        std::unique_lock<std::mutex> lock(coord_mutex);
+        unregistrar_cv.wait(lock, [&]() { return unregistrar_done; });
+    }
+
+    // Unblock the callback so it releases g_invoke_mutex and allows the
+    // unregistrar thread to complete.
+    g_block_callback.store(false, std::memory_order_release);
 
     invoker.join();
+    unregistrar.join();
 
-    // The callback must have run to completion (not been torn mid-execution).
-    assert(g_callback_calls == 1 && "callback must have completed (not torn)");
-    assert(invoke_done.load(std::memory_order_acquire) && "invoke must have returned");
+    // At this point:
+    // - The callback completed exactly once (not torn mid-execution).
+    // - unregister() returned only after the callback released g_invoke_mutex.
+    // - g_callback is cleared.
+    assert(g_callback_calls == 1 && "callback must have completed exactly once (not torn)");
+    assert(!wifi_policy_is_registered() && "must not be registered after unregister");
 
     printf("PASS\n");
 }

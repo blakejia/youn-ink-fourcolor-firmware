@@ -5,12 +5,18 @@
  * headers or Rust headers.
  *
  * Thread-safety model:
- *   - registration_mutex_: held during register/unregister.
- *   - invoke_mutex_: short-lived; blocks unregister for the duration of a
- *     callback invocation so the in-flight call always completes.
- *   - unregister() acquires registration_mutex_, then invoke_mutex_ (in that
- *     order) and clears the callback under both locks.
- *   - invoke() acquires invoke_mutex_ first, then checks the callback.
+ *   - g_invoke_mutex: held by invoke() for the ENTIRE duration of the callback
+ *     execution (not just the pointer read).  This is the key invariant:
+ *     unregister() blocks on this mutex and therefore cannot return until the
+ *     in-flight callback has fully completed.
+ *   - g_registration_mutex: serialises register() and unregister() so that
+ *     a re-registration cannot race with a concurrent unregister().
+ *   - unregister() acquires g_invoke_mutex first, then clears the callback.
+ *     Because invoke() holds g_invoke_mutex through the full callback, the
+ *     clear in unregister() cannot happen until every in-flight callback
+ *     has returned.
+ *   - register() acquires g_registration_mutex, then g_invoke_mutex so that
+ *     it also blocks any in-flight unregister() or invoke().
  */
 
 #include "wifi_policy_shim.h"
@@ -21,16 +27,17 @@
 namespace {
 
 // Stored registration
-static wifi_policy_callback_t   g_callback   = nullptr;
-static void*                   g_context    = nullptr;
-static uint32_t                g_invoke_count = 0;
+static wifi_policy_callback_t   g_callback      = nullptr;
+static void*                  g_context       = nullptr;
+static uint32_t                g_invoke_count  = 0;
 
-// Per-call guard: acquired by invoke() before reading g_callback so that
-// unregister() can block invoke() until every in-flight call finishes.
-static std::mutex              g_invoke_mutex;
+// Invocation guard: held by invoke() for the ENTIRE callback execution,
+// and by unregister() to drain in-flight calls before clearing.
+// This is the only lock needed for the core invariant.
+static std::mutex             g_invoke_mutex;
 
-// Registration mutex: acquired by register/unregister so that a concurrent
-// invoke() cannot simultaneously unregister the callback.
+// Serialises register() calls against unregister() so a re-registration
+// cannot race with an unregister-in-progress.
 static std::mutex              g_registration_mutex;
 
 }  // namespace
@@ -39,10 +46,9 @@ extern "C" bool wifi_policy_register(wifi_policy_callback_t cb, void* ctx) {
     if (cb == nullptr) {
         return false;
     }
+    // Serialise against any concurrent unregister().
     std::lock_guard<std::mutex> reg_lock(g_registration_mutex);
-
-    // Also acquire invoke lock so that a callback currently being invoked sees
-    // either the old or the new registration, never a torn state.
+    // Block any in-flight unregister() or invoke() so the update is atomic.
     std::lock_guard<std::mutex> inv_lock(g_invoke_mutex);
     g_callback = cb;
     g_context  = ctx;
@@ -50,14 +56,17 @@ extern "C" bool wifi_policy_register(wifi_policy_callback_t cb, void* ctx) {
 }
 
 extern "C" bool wifi_policy_unregister(void) {
-    // 1. Block new invoke() calls.
+    // Acquire g_invoke_mutex FIRST — this is what makes unregister() wait
+    // for every in-flight callback to finish before it clears g_callback.
+    // If invoke() is currently executing a callback, we block here until
+    // that callback returns and releases the lock.
     std::lock_guard<std::mutex> inv_lock(g_invoke_mutex);
-    // 2. Clear under the same lock so invoke() cannot observe a partially-
-    //    cleared or nullptr-after-unregister state.
+
+    // Now clear under the lock.  No new invoke() call can enter the callback
+    // (it would block on g_invoke_mutex), and no in-flight invoke() exists
+    // (we hold the lock it was holding).  The clear is therefore safe.
     g_callback = nullptr;
     g_context  = nullptr;
-    // registration_mutex_ is not needed here: once invoke_mutex_ is held
-    // no invoke() can read g_callback, and no new invoke() can start.
     return true;
 }
 
@@ -78,21 +87,25 @@ extern "C" bool wifi_policy_invoke_from_component(
     wifi_policy_callback_t cb   = nullptr;
     void*                 ctx  = nullptr;
 
-    // Acquire invoke lock before reading g_callback so that unregister() must
-    // wait for every in-flight invocation to finish.
+    // Acquire the invocation guard BEFORE reading g_callback.  We hold this
+    // lock for the ENTIRE callback execution below, so that unregister()
+    // cannot return until the callback has fully returned.
     {
         std::lock_guard<std::mutex> inv_lock(g_invoke_mutex);
         cb  = g_callback;
         ctx = g_context;
+        if (cb == nullptr) {
+            // No callback registered — safe fallback (output already zeroed).
+            return false;
+        }
+        ++g_invoke_count;
     }
 
-    if (cb == nullptr) {
-        // Safe fallback: all output is zero (no-op).
-        return false;
-    }
-
+    // cb is non-null and will remain stable while g_invoke_mutex is not held:
+    // unregister() cannot clear it (it would block on g_invoke_mutex),
+    // and register() cannot replace it (it also acquires g_invoke_mutex).
+    // Copy the input so the callback can inspect it without lifetime issues.
     wifi_policy_input_v1_t in_copy = *input;
-    ++g_invoke_count;
 
     bool ok = cb(ctx, &in_copy, output);
     return ok;

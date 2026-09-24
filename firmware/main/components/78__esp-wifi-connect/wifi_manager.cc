@@ -3,7 +3,6 @@
  */
 
 #include "wifi_manager.h"
-#include "../../wifi_policy_adapter.h"
 
 #include "wifi_station.h"
 #include "wifi_configuration_ap.h"
