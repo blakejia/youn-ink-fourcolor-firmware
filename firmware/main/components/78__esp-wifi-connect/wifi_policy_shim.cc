@@ -20,6 +20,14 @@
 #include <cstring>
 #include <mutex>
 
+extern "C" {
+uint8_t rf_wifi_encode_rtc_cache(const uint8_t*, uint32_t, const uint8_t*, uint8_t, uint8_t*, uint32_t);
+uint8_t rf_wifi_decode_rtc_cache(const uint8_t*, uint32_t, uint8_t*, uint32_t, uint8_t*, uint8_t*);
+uint8_t rf_wifi_validate_rtc_cache(const uint8_t*, uint32_t);
+uint8_t rf_wifi_parse_endpoint(const char*, uint8_t*, uint32_t, uint16_t*);
+uint8_t rf_wifi_parse_url_authority(const char*, uint8_t*, uint32_t, uint16_t*);
+}
+
 namespace {
 
 // Stored registration
@@ -93,4 +101,30 @@ extern "C" uint32_t wifi_policy_invoke_count(void) {
 extern "C" bool wifi_policy_is_registered(void) {
     std::lock_guard<std::mutex> lock(g_shim_mutex);
     return g_callback != nullptr;
+}
+
+extern "C" bool wifi_policy_encode_rtc_cache(const uint8_t* ssid, uint32_t ssid_len,
+                                              const uint8_t* bssid, uint8_t channel,
+                                              uint8_t* buf, uint32_t buf_len) {
+    return rf_wifi_encode_rtc_cache(ssid, ssid_len, bssid, channel, buf, buf_len) != 0;
+}
+
+extern "C" bool wifi_policy_decode_rtc_cache(const uint8_t* buf, uint32_t buf_len,
+                                              uint8_t* ssid_out, uint32_t ssid_out_cap,
+                                              uint8_t* bssid_out, uint8_t* channel_out) {
+    return rf_wifi_decode_rtc_cache(buf, buf_len, ssid_out, ssid_out_cap, bssid_out, channel_out) != 0;
+}
+
+extern "C" bool wifi_policy_validate_rtc_cache(const uint8_t* buf, uint32_t buf_len) {
+    return rf_wifi_validate_rtc_cache(buf, buf_len) != 0;
+}
+
+extern "C" bool wifi_policy_parse_endpoint(const char* input, uint8_t* host_buf,
+                                            uint32_t host_buf_len, uint16_t* port) {
+    return rf_wifi_parse_endpoint(input, host_buf, host_buf_len, port) != 0;
+}
+
+extern "C" bool wifi_policy_parse_url_authority(const char* input, uint8_t* host_buf,
+                                                 uint32_t host_buf_len, uint16_t* port) {
+    return rf_wifi_parse_url_authority(input, host_buf, host_buf_len, port) != 0;
 }

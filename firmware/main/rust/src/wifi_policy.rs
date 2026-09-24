@@ -602,6 +602,51 @@ pub unsafe extern "C" fn rf_wifi_policy_decide(
     }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rf_wifi_encode_rtc_cache(
+    ssid: *const u8,
+    ssid_len: u32,
+    bssid: *const u8,
+    channel: u8,
+    buf: *mut u8,
+    buf_len: u32,
+) -> u8 {
+    if ssid.is_null() || bssid.is_null() || buf.is_null() || buf_len < RTC_WIFI_RECORD_SIZE as u32 || ssid_len >= RTC_WIFI_SSID_LEN as u32 {
+        return 0;
+    }
+    let ssid_slice = unsafe { core::slice::from_raw_parts(ssid, ssid_len as usize) };
+    let bssid_slice = unsafe { core::slice::from_raw_parts(bssid, 6) };
+    let bssid_array: &[u8; 6] = bssid_slice.try_into().unwrap();
+    unsafe { encode_rtc_cache(ssid_slice, bssid_array, channel, buf) }.is_ok() as u8
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rf_wifi_decode_rtc_cache(
+    buf: *const u8,
+    buf_len: u32,
+    ssid_out: *mut u8,
+    ssid_out_cap: u32,
+    bssid_out: *mut u8,
+    channel_out: *mut u8,
+) -> u8 {
+    if buf.is_null() || ssid_out.is_null() || bssid_out.is_null() || channel_out.is_null() || buf_len < RTC_WIFI_RECORD_SIZE as u32 || ssid_out_cap < 32 {
+        return 0;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(buf, buf_len as usize) };
+    let Some(decoded) = decode_rtc_cache(bytes) else { return 0; };
+    unsafe {
+        core::ptr::copy_nonoverlapping(decoded.ssid.as_ptr(), ssid_out, 32);
+        core::ptr::copy_nonoverlapping(decoded.bssid.as_ptr(), bssid_out, 6);
+        *channel_out = decoded.channel;
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rf_wifi_validate_rtc_cache(buf: *const u8, buf_len: u32) -> u8 {
+    (!buf.is_null() && buf_len >= RTC_WIFI_RECORD_SIZE as u32 && decode_rtc_cache(unsafe { core::slice::from_raw_parts(buf, buf_len as usize) }).is_some()) as u8
+}
+
 /// Parse an MQTT endpoint (host[:port]) and write the host to a buffer.
 ///
 /// # Safety

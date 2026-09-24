@@ -100,6 +100,15 @@ void rf_wifi_policy_decide(
     const rf_wifi_policy_inputs_t* inp,
     rf_wifi_policy_output_t*       out);
 
+/* ── RTC cache codec ───────────────────────────────────────────────────── */
+uint8_t rf_wifi_encode_rtc_cache(const uint8_t* ssid, uint32_t ssid_len,
+                                 const uint8_t* bssid, uint8_t channel,
+                                 uint8_t* buf, uint32_t buf_len);
+uint8_t rf_wifi_decode_rtc_cache(const uint8_t* buf, uint32_t buf_len,
+                                 uint8_t* ssid_out, uint32_t ssid_out_cap,
+                                 uint8_t* bssid_out, uint8_t* channel_out);
+uint8_t rf_wifi_validate_rtc_cache(const uint8_t* buf, uint32_t buf_len);
+
 /* ── Endpoint parsing helpers ────────────────────────────────────────────── */
 
 /**

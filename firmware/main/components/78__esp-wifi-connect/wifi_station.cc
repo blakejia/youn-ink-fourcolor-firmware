@@ -114,15 +114,11 @@ RTC_DATA_ATTR static struct RtcWifiCache {
 static constexpr uint32_t kRtcWifiCacheMagic = 0x52465731;  // "RFW1"
 
 static void SaveWifiCacheToRtc(const std::string& ssid, const uint8_t bssid[6], uint8_t channel) {
-    if (ssid.empty() || ssid.size() >= sizeof(g_rtc_wifi_cache.ssid)) {
-        g_rtc_wifi_cache.magic = 0;  // unpersistable -> honest cache_miss next boot
-        return;
-    }
-    g_rtc_wifi_cache.magic = kRtcWifiCacheMagic;
-    memset(g_rtc_wifi_cache.ssid, 0, sizeof(g_rtc_wifi_cache.ssid));
-    memcpy(g_rtc_wifi_cache.ssid, ssid.data(), ssid.size());
-    memcpy(g_rtc_wifi_cache.bssid, bssid, 6);
-    g_rtc_wifi_cache.channel = channel;
+    memset(&g_rtc_wifi_cache, 0, sizeof(g_rtc_wifi_cache));
+    wifi_policy_encode_rtc_cache(reinterpret_cast<const uint8_t*>(ssid.data()),
+                                 static_cast<uint32_t>(ssid.size()), bssid, channel,
+                                 reinterpret_cast<uint8_t*>(&g_rtc_wifi_cache),
+                                 sizeof(g_rtc_wifi_cache));
 }
 
 static void ClearWifiCacheRtc() {
@@ -130,23 +126,22 @@ static void ClearWifiCacheRtc() {
 }
 
 static void SeedFastCacheFromRtc() {
-    if (g_rtc_wifi_cache.magic != kRtcWifiCacheMagic ||
-        g_rtc_wifi_cache.channel == 0 ||
-        g_rtc_wifi_cache.ssid[0] == '\0' ||
-        g_rtc_wifi_cache.ssid[sizeof(g_rtc_wifi_cache.ssid) - 1] != '\0' ||
-        !IsValidBssid(g_rtc_wifi_cache.bssid)) {
+    uint8_t ssid[32] = {0};
+    uint8_t bssid[6] = {0};
+    uint8_t channel = 0;
+    if (!wifi_policy_decode_rtc_cache(reinterpret_cast<const uint8_t*>(&g_rtc_wifi_cache),
+                                      sizeof(g_rtc_wifi_cache), ssid, sizeof(ssid), bssid, &channel)) {
         return;
     }
     std::lock_guard<std::mutex> lock(g_fast_cache_mutex);
-    if (g_fast_cache.have_wifi) return;  // never clobber a fresher RAM entry
+    if (g_fast_cache.have_wifi) return;
     g_fast_cache.have_wifi = true;
-    g_fast_cache.ssid = reinterpret_cast<const char*>(g_rtc_wifi_cache.ssid);
-    memcpy(g_fast_cache.bssid, g_rtc_wifi_cache.bssid, 6);
-    g_fast_cache.channel = g_rtc_wifi_cache.channel;
-    // esp_timer restarts at 0 every boot and last_ms feeds only the FAST_RC
-    // age log — stamp "now" so the line reads as fresh as the sleep crossed.
+    g_fast_cache.ssid.assign(reinterpret_cast<const char*>(ssid), strnlen(reinterpret_cast<const char*>(ssid), sizeof(ssid)));
+    memcpy(g_fast_cache.bssid, bssid, 6);
+    g_fast_cache.channel = channel;
     g_fast_cache.last_ms = esp_timer_get_time() / 1000;
 }
+
 
 static bool IsValidIpInfo(const esp_netif_ip_info_t& info) {
     return info.ip.addr != 0 && info.gw.addr != 0 && info.netmask.addr != 0;
@@ -361,85 +356,28 @@ static bool LoadHttpOtaUrl(std::string* url, std::string* source) {
 }
 
 static bool ParseEndpoint(const std::string& endpoint, std::string* host, int* port) {
-    if (host == nullptr || port == nullptr || endpoint.empty()) {
+    uint8_t host_buf[256] = {0};
+    uint16_t parsed_port = 0;
+    if (host == nullptr || port == nullptr || endpoint.empty() ||
+        !wifi_policy_parse_endpoint(endpoint.c_str(), host_buf, sizeof(host_buf), &parsed_port)) {
         return false;
     }
-    std::string h = endpoint;
-    int p = 8883;
-    auto pos = endpoint.rfind(':');
-    if (pos != std::string::npos && pos + 1 < endpoint.size()) {
-        bool digits = true;
-        for (size_t i = pos + 1; i < endpoint.size(); ++i) {
-            if (endpoint[i] < '0' || endpoint[i] > '9') {
-                digits = false;
-                break;
-            }
-        }
-        if (digits) {
-            h = endpoint.substr(0, pos);
-            p = std::stoi(endpoint.substr(pos + 1));
-        }
-    }
-    if (h.empty()) {
-        return false;
-    }
-    *host = h;
-    *port = p;
+    *host = reinterpret_cast<const char*>(host_buf);
+    *port = parsed_port;
     return true;
 }
 
 static bool ParseUrlAuthority(const std::string& url,
                               std::string* host,
                               int* port) {
-    if (host == nullptr || port == nullptr || url.empty()) {
+    uint8_t host_buf[256] = {0};
+    uint16_t parsed_port = 0;
+    if (host == nullptr || port == nullptr || url.empty() ||
+        !wifi_policy_parse_url_authority(url.c_str(), host_buf, sizeof(host_buf), &parsed_port)) {
         return false;
     }
-
-    size_t scheme_end = url.find("://");
-    if (scheme_end == std::string::npos) {
-        return false;
-    }
-    std::string scheme = url.substr(0, scheme_end);
-    std::transform(scheme.begin(), scheme.end(), scheme.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    int default_port = 0;
-    if (scheme == "https" || scheme == "wss") {
-        default_port = 443;
-    } else if (scheme == "http" || scheme == "ws") {
-        default_port = 80;
-    } else {
-        return false;
-    }
-
-    size_t authority_start = scheme_end + 3;
-    size_t authority_end = url.find('/', authority_start);
-    std::string authority = url.substr(authority_start, authority_end - authority_start);
-    if (authority.empty()) {
-        return false;
-    }
-
-    std::string resolved_host = authority;
-    int resolved_port = default_port;
-    size_t colon = authority.rfind(':');
-    if (colon != std::string::npos && colon + 1 < authority.size()) {
-        bool digits = true;
-        for (size_t i = colon + 1; i < authority.size(); ++i) {
-            if (authority[i] < '0' || authority[i] > '9') {
-                digits = false;
-                break;
-            }
-        }
-        if (digits) {
-            resolved_host = authority.substr(0, colon);
-            resolved_port = std::stoi(authority.substr(colon + 1));
-        }
-    }
-    if (resolved_host.empty()) {
-        return false;
-    }
-
-    *host = resolved_host;
-    *port = resolved_port;
+    *host = reinterpret_cast<const char*>(host_buf);
+    *port = parsed_port;
     return true;
 }
 

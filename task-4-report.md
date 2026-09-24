@@ -4,6 +4,8 @@
 - Unregistered callbacks return `false`; the shim therefore retains its zero-initialized no-op fallback.
 - Added the minimal endpoint-missing policy decision invocation in `wifi_station.cc`; the existing `IpFastFallback("endpoint_missing")` path remains preserved regardless of policy availability.
 - Rust policy C ABI and CMake source registration are included in the Task 4a firmware changes.
+- Added production C ABI exports for RTC cache encode/decode/validate; production WifiStation cache save/seed now calls Rust while C++ owns RTC storage.
+- Endpoint resolution now delegates MQTT and URL parsing to the Rust C ABI, preserving existing lax parser semantics.
 
 ## Verification
 

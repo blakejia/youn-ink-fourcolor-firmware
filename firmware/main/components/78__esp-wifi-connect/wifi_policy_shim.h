@@ -150,6 +150,18 @@ uint32_t wifi_policy_invoke_count(void);
  */
 bool wifi_policy_is_registered(void);
 
+bool wifi_policy_encode_rtc_cache(const uint8_t* ssid, uint32_t ssid_len,
+                                  const uint8_t* bssid, uint8_t channel,
+                                  uint8_t* buf, uint32_t buf_len);
+bool wifi_policy_decode_rtc_cache(const uint8_t* buf, uint32_t buf_len,
+                                  uint8_t* ssid_out, uint32_t ssid_out_cap,
+                                  uint8_t* bssid_out, uint8_t* channel_out);
+bool wifi_policy_validate_rtc_cache(const uint8_t* buf, uint32_t buf_len);
+bool wifi_policy_parse_endpoint(const char* input, uint8_t* host_buf,
+                                uint32_t host_buf_len, uint16_t* port);
+bool wifi_policy_parse_url_authority(const char* input, uint8_t* host_buf,
+                                     uint32_t host_buf_len, uint16_t* port);
+
 #ifdef __cplusplus
 }
 #endif
