@@ -23,6 +23,7 @@
 #include <ctime>
 #include "device_signature.h"
 #include "pairing.h"
+#include "pairing_response.h"
 
 static const char *kTag = "Pairing";
 
@@ -172,6 +173,9 @@ static bool wall_clock_ok(void)
 /**
  * @brief 发起 pair-start 请求，返回配对码和过期时间
  * @return true=成功, false=网络错误
+ *
+ * 何时算成功（200 + JSON 有效 + code 为字符串 + expires_in 为数字）由
+ * pairing_response.rs 分类，cargo test 覆盖；这里仍负责 HTTP 与 cJSON。
  */
 static bool do_pair_start(const char *device_id, char *code_out, int code_out_len,
                           int *expires_out)
@@ -208,44 +212,60 @@ static bool do_pair_start(const char *device_id, char *code_out, int code_out_le
     int resp_len = sizeof(resp);
     int status = http_wrapper_post_json(
         url, NULL, body, extra, 4, resp, &resp_len, kHttpTimeoutMs);
+
+    // 解析响应。旧实现只在 200 时解析；非 200 / 传输错误直接判失败，
+    // 不去读可能未初始化的响应缓冲。
+    rf_pair_start_facts_t facts = {};
+    facts.status = status;
+    if (status == 200) {
+        cJSON *json = cJSON_Parse(resp);
+        facts.json_valid = (json != nullptr) ? 1 : 0;
+        if (json) {
+            cJSON *code_item = cJSON_GetObjectItemCaseSensitive(json, "code");
+            cJSON *expires_item = cJSON_GetObjectItemCaseSensitive(json, "expires_in");
+            facts.code_is_string = cJSON_IsString(code_item) ? 1 : 0;
+            facts.expires_is_number = cJSON_IsNumber(expires_item) ? 1 : 0;
+            if (facts.code_is_string && facts.expires_is_number) {
+                snprintf(code_out, code_out_len, "%s", code_item->valuestring);
+                *expires_out = expires_item->valueint;
+            }
+            cJSON_Delete(json);
+        }
+    }
+
+    if (rf_pairing_classify_pair_start(&facts) == RF_PAIR_OUTCOME_PAIR_STARTED) {
+        return true;
+    }
     if (status < 0) {
         ESP_LOGE(kTag, "pair-start 网络错误");
-        return false;
-    }
-    if (status != 200) {
+    } else if (status != 200) {
         ESP_LOGE(kTag, "pair-start HTTP %d", status);
-        return false;
-    }
-
-    // 解析响应
-    cJSON *json = cJSON_Parse(resp);
-    if (!json) {
+    } else if (!facts.json_valid) {
         ESP_LOGE(kTag, "pair-start 响应 JSON 解析失败");
-        return false;
+    } else {
+        ESP_LOGE(kTag, "pair-start 响应字段类型不匹配");
     }
-
-    cJSON *code_item = cJSON_GetObjectItemCaseSensitive(json, "code");
-    cJSON *expires_item = cJSON_GetObjectItemCaseSensitive(json, "expires_in");
-
-    bool ok = false;
-    if (cJSON_IsString(code_item) && cJSON_IsNumber(expires_item)) {
-        snprintf(code_out, code_out_len, "%s", code_item->valuestring);
-        *expires_out = expires_item->valueint;
-        ok = true;
-    }
-    cJSON_Delete(json);
-    return ok;
+    return false;
 }
 
 /**
  * @brief 发起 pair-claim 请求
  * @return HTTP 状态码（200=成功, 401=未确认/过期）
+ * @param outcome 接收分类结果（rf_pairing_outcome_t）：GRANTED=拿到 token，
+ *        PENDING=等待用户确认，REJECTED=401/429 换新码，NETWORK_ERROR=其他。
+ *
+ * 分类规则（200+任意非空 token=granted；200 无 token 或 JSON 无效=pending；
+ * 401/429=rejected；其余=network error）在 pairing_response.rs 里，cargo test
+ * 覆盖；这里仍负责 HTTP 与 cJSON。
  */
 static int do_pair_claim(const char *device_id, const char *code,
-                         char *token_out, int token_out_len)
+                         char *token_out, int token_out_len, uint8_t *outcome)
 {
     char url[256];
     if (!server_pairing_build_endpoint("/api/devices/pair-claim", url, sizeof(url))) {
+        rf_pair_claim_facts_t facts = {};
+        facts.status = -1;
+        *outcome = rf_pairing_classify_claim(&facts);
         return -1;
     }
 
@@ -260,20 +280,28 @@ static int do_pair_claim(const char *device_id, const char *code,
     int status = http_wrapper_post_json(url, NULL, body, nullptr, 0, resp, &resp_len, kHttpTimeoutMs);
     if (status != 200 && status != 401) {
         ESP_LOGW(kTag, "pair-claim HTTP %d（可能网络错误）", status);
-        return status;
     }
 
+    rf_pair_claim_facts_t facts = {};
+    facts.status = status;
+    // 旧实现只在 200 时解析；401/429 的响应体从未被读过，保持如此。
     if (status == 200) {
         cJSON *json = cJSON_Parse(resp);
+        facts.json_valid = (json != nullptr) ? 1 : 0;
         if (json) {
             cJSON *token_item = cJSON_GetObjectItemCaseSensitive(json, "token");
-            if (cJSON_IsString(token_item)) {
+            facts.token_is_string = cJSON_IsString(token_item) ? 1 : 0;
+            // cJSON_IsString 不足以区分空串与非空串，首字节检查单独传递。
+            facts.token_nonempty =
+                (cJSON_IsString(token_item) && token_item->valuestring[0] != '\0') ? 1 : 0;
+            if (facts.token_is_string && facts.token_nonempty) {
                 snprintf(token_out, token_out_len, "%s", token_item->valuestring);
             }
             cJSON_Delete(json);
         }
     }
 
+    *outcome = rf_pairing_classify_claim(&facts);
     return status;
 }
 
@@ -355,9 +383,11 @@ bool server_pairing_run(void)
 
         case RF_PAIR_ACTION_CLAIM: {
             char token[80] = {0};
-            int status = do_pair_claim(device_id, code, token, sizeof(token));
+            uint8_t outcome = 0;
+            int status = do_pair_claim(device_id, code, token, sizeof(token), &outcome);
 
-            if (status == 200 && token[0] != '\0') {
+            switch ((rf_pairing_outcome_t)outcome) {
+            case RF_PAIR_OUTCOME_CLAIM_GRANTED:
                 ESP_LOGI(kTag, "配对成功！写入 token");
                 if (!nvs_write_str(kNvsToken, token)) {
                     // 落盘失败不能当成功：服务端已签发 token 并置 trust，
@@ -367,21 +397,24 @@ bool server_pairing_run(void)
                     last = RF_PAIR_OUTCOME_CLAIM_GRANTED;
                 }
                 continue;
-            }
-            if (status == 200) {
+
+            case RF_PAIR_OUTCOME_CLAIM_PENDING:
                 // 200 且无 token = {"status":"pending"}，正常等待用户确认。
                 ESP_LOGD(kTag, "pair-claim pending：等待用户在服务端确认");
                 last = RF_PAIR_OUTCOME_CLAIM_PENDING;
                 continue;
-            }
-            if (status == 401 || status == 429) {
+
+            case RF_PAIR_OUTCOME_CLAIM_REJECTED:
                 ESP_LOGW(kTag, "pair-claim %d: 换新码并退避重试", status);
                 last = RF_PAIR_OUTCOME_CLAIM_REJECTED;
                 continue;
+
+            case RF_PAIR_OUTCOME_CLAIM_NETWORK_ERROR:
+            default:
+                ESP_LOGW(kTag, "pair-claim 网络错误 (status=%d)，退避重试", status);
+                last = RF_PAIR_OUTCOME_CLAIM_NETWORK_ERROR;
+                continue;
             }
-            ESP_LOGW(kTag, "pair-claim 网络错误 (status=%d)，退避重试", status);
-            last = RF_PAIR_OUTCOME_CLAIM_NETWORK_ERROR;
-            continue;
         }
 
         case RF_PAIR_ACTION_PAIRED:
