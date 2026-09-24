@@ -95,6 +95,9 @@ unsafe extern "C" {
     /// (rf_request_full_refresh), never the panel waveform — see F3 note.
     pub fn rf_power_counters(wakes: *mut u32, awake_ms: *mut u32, radio_ms: *mut u32,
                              http_gets: *mut u32, refresh_ms: *mut u32);
+    /// Real panel activity counters (C++ shim owns them): cumulative refresh
+    /// transactions and measured busy milliseconds. Relative activity only.
+    pub fn rf_panel_activity_counters(refreshes: *mut u32, busy_ms: *mut u32);
     /// `esp_reset_reason()` at boot (shim.cpp caches it once; Rust only reads).
     pub fn rf_last_reset_reason() -> u32;
     pub fn rf_battery_sample(mv: *mut u16, pct: *mut u8, charge: *mut u8) -> i32;
@@ -339,6 +342,25 @@ pub(crate) mod host {
     /// Staged by `set_counters`, read out by the `rf_power_counters` stub —
     /// the same "Rust only reads, C owns" shape as the device side.
     static POWER: Mutex<[u32; 5]> = Mutex::new([0; 5]);
+    static PANEL_ACTIVITY: Mutex<[u32; 2]> = Mutex::new([0; 2]);
+
+    pub fn set_panel_activity_counters(refreshes: u32, busy_ms: u32) {
+        *PANEL_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner()) =
+            [refreshes, busy_ms];
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_panel_activity_counters(refreshes: *mut u32, busy_ms: *mut u32) {
+        let c = *PANEL_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            if !refreshes.is_null() {
+                *refreshes = c[0];
+            }
+            if !busy_ms.is_null() {
+                *busy_ms = c[1];
+            }
+        }
+    }
 
     pub fn set_counters(wakes: u32, awake_ms: u32, radio_ms: u32, http_gets: u32, refresh_ms: u32) {
         *POWER.lock().unwrap_or_else(|e| e.into_inner()) =

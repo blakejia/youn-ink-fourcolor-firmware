@@ -5,6 +5,8 @@
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
+#include <esp_timer.h>
+#include "shim_power.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -946,6 +948,11 @@ void CustomLcdDisplay::writeBytes(const uint8_t *buf, int len) {
 }
 
 void CustomLcdDisplay::EPD_TurnOnDisplay() {
+    // Relative activity accounting: every path that submits a real waveform
+    // (full, partial, raw photo, factory pattern) funnels through here. Book
+    // one refresh and the measured busy duration after power-off; this is
+    // separate from refresh_submit_ms (queue time) and never converted to mAh.
+    const int64_t panel_t0 = esp_timer_get_time();
     EPD_SendCommand(0x04); //power on
     read_busy();
     if (IsFourColorPanel()) {
@@ -968,6 +975,9 @@ void CustomLcdDisplay::EPD_TurnOnDisplay() {
         EPD_SendData(0xA5);
     }
     EPD_PowerOff();
+    const uint32_t panel_busy_ms =
+        static_cast<uint32_t>((esp_timer_get_time() - panel_t0) / 1000);
+    rf_power_add_panel_refresh(panel_busy_ms);
 }
 
 

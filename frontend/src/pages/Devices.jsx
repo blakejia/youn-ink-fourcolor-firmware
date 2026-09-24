@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
 import { Banner, BusyButton } from '../ui.jsx';
 import { formatCountdown, formatTime, timeAgo } from '../format.js';
+import { windowActivity } from '../lib/activity.js';
 
 // Charge-state vocabulary shared by the cell badge, the curve colors, the
 // legend and the hover readout — one source so they can never disagree.
@@ -400,6 +401,9 @@ function BatteryDetail({ device, onClose }) {
   const pct = p && typeof p.battery_pct === 'number' ? p.battery_pct : null;
   const chg = p && typeof p.battery_charge === 'number' ? p.battery_charge : null;
   const xr = pts && pts.length ? windowRange(pts, hours) : null;
+  const act = windowActivity(pts);
+  const fmtSec = ms => (ms != null ? `${(ms / 1000).toFixed(1)} 秒` : '—');
+  const actStats = pts && pts.length >= 2;
   const xy = pts && pts.length ? makeXY(pts, W, H, PAD, xr) : null;
   const pick = (clientX, target) => {
     if (!xy) return;
@@ -439,6 +443,13 @@ function BatteryDetail({ device, onClose }) {
             <div><dt>radio 时长</dt><dd>{p.radio_ms != null ? `${(p.radio_ms / 1000).toFixed(1)} 秒` : '—'}</dd></div>
             <div><dt>HTTP 请求</dt><dd>{p.http_gets ?? '—'}</dd></div>
             <div><dt>刷屏提交</dt><dd>{p.refresh_submit_ms != null ? `${(p.refresh_submit_ms / 1000).toFixed(1)} 秒` : '—'}</dd></div>
+            <div><dt>区间清醒</dt><dd>{actStats ? fmtSec(act.awake_ms) : '—'}</dd></div>
+            <div><dt>区间射频上界</dt><dd>{actStats ? fmtSec(act.radio_ms) : '—'}</dd></div>
+            <div><dt>区间 EPD 刷新</dt><dd>{actStats ? act.epd_refreshes : '—'}</dd></div>
+            <div><dt>区间 EPD 忙时</dt><dd>{actStats ? fmtSec(act.epd_busy_ms) : '—'}</dd></div>
+            <div style={{ gridColumn: '1 / -1', fontSize: 11, color: '#888' }}>
+              相对活动估算，非 mAh/电量百分比；墨水屏静态画面不计
+            </div>
             <div>
               <dt>上次重启</dt>
               <dd>

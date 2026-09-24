@@ -58,6 +58,20 @@ def test_full_battery_params_insert_one_row(client):
     assert (row["mv"], row["pct"], row["charge"]) == (3980, 76, 4)
     assert row["wakes"] == 3 and row["awake_ms"] == 900 and row["radio_ms"] == 400
 
+def test_refresh_activity_counters_are_saved_with_battery_sample(client):
+    now = int(time.time())
+    r = _get_schedule(
+        client,
+        "?w=3&a=900&r=400&g=1&f=0&er=2&eb=3456&rr=3&v=3980&p=76&c=4",
+    )
+    assert r.status_code == 200
+    row = registry.battery_history(DEV, since_ts=now - 60)[0]
+    assert row["epd_refreshes"] == 2
+    assert row["epd_busy_ms"] == 3456
+    snap = json.loads(registry.get_power_counters(DEV))
+    assert snap["epd_refreshes"] == 2
+    assert snap["epd_busy_ms"] == 3456
+
 
 def test_missing_battery_params_change_nothing(client):
     now = int(time.time())
@@ -138,14 +152,17 @@ def test_power_history_returns_points_ascending(client):
     now = int(time.time())
     for i, (mv, p) in enumerate([(4000, 90), (3900, 80), (3800, 70)]):
         registry.add_battery_sample(DEV, now - 300 + i * 60, mv, p, 4,
-                                   {"wakes": i, "awake_ms": 100 * i})
+                                   {"wakes": i, "awake_ms": 100 * i,
+                                    "epd_refreshes": i + 2,
+                                    "epd_busy_ms": 500 * (i + 1)})
     r = client.get(f"/api/devices/{DEV}/power-history?hours=1",
                    headers=_op_headers())
     assert r.status_code == 200
     pts = r.json()["points"]
     assert [p["mv"] for p in pts] == [4000, 3900, 3800]
     assert pts[0]["awake_ms"] == 0 and pts[2]["awake_ms"] == 200
-
+    assert pts[0]["epd_refreshes"] == 2 and pts[2]["epd_refreshes"] == 4
+    assert pts[0]["epd_busy_ms"] == 500 and pts[2]["epd_busy_ms"] == 1500
 
 def test_power_history_downsamples_over_500_points(client):
     """600 raw rows over 12 h → capped at 500 buckets by time-bucket average."""

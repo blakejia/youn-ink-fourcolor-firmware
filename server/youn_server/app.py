@@ -259,7 +259,8 @@ def create_app() -> FastAPI:
         merged = {"ts": bucket[-1]["ts"], "charge": charge}
         for k in ("mv", "pct"):
             merged[k] = round(sum(p[k] for p in bucket) / len(bucket))
-        for k in ("wakes", "awake_ms", "radio_ms", "http_gets", "refresh_submit_ms"):
+        for k in ("wakes", "awake_ms", "radio_ms", "http_gets", "refresh_submit_ms",
+                  "epd_refreshes", "epd_busy_ms"):
             merged[k] = bucket[-1][k]
         return merged
 
@@ -599,8 +600,9 @@ def create_app() -> FastAPI:
         # schedule GET query string (?w=&a=&r=&g=&f=). Missing keys read as 0
         # so old firmware (bare path, no query) keeps working unchanged.
         # Semantics (see report F3): r is a radio-on UPPER BOUND, f is
-        # refresh-SUBMIT time — never the panel waveform. panel_ms (true
-        # waveform occupancy) is a deferred item, not measured here.
+        # refresh-SUBMIT time. er/eb are the real panel refresh count and
+        # measured waveform-busy duration, used only as a relative activity
+        # estimate (no current sensor, so never converted to mAh or percent).
         qp = request.query_params
         def _u32(name: str) -> int:
             try:
@@ -614,6 +616,11 @@ def create_app() -> FastAPI:
             "radio_ms": _u32("r"),
             "http_gets": _u32("g"),
             "refresh_submit_ms": _u32("f"),
+            # Relative activity estimate (no current sensor): cumulative count
+            # of real panel refresh transactions and their busy duration.
+            # Missing query keys from old firmware read as 0.
+            "epd_refreshes": _u32("er"),
+            "epd_busy_ms": _u32("eb"),
         }
         # `rr` is the esp_reset_reason_t enum the device sampled at boot
         # (e.g. 15=BROWNOUT, 8=RTCWDT). Old firmware omits it: keep the last

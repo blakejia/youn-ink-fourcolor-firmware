@@ -56,6 +56,10 @@ void rf_rails_audio(int on);   /* 音频 + 功放 */
 void rf_power_count_wake(void);
 void rf_power_add_awake_ms(uint32_t ms);
 void rf_power_add_radio_ms(uint32_t ms);
+/* Real panel activity: one call per waveform submission; busy_ms is the
+ * measured duration of that refresh (not submit-queue time). Relative
+ * activity estimate only — no current sensor, never converted to mAh or %. */
+void rf_power_add_panel_refresh(uint32_t busy_ms);
 // NOTE: no rf_power_add_refresh_ms — f is booked inside rf_request_full_refresh
 // (single exit). A second writer would let a caller double-book one submit.
 

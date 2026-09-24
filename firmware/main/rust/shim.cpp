@@ -183,6 +183,11 @@ extern "C" void rf_timer_delete(void) {
 // fetch). Zeroed on cold boot / power loss: RTC memory does not survive that,
 // which is the correct fresh start.
 RTC_DATA_ATTR static uint32_t g_wakes, g_awake_ms, g_radio_ms, g_http_gets, g_refresh_submit_ms;
+// Real panel activity (relative estimate only): cumulative refresh
+// transactions and measured busy milliseconds. RTC_DATA_ATTR because every
+// duty-cycle sleep is a reboot. No current sensor exists, so these are never
+// converted to mAh or a battery percentage.
+RTC_DATA_ATTR static uint32_t g_panel_refreshes, g_panel_busy_ms;
 
 // ─────────────────────────────── http ───────────────────────────────
 
@@ -292,7 +297,8 @@ extern "C" void rf_request_full_refresh(void) {
     // notification popups all funnel through here — one place, no per-caller
     // bookkeeping to forget. Counts SUBMITS only: the call returns once the
     // request is queued; the panel's multi-second waveform runs asynchronously
-    // (see panel_ms note below) and is deliberately NOT included here.
+    // and is booked separately by rf_power_add_panel_refresh() in
+    // EPD_TurnOnDisplay(). Submit time is deliberately NOT included there.
     const uint64_t t0 = (uint64_t)(esp_timer_get_time() / 1000);
     CustomLcdDisplay *d = lcd();
     if (d != nullptr) {
@@ -401,6 +407,14 @@ extern "C" void rf_power_counters(uint32_t* w, uint32_t* a, uint32_t* r, uint32_
 extern "C" void rf_power_count_wake(void)   { g_wakes++; }
 extern "C" void rf_power_add_awake_ms(uint32_t ms) { g_awake_ms += ms; }
 extern "C" void rf_power_add_radio_ms(uint32_t ms) { g_radio_ms += ms; }
+extern "C" void rf_power_add_panel_refresh(uint32_t busy_ms) {
+    g_panel_refreshes++;
+    g_panel_busy_ms += busy_ms;
+}
+extern "C" void rf_panel_activity_counters(uint32_t* er, uint32_t* eb) {
+    if (er) *er = g_panel_refreshes;
+    if (eb) *eb = g_panel_busy_ms;
+}
 
 // Last reset reason, sampled once at first call (boot path) and cached in RTC
 // RAM: the query string must carry WHY the device rebooted (brownout vs watchdog

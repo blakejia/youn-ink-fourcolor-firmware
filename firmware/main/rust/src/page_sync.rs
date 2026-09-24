@@ -170,8 +170,12 @@ fn fetch_schedule(buf: &mut [u8]) -> Option<usize> {
     path.push("/api/pages/schedule");
     let mut c = [0u32; 5];
     unsafe { shim::rf_power_counters(&mut c[0], &mut c[1], &mut c[2], &mut c[3], &mut c[4]) };
+    let mut panel = [0u32; 2];
+    unsafe { shim::rf_panel_activity_counters(&mut panel[0], &mut panel[1]) };
     let rr = unsafe { shim::rf_last_reset_reason() };
-    let _ = write!(path, "?w={}&a={}&r={}&g={}&f={}&rr={}", c[0], c[1], c[2], c[3], c[4], rr);
+    let _ = write!(path,
+        "?w={}&a={}&r={}&g={}&f={}&er={}&eb={}&rr={}",
+        c[0], c[1], c[2], c[3], c[4], panel[0], panel[1], rr);
 
     // One-hour sliding gate (spec 2026-09-23): v/p/c ride only when due, and
     // arming happens AFTER a real sample lands on the wire — peek and arm are
@@ -1800,6 +1804,37 @@ mod tests {
         // 2) empty-hint path (direct, no schedule needed).
         show_empty_hint();
         assert_eq!(shim::host::refresh_submit_ms(), 2, "empty hint books one submit");
+    }
+
+    #[test]
+    fn schedule_get_carries_panel_activity_counters() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_counters(1, 100, 50, 1, 0);
+        shim::host::set_panel_activity_counters(7, 12345);
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        sync_once();
+
+        let gets = shim::host::calls_matching("http_get");
+        let sched = gets.iter().find(|c| c.contains("/api/pages/schedule?"))
+            .expect("schedule GET with a query string");
+        let query = sched.split('?').nth(1).unwrap_or("");
+        let mut wire = [0u32; 2];
+        let mut seen = [false; 2];
+        for kv in query.split('&') {
+            let (k, v) = kv.split_once('=').unwrap_or(("", ""));
+            if let (key, Ok(n)) = (k, v.parse::<u32>()) {
+                match key {
+                    "er" => { wire[0] = n; seen[0] = true; }
+                    "eb" => { wire[1] = n; seen[1] = true; }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(seen, [true, true],
+                   "schedule GET must carry er/eb panel activity keys: {query}");
+        assert_eq!(wire, [7, 12345],
+                   "staged panel activity must ride the schedule GET: {query}");
     }
 
     #[test]

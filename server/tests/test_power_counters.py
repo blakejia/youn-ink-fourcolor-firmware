@@ -37,7 +37,8 @@ def client():
 def test_schedule_echoes_power_counters(client):
     _register()
     r = client.get(
-        "/api/pages/schedule?w=7&a=1234&r=567&g=2&f=890", headers=_auth()
+        "/api/pages/schedule?w=7&a=1234&r=567&g=2&f=890&er=4&eb=15000",
+        headers=_auth()
     )
     assert r.status_code == 200
     body = r.json()
@@ -47,6 +48,8 @@ def test_schedule_echoes_power_counters(client):
         "radio_ms": 567,
         "http_gets": 2,
         "refresh_submit_ms": 890,
+        "epd_refreshes": 4,
+        "epd_busy_ms": 15000,
     }
 
 
@@ -61,6 +64,9 @@ def test_schedule_without_counters_reads_as_zero(client):
         "radio_ms": 0,
         "http_gets": 0,
         "refresh_submit_ms": 0,
+        # Old firmware omits er/eb: absent means zero, not an error.
+        "epd_refreshes": 0,
+        "epd_busy_ms": 0,
     }
 
 
@@ -78,4 +84,6 @@ def test_power_snapshot_is_persisted(client):
         "radio_ms": 50,
         "http_gets": 1,
         "refresh_submit_ms": 20,
+        "epd_refreshes": 0,
+        "epd_busy_ms": 0,
     }

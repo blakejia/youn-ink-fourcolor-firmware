@@ -142,8 +142,19 @@ class DeviceRegistry:
                    radio_ms INTEGER NOT NULL DEFAULT 0,
                    http_gets INTEGER NOT NULL DEFAULT 0,
                    refresh_submit_ms INTEGER NOT NULL DEFAULT 0,
+                   epd_refreshes INTEGER NOT NULL DEFAULT 0,
+                   epd_busy_ms INTEGER NOT NULL DEFAULT 0,
                    PRIMARY KEY (device_id, ts)
                )""")
+        for col in ("epd_refreshes", "epd_busy_ms"):
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE battery_history ADD COLUMN {col} "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
 
     # ── write ──
     def upsert(
@@ -320,10 +331,14 @@ class DeviceRegistry:
         c = counters or {}
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO battery_history VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO battery_history "
+                "(device_id, ts, mv, pct, charge, wakes, awake_ms, radio_ms, "
+                "http_gets, refresh_submit_ms, epd_refreshes, epd_busy_ms) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (device_id, ts, mv, pct, charge, c.get("wakes", 0),
                  c.get("awake_ms", 0), c.get("radio_ms", 0), c.get("http_gets", 0),
-                 c.get("refresh_submit_ms", 0)))
+                 c.get("refresh_submit_ms", 0), c.get("epd_refreshes", 0),
+                 c.get("epd_busy_ms", 0)))
             self._conn.execute(
                 "DELETE FROM battery_history WHERE device_id = ? AND ts < ?",
                 (device_id, ts - 90 * 86400))
@@ -332,7 +347,7 @@ class DeviceRegistry:
         with self._lock:
             cur = self._conn.execute(
                 "SELECT ts, mv, pct, charge, wakes, awake_ms, radio_ms, http_gets,"
-                " refresh_submit_ms FROM battery_history"
+                " refresh_submit_ms, epd_refreshes, epd_busy_ms FROM battery_history"
                 " WHERE device_id = ? AND ts >= ? ORDER BY ts", (device_id, since_ts))
             return [dict(zip([d[0] for d in cur.description], row)) for row in cur.fetchall()]
 
