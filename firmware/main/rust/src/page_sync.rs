@@ -15,9 +15,10 @@ use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::json;
 use crate::battery_activity_policy;
+use crate::json;
 use crate::page_compare_policy;
+use crate::protocol_parse;
 use crate::{log_e, log_i, log_w};
 
 use crate::shim::{self, CBuf};
@@ -55,7 +56,8 @@ fn record_index(rec: &[u8; 48]) -> i32 {
 /// 60x the server's intent and kept the radio up all day.
 const DEFAULT_POLL_S: u32 = 600;
 const DEFAULT_SLEEP_POLL_S: u32 = 3600;
-const MAX_POLL_MINUTES: i64 = 1440;
+// MAX_POLL_MINUTES now lives in `protocol_parse` (Task 6, design §7);
+// `minutes_to_s` routes through it.
 const SCHEDULE_TIMEOUT_MS: i32 = 10_000;
 const BITMAP_TIMEOUT_MS: i32 = 15_000;
 const SCHEDULE_BUF: usize = 8192;
@@ -327,10 +329,13 @@ impl Policy {
 }
 
 fn minutes_to_s(minutes: Option<i64>, fallback: u32) -> u32 {
-    match minutes {
-        Some(m) if m > 0 => (m.min(MAX_POLL_MINUTES) as u32) * 60,
-        _ => fallback,
-    }
+    // Task 6 (design §7): the scaling rule lives in `protocol_parse`;
+    // JSON extraction (the DOM walk) stays here at the call site.
+    let (present, value) = match minutes {
+        Some(m) => (1, m),
+        None => (0, 0),
+    };
+    protocol_parse::policy_minutes_to_s(present, value, fallback)
 }
 
 /// Read the policy out of a schedule body. Pure, so it is unit-tested on the host.
@@ -388,21 +393,34 @@ pub fn parse_schedule(body: &[u8]) -> Option<ParsedSchedule> {
         if out.count >= MAX_PAGES {
             return false;
         }
+        // Task 6 (design §7): entry usability + duration classification
+        // lives in `protocol_parse`; the DOM reads stay here.
+        let md5_len = json::member(body, item, "md5")
+            .and_then(|at| json::str_value(body, at))
+            .map(|v| v.len() as u32)
+            .unwrap_or(0);
+        let (has_duration, dur_min) = json::member(body, item, "duration_minutes")
+            .and_then(|at| json::int_value(body, at))
+            .map(|v| (1u8, v))
+            .unwrap_or((0, 0));
+        let entry = protocol_parse::decide_schedule_entry(
+            &protocol_parse::ScheduleEntryFacts {
+                md5_len,
+                has_duration,
+                _pad: [0; 3],
+                duration_minutes: dur_min,
+            },
+        );
+        if entry.usable == 0 {
+            return true;
+        }
         let Some(page_md5) = json::member(body, item, "md5")
             .and_then(|at| json::str_value(body, at))
             .and_then(md5_from)
         else {
             return true;
         };
-        let Some(dur_min) = json::member(body, item, "duration_minutes")
-            .and_then(|at| json::int_value(body, at))
-        else {
-            return true;
-        };
-        out.pages[out.count] = ParsedPage {
-            md5: page_md5,
-            duration_s: dur_min.max(0) as u32 * 60,
-        };
+        out.pages[out.count] = ParsedPage { md5: page_md5, duration_s: entry.duration_s };
         out.count += 1;
         true
     })?;

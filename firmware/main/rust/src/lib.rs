@@ -33,6 +33,7 @@ pub mod page_sync;
 pub mod pairing;
 pub mod pairing_response;
 pub mod power;
+pub mod protocol_parse;
 pub mod settings;
 pub mod shim;
 
