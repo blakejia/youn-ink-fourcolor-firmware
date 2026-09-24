@@ -106,8 +106,10 @@ public:
     // Callback fires when config AP state changes: "ap_started" | "ap_client_connected"
     // | "provisioning" | "provisioned" | "error" (reason = WiFi reason code, -1 = other)
     void SetProvisioningStateCallback(std::function<void(const std::string& state, int reason)> cb);
-    const WifiManagerConfig& GetConfig() const { return config_; }
 
+    // Final teardown hook — called exactly once from the destructor.
+    // Tears down the Wi-Fi policy adapter registration.  Idempotent.
+    void WifiPolicyShutdown();
     WifiManager(const WifiManager&) = delete;
     WifiManager& operator=(const WifiManager&) = delete;
 

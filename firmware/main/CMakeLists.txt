@@ -85,6 +85,8 @@ set(SOURCES
     "streaming/text_chunker.cc"
     "streaming/tts_streamer.cc"
     "streaming/stream_pipeline.cc"
+    # Task 3: Wi-Fi policy adapter (seam between 78__esp-wifi-connect and Rust policy)
+    "wifi_policy_adapter.cc"
 )
 
 set(INCLUDE_DIRS

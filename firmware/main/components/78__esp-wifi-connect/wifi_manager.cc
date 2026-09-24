@@ -3,6 +3,8 @@
  */
 
 #include "wifi_manager.h"
+#include "../../wifi_policy_adapter.h"
+
 #include "wifi_station.h"
 #include "wifi_configuration_ap.h"
 
@@ -26,6 +28,7 @@ WifiManager::WifiManager() = default;
 
 WifiManager::~WifiManager() {
     std::lock_guard<std::mutex> lock(mutex_);
+    WifiPolicyShutdown();
     if (station_active_ && station_) {
         station_->Stop();
     }
@@ -35,6 +38,15 @@ WifiManager::~WifiManager() {
     if (initialized_) {
         esp_wifi_deinit();
     }
+}
+
+void WifiManager::WifiPolicyShutdown() {
+    // wifi_policy_adapter_unregister is idempotent; it is safe to call even
+    // when registration never happened.  Do NOT call this on ordinary
+    // StopStation/StartStation cycles — it is only for final teardown.
+    // Defined in the main wifi_policy_adapter.cc.
+    extern void wifi_policy_adapter_unregister(void);
+    wifi_policy_adapter_unregister();
 }
 
 void WifiManager::NotifyEvent(WifiEvent event) {
@@ -51,7 +63,7 @@ void WifiManager::NotifyEvent(WifiEvent event) {
 
 bool WifiManager::Initialize(const WifiManagerConfig& config) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     if (initialized_) {
         ESP_LOGW(TAG, "Already initialized");
         return true;
@@ -113,7 +125,7 @@ bool WifiManager::IsInitialized() const {
 
 void WifiManager::StartStation() {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     if (!initialized_) {
         ESP_LOGE(TAG, "Not initialized");
         return;
@@ -161,7 +173,7 @@ void WifiManager::StartStation() {
 
 void WifiManager::StopStation() {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     if (!station_active_) {
         return;
     }
@@ -170,7 +182,7 @@ void WifiManager::StopStation() {
     station_->Stop();
     ESP_LOGI(TAG, "Station stopped");
     station_active_ = false;
-    
+
     mutex_.unlock();
     NotifyEvent(WifiEvent::Disconnected);
     mutex_.lock();
@@ -277,7 +289,7 @@ void WifiManager::SetFastProbeTarget(NetworkProbeTarget probe_target) {
 
 void WifiManager::StartConfigAp() {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     if (!initialized_) {
         ESP_LOGE(TAG, "Not initialized");
         return;
@@ -302,7 +314,7 @@ void WifiManager::StartConfigAp() {
     config_ap_->SetSsidPrefix(config_.ssid_prefix);
     config_ap_->SetPassword(config_.ap_password);
     config_ap_->SetLanguage(config_.language);
-    
+
     // Web handler calls this when user submits config
     config_ap_->OnExitRequested([this]() {
         ESP_LOGI(TAG, "Config exit requested from web");
@@ -328,7 +340,7 @@ void WifiManager::StartConfigAp() {
 
 void WifiManager::StopConfigAp() {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     if (!config_mode_active_) {
         return;
     }

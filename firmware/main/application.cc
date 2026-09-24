@@ -8,13 +8,13 @@
 #include "settings.h"
 #include "ui/rawdraw_ui_manager.h"
 #include "ui/renderers/rawdraw/wifi_renderer.h"
+#include "wifi_policy_adapter.h"
 #include "wifi_manager.h"
 
 #include <esp_mac.h>
 #include <esp_log.h>
 #include <esp_sleep.h>
 #include <esp_sntp.h>
-#include <esp_system.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
 #include <atomic>
@@ -533,6 +533,11 @@ void Application::Initialize(bool quiet) {
 
     // Start network (non-blocking, WiFi connects asynchronously)
     board.RequestNetwork();
+
+    // Register the Wi-Fi policy callback seam after the network is initialised.
+    // Registration persists across ordinary StopStation/StartStation cycles and
+    // is torn down only in WifiManager's final destructor via WifiPolicyShutdown.
+    wifi_policy_adapter_register();
 
     // Quiet backstop (F22): a quiet boot is provisioned+paired by
     // construction, so nothing else is in flight — if WiFi never connects,
