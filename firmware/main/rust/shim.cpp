@@ -43,8 +43,7 @@
 #include "notify.h"
 #include "page_sync.h"
 #include "server_pairing.h"
-
-// ─────────────────────────────── runtime ───────────────────────────────
+#include "rust/include/time_gate_policy.h"
 
 namespace {
 
@@ -448,30 +447,91 @@ extern "C" int rf_battery_sample(uint16_t* mv, uint8_t* pct, uint8_t* charge) {
 // poison the window, and the first post-sync report arms it. Peek and arm are
 // separate: page_sync arms only after a real sample reached the URL, so an
 // ADC hiccup never buys an hour of silence.
+//
+// The decision now lives in `time_gate_policy.rs`. This shim only owns the
+// RTC slow-memory stamp (`g_battery_due_at`) and reads the wall clock +
+// PCF8563 fallback. The Rust policy returns `battery_sample_ok` plus the
+// next arm stamp, and `time()==-1` is propagated as a negative `now_s`
+// before any u32 narrowing (see RfReadNowSigned() in application.cc — we
+// keep that helper mirrored here to avoid a header dependency on the
+// application-side observer).
 RTC_DATA_ATTR static uint32_t g_battery_due_at;
-static const time_t kBatteryMinClock = 1577836800;  // 2020-01-01 UTC
 extern "C" int ZectrixRtcNowEpoch(uint32_t* epoch);  // board .cc (mechanism)
 
-static time_t BatteryClock(void) {
-    time_t now = time(nullptr);
-    if (now >= kBatteryMinClock) return now;
+static int64_t ShimReadNowSigned(void) {
+    return (int64_t)time(nullptr);
+}
+static uint32_t ShimReadRtcEpoch(void) {
     uint32_t epoch = 0;
-    if (ZectrixRtcNowEpoch(&epoch) && epoch >= (uint32_t)kBatteryMinClock) {
-        return (time_t)epoch;
+    if (ZectrixRtcNowEpoch(&epoch) && epoch >= RF_TIME_GATE_NEVER) {
+        return epoch;
     }
     return 0;
 }
-extern "C" int rf_battery_due(void) {
-    time_t now = BatteryClock();
-    if (now < kBatteryMinClock) return 1;              // no clock anywhere: always due
-    return (uint32_t)now >= g_battery_due_at ? 1 : 0;
-}
-extern "C" void rf_battery_arm(void) {
-    time_t now = BatteryClock();
-    if (now < kBatteryMinClock) return;                // no clock: don't arm
-    g_battery_due_at = (uint32_t)now + 3600;           // any real report slides the gate
+static int ShimDecideBattery(uint32_t last_arm, uint32_t* next_arm_out) {
+    const int64_t now = ShimReadNowSigned();
+    const uint32_t effective = ShimReadRtcEpoch();
+    const bool now_valid = (now >= (int64_t)RF_TIME_GATE_NEVER);
+    const bool rtc_valid = (effective >= RF_TIME_GATE_NEVER);
+    rf_time_gate_policy_inputs_t in{};
+    in.now_s = now;
+    in.effective_clock_s = effective;
+    in.last_sntp_sync_s = RF_TIME_GATE_NEVER;
+    in.last_battery_arm_s = last_arm;
+    in.sntp_min_period_s = 24u * 60u * 60u;
+    in.battery_min_period_s = 60u * 60u;
+    in.clock_valid_mask =
+        (now_valid ? RF_TIME_GATE_CLOCK_NOW_VALID : 0u) |
+        (rtc_valid ? RF_TIME_GATE_CLOCK_RTC_VALID : 0u) |
+        (now_valid ? RF_TIME_GATE_CLOCK_EVER_SYNCED : 0u);
+    rf_time_gate_policy_output_t out{};
+    rf_time_gate_policy_decide(&in, &out);
+    if (next_arm_out != nullptr) {
+        *next_arm_out = out.next_last_battery_arm_s;
+    }
+    return (int)out.battery_sample_ok;
 }
 
+extern "C" int rf_battery_due(void) {
+    return ShimDecideBattery(g_battery_due_at, nullptr);
+}
+extern "C" void rf_battery_arm(void) {
+    uint32_t next_arm = RF_TIME_GATE_NEVER;
+    if (ShimDecideBattery(g_battery_due_at, &next_arm)) {
+        // Rust tells us to arm only when the wall clock is plausible.
+        // On fallback / 1970 paths `next_arm` stays at NEVER (sentinel),
+        // so we never poison g_battery_due_at.
+        if (next_arm != RF_TIME_GATE_NEVER) {
+            g_battery_due_at = next_arm;
+        }
+    }
+}
+
+extern "C" int rf_time_gate_wifi_cache_ok(void) {
+    // The Wi-Fi cache is a stale-on-write record; it must only be
+    // persisted when the wall clock is plausible. The decision lives
+    // in `time_gate_policy.rs`; this shim is a one-call observer so
+    // external C++ sites (wifi_station.cc) can consult it without
+    // building the full input struct themselves.
+    const int64_t now = ShimReadNowSigned();
+    const uint32_t effective = ShimReadRtcEpoch();
+    const bool now_valid = (now >= (int64_t)RF_TIME_GATE_NEVER);
+    const bool rtc_valid = (effective >= RF_TIME_GATE_NEVER);
+    rf_time_gate_policy_inputs_t in{};
+    in.now_s = now;
+    in.effective_clock_s = effective;
+    in.last_sntp_sync_s = RF_TIME_GATE_NEVER;
+    in.last_battery_arm_s = RF_TIME_GATE_NEVER;
+    in.sntp_min_period_s = 24u * 60u * 60u;
+    in.battery_min_period_s = 60u * 60u;
+    in.clock_valid_mask =
+        (now_valid ? RF_TIME_GATE_CLOCK_NOW_VALID : 0u) |
+        (rtc_valid ? RF_TIME_GATE_CLOCK_RTC_VALID : 0u) |
+        (now_valid ? RF_TIME_GATE_CLOCK_EVER_SYNCED : 0u);
+    rf_time_gate_policy_output_t out{};
+    rf_time_gate_policy_decide(&in, &out);
+    return (int)out.wifi_cache_ok;
+}
 // ───────────────────── device signature (public ABI) ─────────────────────
 
 /* Implemented in Rust. Writes mac_hex / timestamp / nonce_b64 / sig_b64, each

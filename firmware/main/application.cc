@@ -50,42 +50,66 @@ extern "C" uint32_t ZectrixAwakeWatchdogFired();
 // only by a cold reset/power loss. SNTP's success callback updates it.
 RTC_DATA_ATTR static std::atomic<uint32_t> s_last_sntp_sync_epoch{0};
 
-// The Rust time-gate policy is the single owner of which RTC writes are
-// allowed; C++ only owns the storage and the underlying clock reads. The
-// hard-coded `1577836800` sentinel lives behind RF_TIME_GATE_NEVER in the
-// Rust ABI; using the macro here keeps the two in lockstep and avoids
-// relying on `application.cc` knowing the exact 2020-01-01 epoch.
-constexpr uint32_t kMinPlausibleEpoch = RF_TIME_GATE_NEVER;
+// The Rust time-gate policy (`time_gate_policy.rs`) owns every time-gate
+// decision. C++ only owns the storage (RTC_DATA_ATTR stamps) and the
+// underlying clock reads (`time()`, `ZectrixRtcNowEpoch`). All early
+// returns that used to live in this file are gone — the Rust fn returns
+// the correct action for every input, including `time()==-1`.
 
-static uint32_t RfReadNow(void) {
-    return (uint32_t)time(nullptr);
+constexpr uint32_t kSntpMinPeriodS = 24u * 60u * 60u;
+constexpr uint32_t kBatteryMinPeriodS = 60u * 60u;
+
+// Read `time()` as a signed value so `time()==-1` propagates as -1 instead
+// of becoming 0xFFFFFFFF when narrowed to u32.
+static int64_t RfReadNowSigned(void) {
+    return (int64_t)time(nullptr);
 }
 
-static bool RfClockNowValid(uint32_t now) {
-    return now >= kMinPlausibleEpoch;
+// PCF8563 epoch fallback. Returns 0 when the RTC does not hold a plausible
+// epoch; C++ never uses this for SNTP mark-synced (the Rust policy refuses
+// to persist a fake sync stamp).
+static uint32_t RfReadRtcEpoch(void) {
+    uint32_t epoch = 0;
+    if (ZectrixRtcNowEpoch(&epoch) && epoch >= RF_TIME_GATE_NEVER) {
+        return epoch;
+    }
+    return 0;
+}
+
+// Fill the time-gate inputs from the live clock sources. Callers add the
+// per-site `last_*` stamps before invoking the decision.
+static void RfFillTimeGateInputs(int64_t now_s, uint32_t effective_clock_s,
+                                 uint32_t last_sntp_sync_s, uint32_t last_battery_arm_s,
+                                 bool now_valid_bit, bool rtc_valid_bit, bool ever_synced_bit,
+                                 rf_time_gate_policy_inputs_t* in) {
+    in->now_s = now_s;
+    in->effective_clock_s = effective_clock_s;
+    in->last_sntp_sync_s = last_sntp_sync_s;
+    in->last_battery_arm_s = last_battery_arm_s;
+    in->sntp_min_period_s = kSntpMinPeriodS;
+    in->battery_min_period_s = kBatteryMinPeriodS;
+    in->clock_valid_mask =
+        (now_valid_bit ? RF_TIME_GATE_CLOCK_NOW_VALID : 0u) |
+        (rtc_valid_bit ? RF_TIME_GATE_CLOCK_RTC_VALID : 0u) |
+        (ever_synced_bit ? RF_TIME_GATE_CLOCK_EVER_SYNCED : 0u);
 }
 
 extern "C" void rf_sntp_mark_synced(void) {
-    const uint32_t now = RfReadNow();
-    if (!RfClockNowValid(now)) {
-        return;  // refuse to record an implausible sync (matches Rust gate)
-    }
+    const int64_t now = RfReadNowSigned();
+    const uint32_t effective = RfReadRtcEpoch();
+    const bool now_valid = (now >= (int64_t)RF_TIME_GATE_NEVER);
+    const bool rtc_valid = (effective >= RF_TIME_GATE_NEVER);
     rf_time_gate_policy_inputs_t in{};
+    RfFillTimeGateInputs(now, effective,
+                         s_last_sntp_sync_epoch.load(std::memory_order_acquire),
+                         RF_TIME_GATE_NEVER,
+                         now_valid, rtc_valid, /*ever_synced*/ now_valid,
+                         &in);
     rf_time_gate_policy_output_t out{};
-    in.now_s = now;
-    in.last_sntp_sync_s = s_last_sntp_sync_epoch.load(std::memory_order_acquire);
-    // Other inputs are irrelevant for the mark-synced path; the Rust fn
-    // only consults `now` and `last_sntp_sync_s` for the validity check,
-    // but we populate the struct so the ABI sees the full snapshot.
-    in.last_battery_arm_s = RF_TIME_GATE_NEVER;
-    in.sntp_min_period_s = 24u * 60u * 60u;
-    in.battery_min_period_s = 60u * 60u;
-    in.clock_valid_mask = RF_TIME_GATE_CLOCK_NOW_VALID |
-                          RF_TIME_GATE_CLOCK_RTC_VALID |
-                          RF_TIME_GATE_CLOCK_EVER_SYNCED;
     rf_time_gate_policy_decide(&in, &out);
+    // Rust owns the policy. C++ performs the I/O only when Rust says ok.
     if (out.sntp_mark_synced_ok) {
-        s_last_sntp_sync_epoch.store(now, std::memory_order_release);
+        s_last_sntp_sync_epoch.store((uint32_t)now, std::memory_order_release);
     }
 }
 
@@ -229,23 +253,21 @@ void SeedSystemClockFromRtc() {
 }
 
 bool ShouldStartSntpNow() {
-    // Delegate the daily-gate decision to the Rust time-gate policy. C++
-    // still owns the RTC_DATA_ATTR stamp; Rust owns the action mapping.
-    const uint32_t now = RfReadNow();
-    if (!RfClockNowValid(now)) {
-        // Mirror the first branch of the Rust gate: an implausible wall
-        // clock demands SNTP immediately to repair it.
-        return true;
-    }
+    // Delegate the daily-gate decision to the Rust time-gate policy.
+    // There is intentionally NO C++ early return here: the Rust fn is
+    // the single source of truth for SNTP start, including negative
+    // `time()` and clock regressions. C++ only fills the inputs and
+    // translates the action code.
+    const int64_t now = RfReadNowSigned();
+    const uint32_t effective = RfReadRtcEpoch();
+    const bool now_valid = (now >= (int64_t)RF_TIME_GATE_NEVER);
+    const bool rtc_valid = (effective >= RF_TIME_GATE_NEVER);
     rf_time_gate_policy_inputs_t in{};
-    in.now_s = now;
-    in.last_sntp_sync_s = s_last_sntp_sync_epoch.load(std::memory_order_acquire);
-    in.last_battery_arm_s = RF_TIME_GATE_NEVER;
-    in.sntp_min_period_s = 24u * 60u * 60u;
-    in.battery_min_period_s = 60u * 60u;
-    in.clock_valid_mask = RF_TIME_GATE_CLOCK_NOW_VALID |
-                          RF_TIME_GATE_CLOCK_RTC_VALID |
-                          RF_TIME_GATE_CLOCK_EVER_SYNCED;
+    RfFillTimeGateInputs(now, effective,
+                         s_last_sntp_sync_epoch.load(std::memory_order_acquire),
+                         RF_TIME_GATE_NEVER,
+                         now_valid, rtc_valid, /*ever_synced*/ now_valid,
+                         &in);
     rf_time_gate_policy_output_t out{};
     rf_time_gate_policy_decide(&in, &out);
     return out.sntp_start_action != RF_TIME_GATE_SNTP_ACTION_SKIP;

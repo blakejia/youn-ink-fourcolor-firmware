@@ -28,13 +28,17 @@
 #include "ssid_manager.h"
 #include "wifi_manager.h"
 #include "wifi_policy_shim.h"
+
+// Rust time-gate policy: returns 1 only when the wall clock is plausible
+// (see rust/src/time_gate_policy.rs). The Wi-Fi RTC cache is a
+// stale-on-write record and must not be persisted when the clock is 1970.
+extern "C" int rf_time_gate_wifi_cache_ok(void);
 #define TAG "WifiStation"
 #define FAST_RC_TAG "FAST_RC"
 static bool kFastRcEnable = true;
 #define WIFI_EVENT_CONNECTED BIT0
 #define WIFI_EVENT_STOPPED BIT1
 #define WIFI_EVENT_SCAN_DONE_BIT BIT2
-#define MAX_RECONNECT_COUNT 5
 static constexpr int kFastConnectTimeoutMs = 2000;
 static constexpr int kFastFailThreshold = 3;
 static constexpr int64_t kIpFastMaxAgeMs = 60LL * 60 * 1000;
@@ -114,6 +118,14 @@ RTC_DATA_ATTR static struct RtcWifiCache {
 static constexpr uint32_t kRtcWifiCacheMagic = 0x52465731;  // "RFW1"
 
 static void SaveWifiCacheToRtc(const std::string& ssid, const uint8_t bssid[6], uint8_t channel) {
+    // A 1970 wall clock would poison the cache stamp and confuse the
+    // next wake's SeedFastCacheFromRtc. The Rust time-gate policy is
+    // the single owner of the "is time believable?" decision (the
+    // PCF8563 fallback is irrelevant here — a stale cache needs a
+    // monotonic wall clock).
+    if (rf_time_gate_wifi_cache_ok() == 0) {
+        return;
+    }
     memset(&g_rtc_wifi_cache, 0, sizeof(g_rtc_wifi_cache));
     wifi_policy_encode_rtc_cache(reinterpret_cast<const uint8_t*>(ssid.data()),
                                  static_cast<uint32_t>(ssid.size()), bssid, channel,
