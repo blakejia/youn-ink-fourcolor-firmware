@@ -18,6 +18,7 @@
 
 pub mod charge_policy;
 pub mod led_policy;
+pub mod time_gate_policy;
 pub mod wifi_policy;
 pub mod device_signature;
 pub mod input;

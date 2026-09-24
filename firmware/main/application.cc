@@ -15,6 +15,7 @@
 #include <esp_log.h>
 #include <esp_sleep.h>
 #include <esp_sntp.h>
+
 #include <esp_timer.h>
 #include <esp_wifi.h>
 #include <atomic>
@@ -29,8 +30,9 @@
 #include "notify.h"
 #include "input.h"
 #include "lifecycle.h"
-#include "power.h"
 #include "shim_power.h"
+#include "power.h"
+#include "rust/include/time_gate_policy.h"
 #include <nvs.h>
 
 #include <sys/time.h>
@@ -47,9 +49,42 @@ extern "C" uint32_t ZectrixAwakeWatchdogFired();
 // RTC slow-memory retains this stamp across deep-sleep wakes; it is cleared
 // only by a cold reset/power loss. SNTP's success callback updates it.
 RTC_DATA_ATTR static std::atomic<uint32_t> s_last_sntp_sync_epoch{0};
+
+// The Rust time-gate policy is the single owner of which RTC writes are
+// allowed; C++ only owns the storage and the underlying clock reads. The
+// hard-coded `1577836800` sentinel lives behind RF_TIME_GATE_NEVER in the
+// Rust ABI; using the macro here keeps the two in lockstep and avoids
+// relying on `application.cc` knowing the exact 2020-01-01 epoch.
+constexpr uint32_t kMinPlausibleEpoch = RF_TIME_GATE_NEVER;
+
+static uint32_t RfReadNow(void) {
+    return (uint32_t)time(nullptr);
+}
+
+static bool RfClockNowValid(uint32_t now) {
+    return now >= kMinPlausibleEpoch;
+}
+
 extern "C" void rf_sntp_mark_synced(void) {
-    const uint32_t now = (uint32_t)time(nullptr);
-    if (now >= 1577836800) {
+    const uint32_t now = RfReadNow();
+    if (!RfClockNowValid(now)) {
+        return;  // refuse to record an implausible sync (matches Rust gate)
+    }
+    rf_time_gate_policy_inputs_t in{};
+    rf_time_gate_policy_output_t out{};
+    in.now_s = now;
+    in.last_sntp_sync_s = s_last_sntp_sync_epoch.load(std::memory_order_acquire);
+    // Other inputs are irrelevant for the mark-synced path; the Rust fn
+    // only consults `now` and `last_sntp_sync_s` for the validity check,
+    // but we populate the struct so the ABI sees the full snapshot.
+    in.last_battery_arm_s = RF_TIME_GATE_NEVER;
+    in.sntp_min_period_s = 24u * 60u * 60u;
+    in.battery_min_period_s = 60u * 60u;
+    in.clock_valid_mask = RF_TIME_GATE_CLOCK_NOW_VALID |
+                          RF_TIME_GATE_CLOCK_RTC_VALID |
+                          RF_TIME_GATE_CLOCK_EVER_SYNCED;
+    rf_time_gate_policy_decide(&in, &out);
+    if (out.sntp_mark_synced_ok) {
         s_last_sntp_sync_epoch.store(now, std::memory_order_release);
     }
 }
@@ -194,14 +229,26 @@ void SeedSystemClockFromRtc() {
 }
 
 bool ShouldStartSntpNow() {
-    const time_t now = time(nullptr);
-    if (now < 1577836800) return true;  // no usable RTC seed: SNTP is required
-    const uint32_t last = s_last_sntp_sync_epoch.load(std::memory_order_acquire);
-    if (last < 1577836800) return true;  // first sync since cold boot
-    if (now <= (time_t)last) return true;  // RTC moved backwards: repair it
-    // RTC slow-memory stamp survives deep sleep; refresh only once per day.
-    // At ~30 ppm, PCF8563 drift stays below about 3 seconds per day.
-    return (uint32_t)(now - (time_t)last) >= 24u * 60u * 60u;
+    // Delegate the daily-gate decision to the Rust time-gate policy. C++
+    // still owns the RTC_DATA_ATTR stamp; Rust owns the action mapping.
+    const uint32_t now = RfReadNow();
+    if (!RfClockNowValid(now)) {
+        // Mirror the first branch of the Rust gate: an implausible wall
+        // clock demands SNTP immediately to repair it.
+        return true;
+    }
+    rf_time_gate_policy_inputs_t in{};
+    in.now_s = now;
+    in.last_sntp_sync_s = s_last_sntp_sync_epoch.load(std::memory_order_acquire);
+    in.last_battery_arm_s = RF_TIME_GATE_NEVER;
+    in.sntp_min_period_s = 24u * 60u * 60u;
+    in.battery_min_period_s = 60u * 60u;
+    in.clock_valid_mask = RF_TIME_GATE_CLOCK_NOW_VALID |
+                          RF_TIME_GATE_CLOCK_RTC_VALID |
+                          RF_TIME_GATE_CLOCK_EVER_SYNCED;
+    rf_time_gate_policy_output_t out{};
+    rf_time_gate_policy_decide(&in, &out);
+    return out.sntp_start_action != RF_TIME_GATE_SNTP_ACTION_SKIP;
 }
 
 std::atomic<bool> s_pairing_started{false};
