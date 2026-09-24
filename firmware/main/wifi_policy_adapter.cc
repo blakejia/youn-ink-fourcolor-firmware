@@ -73,6 +73,7 @@ static bool PolicyCallback(
     output->retry_delay_ms = rust_output.retry_delay_ms;
     output->clear_wifi_cache = rust_output.clear_wifi_cache != 0;
     output->clear_ip_cache = rust_output.clear_ip_cache != 0;
+    output->retain_ip = rust_output.retain_ip != 0;
     return true;
 }
 

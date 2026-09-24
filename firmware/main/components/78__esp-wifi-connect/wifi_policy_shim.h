@@ -76,7 +76,8 @@ typedef struct wifi_policy_action_v1 {
     /* Cache directives */
     uint32_t clear_wifi_cache  : 1;
     uint32_t clear_ip_cache    : 1;
-    uint32_t : 30;  /* padding — do not rely on other bits */
+    uint32_t retain_ip         : 1;
+    uint32_t : 29;  /* padding — do not rely on other bits */
 } wifi_policy_action_v1_t;
 
 /* ── Callback type ─────────────────────────────────────────────────────────

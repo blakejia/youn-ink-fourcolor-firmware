@@ -1142,22 +1142,29 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
             this_->on_disconnected_();
         }
         
-        if (this_->reconnect_count_ < MAX_RECONNECT_COUNT) {
-            esp_wifi_connect();
-            this_->reconnect_count_++;
-            ESP_LOGI(TAG, "Reconnecting %s (attempt %d / %d)", this_->ssid_.c_str(), this_->reconnect_count_, MAX_RECONNECT_COUNT);
+        wifi_policy_input_v1_t reconnect{};
+        reconnect.version = WIFI_POLICY_SHIM_VERSION;
+        reconnect.invoke_count = wifi_policy_invoke_count();
+        reconnect.reconnect_count = this_->reconnect_count_;
+        reconnect.fast_fail_count = this_->fast_fail_count_;
+        reconnect.fast_enabled = kFastRcEnable ? 1 : 0;
+        wifi_policy_action_v1_t reconnect_action{};
+        if (wifi_policy_invoke_from_component(&reconnect, &reconnect_action) && reconnect_action.action_kind != 0) {
+            if (reconnect_action.clear_wifi_cache) {
+                WifiManager::GetInstance().ClearFastReconnectCache("policy_stop");
+            }
+            if (reconnect_action.action_kind == 13) {
+                esp_wifi_connect();
+                this_->reconnect_count_++;
+            }
+            if (reconnect_action.action_kind == 14 && !this_->connect_queue_.empty()) {
+                this_->StartConnect();
+            } else {
+                esp_timer_start_once(this_->timer_handle_, this_->scan_current_interval_microseconds_);
+                this_->UpdateScanInterval();
+            }
             return;
         }
-
-        if (!this_->connect_queue_.empty()) {
-            this_->StartConnect();
-            return;
-        }
-        
-        ESP_LOGI(TAG, "No more AP to connect, next scan in %d seconds", 
-                 this_->scan_current_interval_microseconds_ / 1000 / 1000);
-        esp_timer_start_once(this_->timer_handle_, this_->scan_current_interval_microseconds_);
-        this_->UpdateScanInterval();
     } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
         int64_t t_ms = esp_timer_get_time() / 1000;
         ESP_LOGI(FAST_RC_TAG, "stage=wifi event=sta_connected path=slow t_ms=%lld",
@@ -1387,63 +1394,53 @@ bool WifiStation::RunIpFast() {
         return false;
     }
 
+    std::string host;
+    int port = 0;
+    std::string probe_source;
+    bool have_endpoint = ResolveProbeEndpoint(probe_target_, &host, &port, &probe_source);
+    if (!have_endpoint || host.empty()) {
+        wifi_policy_input_v1_t missing{};
+        missing.version = WIFI_POLICY_SHIM_VERSION;
+        missing.invoke_count = wifi_policy_invoke_count();
+        missing.ip_fast_active = ip_fast_attempt_ ? 1 : 0;
+        missing.endpoint_present = 0;
+        missing.have_ip_cache = 1;
+        missing.probe_target = static_cast<uint8_t>(probe_target_);
+        wifi_policy_action_v1_t action{};
+        if (wifi_policy_invoke_from_component(&missing, &action) && action.action_kind == 20 && action.retain_ip) {
+            IpFastDeferRetainCache("endpoint_missing");
+        } else {
+            IpFastFallback("endpoint_missing");
+        }
+        return false;
+    }
+
     int64_t now_ms = esp_timer_get_time() / 1000;
     if (now_ms - ip_fast_cached_ms_ > kIpFastMaxAgeMs) {
         IpFastFallback("ip_stale");
         return false;
     }
-
-    struct netif* lwip_netif = reinterpret_cast<struct netif*>(
-        esp_netif_get_netif_impl(station_netif_));
+    struct netif* lwip_netif = reinterpret_cast<struct netif*>(esp_netif_get_netif_impl(station_netif_));
     if (lwip_netif == nullptr) {
         IpFastFallback("netif_null");
         return false;
     }
-
-    ip4_addr_t probe_ip{};
-    probe_ip.addr = ip_fast_info_.ip.addr;
-    ip4_addr_t gw_ip{};
-    gw_ip.addr = ip_fast_info_.gw.addr;
+    ip4_addr_t probe_ip{}; probe_ip.addr = ip_fast_info_.ip.addr;
+    ip4_addr_t gw_ip{}; gw_ip.addr = ip_fast_info_.gw.addr;
     bool conflict = false;
     if (now_ms + kIpFastArpBudgetMs <= deadline_ms) {
         bool ok = ArpProbeConflict(lwip_netif, probe_ip, kIpFastArpBudgetMs, &conflict);
-        int64_t t_ms = esp_timer_get_time() / 1000;
-        ESP_LOGI(FAST_RC_TAG, "stage=ip step=arp result=%s t_ms=%lld conflict=%d",
-                 ok ? "ok" : "fail", static_cast<long long>(t_ms), conflict ? 1 : 0);
-        if (!ok || conflict) {
-            IpFastFallback("arp_conflict");
-            return false;
-        }
-    } else {
-        IpFastFallback("budget_exhausted_arp");
-        return false;
-    }
-
+        if (!ok || conflict) { IpFastFallback("arp_conflict"); return false; }
+    } else { IpFastFallback("budget_exhausted_arp"); return false; }
     now_ms = esp_timer_get_time() / 1000;
     if (now_ms + kIpFastGwBudgetMs <= deadline_ms) {
-        bool ok = ArpCheckReachable(lwip_netif, gw_ip, kIpFastGwBudgetMs);
-        int64_t t_ms = esp_timer_get_time() / 1000;
-        ESP_LOGI(FAST_RC_TAG, "stage=ip step=gw result=%s t_ms=%lld",
-                 ok ? "ok" : "fail", static_cast<long long>(t_ms));
-        if (!ok) {
-            IpFastFallback("gw_unreachable");
-            return false;
-        }
-    } else {
-        IpFastFallback("budget_exhausted_gw");
-        return false;
-    }
+        if (!ArpCheckReachable(lwip_netif, gw_ip, kIpFastGwBudgetMs)) { IpFastFallback("gw_unreachable"); return false; }
+    } else { IpFastFallback("budget_exhausted_gw"); return false; }
 
-    std::string host;
-    int port = 0;
-    std::string probe_source;
-    bool have_endpoint = ResolveProbeEndpoint(probe_target_, &host, &port, &probe_source);
     ESP_LOGI(FAST_RC_TAG,
-             "stage=ip event=probe_target target=%s source=%s host=%s port=%d t_ms=%lld valid=%d",
-             ProbeTargetToString(probe_target_), probe_source.c_str(),
-             host.empty() ? "-" : host.c_str(), port,
-             static_cast<long long>(esp_timer_get_time() / 1000),
-             have_endpoint ? 1 : 0);
+             "stage=ip event=probe_target target=%s source=%s host=%s port=%d t_ms=%lld valid=1",
+             ProbeTargetToString(probe_target_), probe_source.c_str(), host.c_str(), port,
+             static_cast<long long>(esp_timer_get_time() / 1000));
     ip_addr_t server_addr{};
     bool resolved = false;
     bool host_is_ip = false;
