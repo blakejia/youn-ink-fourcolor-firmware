@@ -60,6 +60,12 @@ public:
     void ClearIpFastCache(const char* reason);
     void SetFastProbeTarget(NetworkProbeTarget probe_target);
 
+    /// True while modem sleep is suppressed because this access point keeps
+    /// dropping the link with BEACON_TIMEOUT (it cannot hold a sleep
+    /// schedule). The decision itself lives in `wifi_policy.rs`; this only
+    /// reports it so callers can pick a power-save level.
+    bool ModemSleepSuppressed() const { return modem_sleep_suppressed_; }
+
     void OnConnect(std::function<void(const std::string& ssid)> on_connect);
     void OnConnected(std::function<void(const std::string& ssid)> on_connected);
     void OnDisconnected(std::function<void()> on_disconnected);
@@ -88,7 +94,12 @@ private:
     esp_netif_ip_info_t ip_fast_info_{};
     esp_ip4_addr_t ip_fast_dns_{};
     int64_t ip_fast_cached_ms_ = 0;
-    NetworkProbeTarget probe_target_ = NetworkProbeTarget::Mqtt;
+    // The only endpoint this product configures is the server base URL
+    // (namespace "server", key "base_url"), which the HttpOta resolver reads;
+    // the MQTT/WebSocket sources are empty in every build here, so defaulting
+    // to Mqtt made ResolveProbeEndpoint() fail forever and silently disabled
+    // the whole IP fast path.
+    NetworkProbeTarget probe_target_ = NetworkProbeTarget::HttpOta;
     
     // Exponential backoff for scan interval
     int scan_min_interval_microseconds_ = 10 * 1000 * 1000;   // Default 10 seconds
@@ -100,6 +111,21 @@ private:
     std::function<void()> on_scan_begin_;
     std::vector<WifiApRecord> connect_queue_;
     bool was_connected_ = false;  // Track if we were connected before disconnection
+
+    // Consecutive BEACON_TIMEOUT disconnects on the current association.
+    // Per-connection state (not persisted): a new AP gets a fresh chance.
+    // Both the streak and the resulting suppression are decided by
+    // `wifi_policy.rs`; this only caches the answer for the PS callers.
+    uint32_t beacon_timeout_streak_ = 0;
+    bool modem_sleep_suppressed_ = false;
+    // Clears the streak when the disconnect came from a different AP than the
+    // one currently being tracked (roaming between APs of one SSID must not
+    // accumulate one AP's faults against another).
+    uint8_t beacon_timeout_bssid_[6] = {0};
+    // When the current association came up, so the disconnect handler can tell
+    // a short-lived (faulty) connection from a healthy long one. Set on
+    // got_ip, read once per disconnect.
+    int64_t connected_since_ms_ = 0;
 
     void HandleScanResult();
     void StartConnect();

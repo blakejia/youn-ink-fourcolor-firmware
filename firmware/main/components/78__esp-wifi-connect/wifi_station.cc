@@ -52,6 +52,14 @@ static const char kMqttNs[] = "mqtt";
 static const char kMqttEndpointKey[] = "endpoint";
 static const char kWebsocketNs[] = "websocket";
 static const char kWebsocketUrlKey[] = "url";
+// The probe endpoint the IP fast path validates before trusting a cached
+// lease. The only endpoint this product actually configures is the server
+// base URL the provisioning page writes (namespace "server", key
+// "base_url") — it is also the host the device really talks to every cycle,
+// so probing it is the honest reachability test. The legacy wifi/ota_url
+// fallback stays for builds that bake CONFIG_OTA_URL in.
+static const char kServerNs[] = "server";
+static const char kServerBaseUrlKey[] = "base_url";
 static const char kWifiNs[] = "wifi";
 static const char kWifiOtaUrlKey[] = "ota_url";
 
@@ -348,7 +356,25 @@ static bool LoadHttpOtaUrl(std::string* url, std::string* source) {
     if (url == nullptr || source == nullptr) {
         return false;
     }
+    // Preferred: the server base URL the provisioning page wrote — the same
+    // host the device talks to every cycle, so reachability of it is exactly
+    // what the fast path needs to validate. A trailing slash is stripped so
+    // the authority parser sees a plain host:port.
     nvs_handle_t nvs;
+    if (nvs_open(kServerNs, NVS_READONLY, &nvs) == ESP_OK) {
+        std::string value;
+        bool ok = ReadNvsString(nvs, kServerBaseUrlKey, &value);
+        nvs_close(nvs);
+        while (!value.empty() && value.back() == '/') {
+            value.pop_back();
+        }
+        if (ok && !value.empty()) {
+            *url = value;
+            *source = "server.base_url";
+            return true;
+        }
+    }
+    // Legacy: a build that bakes the OTA URL into the wifi namespace.
     if (nvs_open(kWifiNs, NVS_READONLY, &nvs) == ESP_OK) {
         std::string value;
         bool ok = ReadNvsString(nvs, kWifiOtaUrlKey, &value);
@@ -961,6 +987,15 @@ void WifiStation::SetScanIntervalRange(int min_interval_seconds, int max_interva
 }
 
 void WifiStation::SetPowerSaveLevel(WifiPowerSaveLevel level) {
+    // AP health override (wifi_policy.rs): an access point that keeps
+    // dropping us with BEACON_TIMEOUT cannot hold the deeper sleep schedule,
+    // so seek the requested level but never go below BALANCED. Applies to
+    // LOW_POWER only — PERFORMANCE already means "no savings" and must not
+    // be silently weakened.
+    if (modem_sleep_suppressed_ && level == WifiPowerSaveLevel::LOW_POWER) {
+        ESP_LOGW(TAG, "AP cannot hold modem sleep; using BALANCED instead of LOW_POWER");
+        level = WifiPowerSaveLevel::BALANCED;
+    }
     wifi_ps_type_t ps_type;
     switch (level) {
         case WifiPowerSaveLevel::LOW_POWER:
@@ -1132,6 +1167,34 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
                  this_->ssid_.c_str());
         this_->ip_fast_ready_ = false;
         this_->ip_fast_attempt_ = false;
+        // AP health (wifi_policy.rs): count consecutive BEACON_TIMEOUT
+        // disconnects for THIS bssid. An AP that omits the TIM IE cannot
+        // sustain modem sleep — observed here as ~112 s of bcn_timeout then
+        // reason=200 — so once the policy says so, trade battery for a link
+        // that stays up. `connected_ms` keeps the count honest in both
+        // directions: a connection that died in seconds extends the run, one
+        // that held for a minute starts a fresh one (so the suppression can
+        // also clear). Roaming to a different BSSID restarts the count — one
+        // AP's faults must not condemn the next.
+        if (disc != nullptr) {
+            if (memcmp(this_->beacon_timeout_bssid_, disc->bssid, 6) != 0) {
+                this_->beacon_timeout_streak_ = 0;
+                memcpy(this_->beacon_timeout_bssid_, disc->bssid, 6);
+            }
+        }
+        const int64_t connected_ms =
+            this_->connected_since_ms_ > 0 ? (t_ms - this_->connected_since_ms_) : 0;
+        this_->beacon_timeout_streak_ = rf_wifi_beacon_timeout_streak(
+            this_->beacon_timeout_streak_, reason, (uint64_t)connected_ms);
+        this_->modem_sleep_suppressed_ =
+            rf_wifi_suppress_modem_sleep(this_->beacon_timeout_streak_, reason) != 0;
+        if (this_->modem_sleep_suppressed_) {
+            ESP_LOGW(FAST_RC_TAG,
+                     "stage=wifi event=ap_unhealthy streak=%u reason=%d "
+                     "connected_ms=%lld action=suppress_modem_sleep",
+                     (unsigned)this_->beacon_timeout_streak_, reason,
+                     static_cast<long long>(connected_ms));
+        }
         xEventGroupClearBits(this_->event_group_, WIFI_EVENT_CONNECTED);
         if (this_->fast_attempt_) {
             this_->HandleFastFallback("sta_disconnected", reason);
@@ -1295,6 +1358,13 @@ void WifiStation::IpEventHandler(void* arg, esp_event_base_t event_base, int32_t
     }
     this_->connect_queue_.clear();
     this_->reconnect_count_ = 0;
+    // Record when this association came up. The disconnect handler feeds the
+    // resulting lifetime to the policy, which is what distinguishes a faulty
+    // AP (dies in seconds, run continues) from a healthy one (held for a
+    // minute, run restarts). The streak deliberately survives a reconnect:
+    // resetting it here would make the suppression unreachable, since every
+    // timeout is followed by one.
+    this_->connected_since_ms_ = esp_timer_get_time() / 1000;
     
     // Reset scan interval to minimum for fast reconnect if disconnected later
     this_->scan_current_interval_microseconds_ = this_->scan_min_interval_microseconds_;
@@ -1390,11 +1460,17 @@ void WifiStation::IpFastDeferRetainCache(const char* reason) {
     // 3b: retain the IP fast cache (g_fast_cache.have_ip + ip_fast_cached_ms_)
     // and the association cache/RTC mirror — clear neither. Stop only this
     // attempt's flags so the next STA connect/fast-attempt can probe again.
+    //
+    // Deliberately does NOT restart the DHCP client, unlike IpFastFallback:
+    // the cache-hit path already ran esp_netif_dhcpc_stop() and installed the
+    // cached lease statically (STA_CONNECTED handler), so starting DHCP here
+    // would make the netif re-acquire an address mid-frame and deliver a
+    // SECOND got_ip for a link that never changed — a duplicate "Got IP /
+    // WiFi connected / statusbar update / Stay awake" round. Nothing needs
+    // the fresh lease: with the endpoint still absent there is no probe to
+    // run, and the next real connect re-evaluates and falls back normally.
     ip_fast_attempt_ = false;
     ip_fast_ready_ = false;
-    if (station_netif_ != nullptr) {
-        esp_netif_dhcpc_start(station_netif_);
-    }
 }
 
 bool WifiStation::RunIpFast() {

@@ -163,6 +163,21 @@ bool wifi_policy_parse_endpoint(const char* input, uint8_t* host_buf,
 bool wifi_policy_parse_url_authority(const char* input, uint8_t* host_buf,
                                      uint32_t host_buf_len, uint16_t* port);
 
+/* ── Access-point health (Rust: wifi_policy.rs) ─────────────────────────── */
+
+/* WIFI_REASON_BEACON_TIMEOUT from esp_wifi_types_generic.h. */
+#define WIFI_POLICY_REASON_BEACON_TIMEOUT 200
+
+/* Advance the BEACON_TIMEOUT streak for the disconnect just observed.
+ * `connected_ms` is how long the ended connection lasted; any reason other
+ * than BEACON_TIMEOUT clears the streak. */
+uint32_t rf_wifi_beacon_timeout_streak(uint32_t streak, int32_t reason,
+                                       uint64_t connected_ms);
+
+/* Whether modem sleep must be off for this association (repeated
+ * BEACON_TIMEOUT disconnects only). */
+uint8_t rf_wifi_suppress_modem_sleep(uint32_t streak, int32_t reason);
+
 #ifdef __cplusplus
 }
 #endif

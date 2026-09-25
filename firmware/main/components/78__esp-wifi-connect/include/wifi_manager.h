@@ -127,7 +127,9 @@ private:
     bool initialized_ = false;
     bool station_active_ = false;
     bool config_mode_active_ = false;
-    NetworkProbeTarget probe_target_ = NetworkProbeTarget::Mqtt;
+    // Mirrors WifiStation's default: the server base_url is the only probe
+    // endpoint this product configures (see wifi_station.h).
+    NetworkProbeTarget probe_target_ = NetworkProbeTarget::HttpOta;
     mutable std::string mac_address_;
     std::function<void(WifiEvent)> event_callback_;
     std::function<void(const std::string&, int)> provisioning_state_callback_;

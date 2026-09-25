@@ -287,6 +287,57 @@ pub const IP_FAST_MAX_AGE_MS: i64 = 3_600_000;
 /// Fast connect failure count threshold — above this, fast connect is skipped.
 pub const FAST_FAIL_THRESHOLD: i32 = 3;
 
+// ─── Access-point health (modem-sleep suppression) ──────────────────────────
+
+/// `WIFI_REASON_BEACON_TIMEOUT` from `esp_wifi_types_generic.h`.
+pub const BEACON_TIMEOUT_REASON: i32 = 200;
+
+/// Consecutive BEACON_TIMEOUT disconnects that mean "this AP cannot hold a
+/// modem-sleep schedule" rather than transient bad luck.
+///
+/// An AP that omits the TIM IE (the driver warns "does not follow Wi-Fi
+/// protocol") leaves the station unable to know when its buffered frames
+/// arrive, so the sleep schedule burns the beacon window until the link dies.
+/// Observed on `yi02`: beacons every 102.4 ms, repeated `bcn_timeout` for
+/// ~112 s, then reason=200.
+///
+/// Three, not one: a single timeout happens on roaming and busy channels.
+pub const MODEM_SLEEP_SUPPRESS_AFTER: u32 = 3;
+
+/// A link that stayed up at least this long counts as healthy: its eventual
+/// BEACON_TIMEOUT starts a fresh run instead of extending the previous one.
+///
+/// Without this the suppression could never engage (every timeout is followed
+/// by a reconnect, and a reconnect would reset the run), and without the reset
+/// it could never clear. The threshold separates "this AP drops us every few
+/// seconds" from "this AP held for minutes and then hiccupped".
+pub const HEALTHY_CONNECTION_MS: u64 = 60_000;
+
+/// Advance the BEACON_TIMEOUT streak for the disconnect just observed.
+///
+/// `connected_ms` is how long the just-ended connection lasted. A run that
+/// survived `HEALTHY_CONNECTION_MS` is healthy, so its termination starts a
+/// new count; a short-lived one continues the run. Any reason other than
+/// BEACON_TIMEOUT clears the streak. Saturated at the threshold: the value
+/// only gates a boolean, and an unbounded counter would eventually wrap.
+pub fn next_beacon_timeout_streak(streak: u32, reason: i32, connected_ms: u64) -> u32 {
+    if reason != BEACON_TIMEOUT_REASON {
+        return 0;
+    }
+    let base = if connected_ms >= HEALTHY_CONNECTION_MS { 0 } else { streak };
+    (base + 1).min(MODEM_SLEEP_SUPPRESS_AFTER)
+}
+
+/// Whether modem sleep must be turned off for the current association.
+///
+/// True only when the link has repeatedly failed with BEACON_TIMEOUT: the
+/// access point cannot support a sleep schedule, so trading battery for a
+/// stable link is the right side of the trade. Always false for every other
+/// disconnect reason.
+pub fn should_suppress_modem_sleep(streak: u32, reason: i32) -> bool {
+    reason == BEACON_TIMEOUT_REASON && streak >= MODEM_SLEEP_SUPPRESS_AFTER
+}
+
 /// Policy action kinds returned by `decide()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -566,8 +617,21 @@ impl Default for COutput {
     }
 }
 
-/// Call the Wi-Fi policy decision.
+/// Decode the C++ `NetworkProbeTarget` code into the Rust enum.
 ///
+/// Order is the C++ producer's, from `network_probe_target.h`:
+/// `HttpOta = 0, WebSocket = 1, Mqtt = 2`. An unknown code cannot be mapped
+/// meaningfully, so it falls back to `HttpOta` — the source this product
+/// actually configures, which keeps an unhandled future code from probing a
+/// service that has no endpoint at all.
+fn c_abi_probe_target(code: u8) -> ProbeTarget {
+    match code {
+        1 => ProbeTarget::WebSocket,
+        2 => ProbeTarget::Mqtt,
+        _ => ProbeTarget::HttpOta,
+    }
+}
+
 /// # Safety
 /// `inp` and `out` must point to valid, correctly aligned structs.
 #[unsafe(no_mangle)]
@@ -597,11 +661,7 @@ pub unsafe extern "C" fn rf_wifi_policy_decide(
         fast_fail_count: i.fast_fail_count as i32,
         fast_enabled: i.fast_enabled != 0,
         endpoint_present: i.endpoint_present != 0,
-        probe_target: match i.probe_target {
-            0 => ProbeTarget::Mqtt,
-            1 => ProbeTarget::WebSocket,
-            _ => ProbeTarget::HttpOta,
-        },
+        probe_target: c_abi_probe_target(i.probe_target),
         host_is_ip_literal: i.host_is_ip_literal != 0,
     };
 
@@ -719,6 +779,28 @@ pub unsafe extern "C" fn rf_wifi_parse_url_authority(
         }
         Err(()) => 0,
     }
+}
+
+/// Advance the BEACON_TIMEOUT streak. C++ keeps the streak in RAM (it is
+/// per-association, not per-boot), feeds the reason code of the disconnect it
+/// just observed, and how long that connection lasted (`connected_ms`).
+///
+/// # Safety
+/// This scalar-only FFI has no pointer preconditions.
+#[unsafe(no_mangle)]
+pub extern "C" fn rf_wifi_beacon_timeout_streak(
+    streak: u32,
+    reason: i32,
+    connected_ms: u64,
+) -> u32 {
+    next_beacon_timeout_streak(streak, reason, connected_ms)
+}
+
+/// # Safety
+/// This scalar-only FFI has no pointer preconditions.
+#[unsafe(no_mangle)]
+pub extern "C" fn rf_wifi_suppress_modem_sleep(streak: u32, reason: i32) -> u8 {
+    should_suppress_modem_sleep(streak, reason) as u8
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1382,6 +1464,7 @@ mod tests {
 
         assert_eq!(cout.action_kind, ActionKind::DeferProbe as u8);
         assert_eq!(cout.clear_ip_cache, 1, "stale cache with endpoint present clears IP");
+
         assert_eq!(cout.retain_ip, 0);
     }
 
@@ -1389,6 +1472,18 @@ mod tests {
     fn c_abi_null_ptr_handled() {
         unsafe { rf_wifi_policy_decide(core::ptr::null(), core::ptr::null_mut()); }
         // Must not panic
+    }
+
+    #[test]
+    fn c_abi_probe_target_codes_match_the_cpp_enum() {
+        // `network_probe_target.h` declares HttpOta=0, WebSocket=1, Mqtt=2.
+        // The decoder must agree, or C++'s chosen target silently arrives as
+        // a different service and ResolveProbeEndpoint picks the wrong source.
+        assert_eq!(c_abi_probe_target(0), ProbeTarget::HttpOta);
+        assert_eq!(c_abi_probe_target(1), ProbeTarget::WebSocket);
+        assert_eq!(c_abi_probe_target(2), ProbeTarget::Mqtt);
+        // Unknown codes must not silently alias a real target.
+        assert_eq!(c_abi_probe_target(3), ProbeTarget::HttpOta);
     }
 
     // ── Sentinel mutation proof (Task 4b) ────────────────────────────────────
@@ -1403,4 +1498,71 @@ mod tests {
     // 4. Restore the implementation (defer_retain_ip) and rerun → green.
     // This proves the sentinel correctly detects a regression to clearing
     // the IP cache on endpoint_missing.
+
+    #[test]
+    fn modem_sleep_suppressed_only_after_repeated_beacon_timeouts() {
+        // One timeout is noise (roaming, a busy channel). The third in a row
+        // is a pattern, and on an AP that omits the TIM IE the driver cannot
+        // keep the modem-sleep schedule — it burns the beacon window and then
+        // disconnects. Suppress modem sleep only for that repeated case.
+        assert!(!should_suppress_modem_sleep(0, BEACON_TIMEOUT_REASON));
+        assert!(!should_suppress_modem_sleep(1, BEACON_TIMEOUT_REASON));
+        assert!(!should_suppress_modem_sleep(2, BEACON_TIMEOUT_REASON));
+        assert!(should_suppress_modem_sleep(3, BEACON_TIMEOUT_REASON));
+        assert!(should_suppress_modem_sleep(9, BEACON_TIMEOUT_REASON));
+    }
+
+    #[test]
+    fn modem_sleep_suppression_ignores_other_disconnect_reasons() {
+        // AUTH_FAIL / NO_AP_FOUND are unrelated to the sleep schedule:
+        // disabling modem sleep would cost battery and buy nothing.
+        assert!(!should_suppress_modem_sleep(9, 202));  // AUTH_FAIL
+        assert!(!should_suppress_modem_sleep(9, 201));  // NO_AP_FOUND
+        assert!(!should_suppress_modem_sleep(9, -1));   // unknown
+    }
+
+    #[test]
+    fn beacon_timeout_accumulates_across_short_lived_connections() {
+        // The real failure shape: the link comes up, survives a few seconds,
+        // dies with BEACON_TIMEOUT, reconnects, dies again. Resetting on every
+        // reconnect would make the streak unreachable, so a connection that
+        // did not survive the healthy threshold counts as a continuous fault.
+        let short = HEALTHY_CONNECTION_MS - 1;
+        let s1 = next_beacon_timeout_streak(0, BEACON_TIMEOUT_REASON, short);
+        let s2 = next_beacon_timeout_streak(s1, BEACON_TIMEOUT_REASON, short);
+        let s3 = next_beacon_timeout_streak(s2, BEACON_TIMEOUT_REASON, short);
+        assert_eq!((s1, s2, s3), (1, 2, 3));
+        assert!(should_suppress_modem_sleep(s3, BEACON_TIMEOUT_REASON));
+    }
+
+    #[test]
+    fn a_long_healthy_connection_clears_the_streak() {
+        // A link that held for a long time is evidence the AP *can* sleep; the
+        // next timeout is a fresh fault, not the fourth of a bad run. This is
+        // the recovery path — without it the suppression latches forever.
+        let s = next_beacon_timeout_streak(3, BEACON_TIMEOUT_REASON, HEALTHY_CONNECTION_MS);
+        assert_eq!(s, 1);
+        assert!(!should_suppress_modem_sleep(s, BEACON_TIMEOUT_REASON));
+    }
+
+    #[test]
+    fn beacon_timeout_streak_ignores_other_disconnect_reasons() {
+        // AUTH_FAIL / NO_AP_FOUND say nothing about the sleep schedule:
+        // disabling modem sleep would cost battery and buy nothing.
+        assert!(!should_suppress_modem_sleep(9, 202));  // AUTH_FAIL
+        assert!(!should_suppress_modem_sleep(9, 201));  // NO_AP_FOUND
+        assert!(!should_suppress_modem_sleep(9, -1));   // unknown
+        assert_eq!(next_beacon_timeout_streak(9, 202, 1000), 0);
+    }
+
+    #[test]
+    fn beacon_timeout_streak_is_bounded() {
+        // No unbounded climb: the value only gates a boolean, and a saturated
+        // word would eventually wrap.
+        let mut s = 0u32;
+        for _ in 0..40 {
+            s = next_beacon_timeout_streak(s, BEACON_TIMEOUT_REASON, 1000);
+        }
+        assert_eq!(s, MODEM_SLEEP_SUPPRESS_AFTER);
+    }
 }
