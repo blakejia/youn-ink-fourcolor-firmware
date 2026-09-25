@@ -32,12 +32,23 @@ def client():
 
 @pytest.fixture(autouse=True)
 def _clean_history():
-    """Isolate the append-only history per test (shared process registry)."""
+    """Isolate the append-only history and the power snapshot per test.
+
+    `registry` is process-wide, so both the history rows and the device's
+    power_counters blob leak between tests unless cleared here. The snapshot
+    matters for the "no battery fields without params" cases: carrying a
+    previous test's reading forward would make them pass or fail for the
+    wrong reason.
+    """
     _register()
     try:
         with registry._lock:
             registry._conn.execute(
                 "DELETE FROM battery_history WHERE device_id = ?", (DEV,)
+            )
+            registry._conn.execute(
+                "UPDATE devices SET power_counters = NULL WHERE device_id = ?",
+                (DEV,),
             )
     except Exception:
         pass  # red phase: table does not exist yet
@@ -121,6 +132,46 @@ def test_snapshot_without_params_has_no_battery_fields(client):
     assert "battery_mv" not in snap
     assert "battery_pct" not in snap
     assert "battery_charge" not in snap
+
+
+def test_snapshot_keeps_last_battery_fields_when_this_get_omits_them(client):
+    """A GET without v/p/c must not wipe the stored battery badge.
+
+    The device sends v/p/c only on its battery-reporting wake (one per hour
+    per the firmware gate), while every schedule GET rewrites the whole
+    power_counters blob. If the rewrite drops battery_*, /api/devices loses
+    the badge until the next reporting wake — which is what makes the
+    devices-page battery cell alternate between clickable and a dash.
+    """
+    _get_schedule(client, "?w=1&a=2&r=3&g=4&f=5&v=3980&p=76&c=4")
+    assert json.loads(registry.get_power_counters(DEV))["battery_pct"] == 76
+
+    # Next poll: same firmware, counters only, no battery keys.
+    _get_schedule(client, "?w=6&a=40&r=41&g=5&f=0")
+
+    snap = json.loads(registry.get_power_counters(DEV))
+    assert snap["battery_mv"] == 3980
+    assert snap["battery_pct"] == 76
+    assert snap["battery_charge"] == 4
+    # The fresh counters still win: we keep battery_*, not the whole blob.
+    assert snap["wakes"] == 6 and snap["awake_ms"] == 40
+
+
+def test_snapshot_drops_battery_fields_when_a_read_is_out_of_range(client):
+    """An out-of-range reading clears the badge instead of freezing it.
+
+    Keeping the last value is only correct while the device is still
+    answering with usable numbers; a bad reading means "this unit can no
+    longer be trusted to report", so the badge must go back to a dash
+    rather than display a stale percentage indefinitely."""
+    _get_schedule(client, "?w=1&a=2&r=3&g=4&f=5&v=3980&p=76&c=4")
+    _get_schedule(client, "?w=6&a=40&r=41&g=5&f=0&v=100&p=76&c=4")
+
+    snap = json.loads(registry.get_power_counters(DEV))
+    assert "battery_mv" not in snap
+    assert "battery_pct" not in snap
+    assert "battery_charge" not in snap
+
 
 
 # ── power-history endpoint ──────────────────────────────────────────────

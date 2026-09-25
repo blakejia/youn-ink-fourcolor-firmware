@@ -626,27 +626,32 @@ def create_app() -> FastAPI:
         # (e.g. 15=BROWNOUT, 8=RTCWDT). Old firmware omits it: keep the last
         # stored reason instead of clobbering it with "unknown" — the reason is
         # boot-scoped, not poll-scoped, so absent means "unchanged since boot".
+        # Read the stored snapshot once: the `battery_*` carry-forward below
+        # needs the same previous blob.
+        try:
+            prev = json.loads(registry.get_power_counters(dev.device_id) or "{}")
+        except (ValueError, TypeError):
+            prev = {}
+        if not isinstance(prev, dict):
+            prev = {}
         rr = qp.get("rr")
         if rr is not None:
             try:
                 power["reset_reason"] = max(0, int(rr))
             except (TypeError, ValueError):
                 pass
-        else:
-            try:
-                prev = json.loads(registry.get_power_counters(dev.device_id) or "{}")
-                if "reset_reason" in prev:
-                    power["reset_reason"] = prev["reset_reason"]
-            except (ValueError, TypeError):
-                pass
-        try:
-            registry.set_power_counters(dev.device_id, json.dumps(power))
-        except Exception:
-            log.warning("set_power_counters failed device=%s", dev.device_id)
+        elif "reset_reason" in prev:
+            power["reset_reason"] = prev["reset_reason"]
         # Battery telemetry (spec 2026-09-22): all three keys present and
         # in-range → one history row carrying this GET's counter snapshot.
-        # Anything less = old firmware or bad reading: no row, no snapshot
-        # fields (same absent-means-absent semantics as `rr`).
+        # Missing keys keep the last reading instead of dropping it: the device
+        # reports only on its gated battery wake (about one per hour), while
+        # every schedule GET rewrites this whole blob — so rebuilding from
+        # scratch erased the badge on every counter-only poll, making the
+        # devices-page battery cell alternate between a percentage and a dash.
+        # A partial or out-of-range reading still clears the badge rather than
+        # freezing it: a unit answering with an unusable value should show a
+        # dash, not a stale percentage, and its history row is dropped anyway.
         try:
             v, p, c = int(qp["v"]), int(qp["p"]), int(qp["c"])
         except (KeyError, TypeError, ValueError):
@@ -654,10 +659,14 @@ def create_app() -> FastAPI:
         if v and 2500 <= v <= 5000 and 0 <= p <= 100 and 0 <= c <= 4:
             registry.add_battery_sample(dev.device_id, int(time.time()), v, p, c, power)
             power["battery_mv"], power["battery_pct"], power["battery_charge"] = v, p, c
-            try:
-                registry.set_power_counters(dev.device_id, json.dumps(power))
-            except Exception:
-                log.warning("set_power_counters failed device=%s", dev.device_id)
+        elif "v" not in qp and "p" not in qp and "c" not in qp:
+            for key in ("battery_mv", "battery_pct", "battery_charge"):
+                if key in prev:
+                    power[key] = prev[key]
+        try:
+            registry.set_power_counters(dev.device_id, json.dumps(power))
+        except Exception:
+            log.warning("set_power_counters failed device=%s", dev.device_id)
         entries = pages_mod.build_schedule_from_disk(dev.device_id)
         sched_md = pages_mod.compute_schedule_md(entries)
         current_index, seconds_until_next_page = pages_mod.schedule_position(entries, time.time())
