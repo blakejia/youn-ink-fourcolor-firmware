@@ -78,3 +78,6 @@ server/data/images/
 # 避免把含密钥的 .env 备份提交进仓库
 .env.bak*
 *.env.bak*
+
+# 隔离工作树（SDD 执行用）
+.worktrees/
