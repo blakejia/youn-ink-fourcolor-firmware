@@ -154,33 +154,6 @@ uint8_t rf_wifi_parse_url_authority(
     uint32_t   host_buf_len,
     uint16_t*  port);
 
-/* ── Access-point health (modem-sleep suppression) ──────────────────────── */
-
-/* WIFI_REASON_BEACON_TIMEOUT from esp_wifi_types_generic.h. */
-#define RF_WIFI_REASON_BEACON_TIMEOUT 200
-/* Consecutive BEACON_TIMEOUT disconnects that mean the AP cannot hold a
- * modem-sleep schedule; see wifi_policy.rs for the evidence. */
-#define RF_WIFI_MODEM_SLEEP_SUPPRESS_AFTER 3
-/* A connection that lasted at least this long counts as healthy: its
- * BEACON_TIMEOUT starts a fresh run instead of extending the previous one. */
-#define RF_WIFI_HEALTHY_CONNECTION_MS 60000ULL
-
-/**
- * Advance the BEACON_TIMEOUT streak for the disconnect just observed.
- * `connected_ms` is how long the ended connection lasted; any reason other
- * than BEACON_TIMEOUT clears the streak.
- */
-uint32_t rf_wifi_beacon_timeout_streak(
-    uint32_t streak,
-    int32_t  reason,
-    uint64_t connected_ms);
-
-/**
- * Whether modem sleep must be off for this association: true only after
- * repeated BEACON_TIMEOUT disconnects.
- */
-uint8_t rf_wifi_suppress_modem_sleep(uint32_t streak, int32_t reason);
-
 #ifdef __cplusplus
 }
 #endif
