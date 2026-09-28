@@ -927,7 +927,17 @@ IDF_TARGET=esp32s3 idf.py build
 ```
 Expected: `Project build complete`
 
-- [ ] **Step 5: 用 nm 确认符号真的进了产物**
+- [ ] **Step 5: 用 nm 确认符号进了目标文件（最终 ELF 里是空的，见下）**
+
+**注意：本步在 Task 3 内只验证到目标文件级。** `libmain.a` 用 `-Wl,--gc-sections` 链接，而 Task 3 没有任何调用方，归档成员会被回收 → 最终 ELF 里 `rf_logbuf_*` 计数为 0、`.rtc_noinit` 读作 0 B。这是链接器的正常行为，不是缺陷。证据取目标文件：
+
+```bash
+source ~/data/esp-idf-v6.0/export.sh
+O=$(find firmware/build -name "shim_log.cpp.obj" | head -1)
+xtensa-esp32s3-elf-nm "$O" | grep rf_logbuf     # 期望 4 个 T
+xtensa-esp32s3-elf-size -A "$O" | grep noinit   # 期望 .rtc_noinit.0 ≈ 2068
+```
+
 
 Run:
 ```bash
@@ -936,7 +946,10 @@ xtensa-esp32s3-elf-nm firmware/build/xiaozhi.elf | grep rf_logbuf
 ```
 Expected: 4 个 `T rf_logbuf_*`（`install_hook` / `read` / `ack` / `stats`）
 
-- [ ] **Step 6: 确认 `.rtc_noinit` 真的非空且带 magic**
+- [ ] **Step 6: 最终 ELF 的符号与段大小（本步在 Task 5 之前必为空）
+
+这两项**在 Task 3 内必然为空**，由 Task 5 的接线负责让它们出现；Task 5 Step 8 会重跑同一检查。此处仅记录预期：
+
 
 Run:
 ```bash
