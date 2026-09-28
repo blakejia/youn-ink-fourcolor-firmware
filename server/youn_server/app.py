@@ -55,6 +55,8 @@ from fastapi.responses import Response
 from .canvas_render import RenderError, render_canvas_to_bitmap, render_canvas_to_png
 from . import pairing as pairing_mod
 
+from . import devicelog
+
 from . import notify_store as ns
 
 from . import pages as pages_mod
@@ -533,6 +535,59 @@ def create_app() -> FastAPI:
         items = ns.get_store().recent(device_id=device_id, limit=limit)
         return {"notifications": [asdict(n) for n in items]}
 
+    # ── device log upload (spec 2026-09-28) ──
+    @app.post("/api/device-log", status_code=201)
+    async def device_log(request: Request, body: dict = Body(...)):
+        """Accept one batch of device-side log lines.
+
+        Lines ride base64 because the device's heap-frugal JSON writer has no
+        reason to hand-roll the escaping; the server decodes and hands the raw
+        text to devicelog, which owns the on-disk layout.
+        """
+        dev = _require_device_token(request)
+        try:
+            seq_hi = int(body.get("seq_hi"))
+            dropped = int(body.get("dropped", 0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "seq_hi and dropped must be integers")
+        if dropped < 0:
+            raise HTTPException(400, "dropped must be >= 0")
+        raw = body.get("lines")
+        if not isinstance(raw, str):
+            raise HTTPException(400, "lines must be a string")
+        try:
+            text = base64.b64decode(raw, validate=True)
+        except Exception:
+            raise HTTPException(400, "lines must be valid base64")
+        if len(text) > 4096:
+            raise HTTPException(400, "decoded body too large")
+        stamped = datetime.now(ZoneInfo(settings.canvas_timezone)).isoformat()
+        written = devicelog.append_lines(
+            dev.device_id, stamped, text.decode("utf-8", errors="replace"), dropped)
+        return {"written": written}
+
+    @app.post("/api/devices/{device_id}/log-upload")
+    async def set_device_log_upload(device_id: str, request: Request,
+                                    body: dict = Body(...)):
+        """Operator sets the service-side opinion: 1 force on, 0 force off,
+        null = no opinion (the device's own switch decides)."""
+        _require_operator(request)
+        dev = registry.get(device_id)
+        if dev is None:
+            raise HTTPException(404, "unknown device")
+        raw = body.get("value", None)
+        if raw is not None and raw not in (0, 1):
+            raise HTTPException(400, "value must be 1, 0 or null")
+        registry.set_log_upload(device_id, None if raw is None else int(raw))
+        return {"log_upload": registry.get_log_upload(device_id)}
+
+    @app.get("/api/devices/{device_id}/logs")
+    async def device_logs(device_id: str, request: Request, tail: int = Query(500)):
+        _require_operator(request)
+        n = max(1, min(int(tail), devicelog.MAX_LINES_PER_REQUEST))
+        lines, truncated = devicelog.tail_lines(device_id, n)
+        return {"lines": lines, "truncated": truncated}
+
     # ── Canvas Loop ──
 
     @app.post("/api/pages")
@@ -622,6 +677,11 @@ def create_app() -> FastAPI:
             "epd_refreshes": _u32("er"),
             "epd_busy_ms": _u32("eb"),
         }
+        # `lo` is the device's own switch opinion: 0 = none, 1 = off, 2 = on.
+        # Echoed back so the admin UI can say "the device has it off" instead
+        # of showing an enabled service setting that appears to do nothing.
+        # Absent (old firmware) reads as 0 = no opinion.
+        local_lo = _u32("lo")
         # `rr` is the esp_reset_reason_t enum the device sampled at boot
         # (e.g. 15=BROWNOUT, 8=RTCWDT). Old firmware omits it: keep the last
         # stored reason instead of clobbering it with "unknown" — the reason is
@@ -684,11 +744,13 @@ def create_app() -> FastAPI:
                 "poll_interval_minutes": settings.canvas_poll_interval_minutes,
                 "sleep_poll_interval_minutes": settings.canvas_sleep_poll_interval_minutes,
                 "min_page_duration_minutes": settings.canvas_min_page_duration_minutes,
+                "log_upload": registry.get_log_upload(dev.device_id),
             },
             "pages": [e.to_dict() for e in entries],
             "screen_active": pages_mod.screen_active_now(),
             "notify_pending": ns.get_store().has_pending(dev.device_id),
             "power": power,
+            "local_log_upload": local_lo,
         }
 
     @app.get("/api/pages/bitmap/{md5}.bin")

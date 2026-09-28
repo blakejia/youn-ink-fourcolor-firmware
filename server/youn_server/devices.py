@@ -46,6 +46,7 @@ class Device:
     ws_session_id: Optional[str]
     ip_address: Optional[str]
     trust: bool
+    log_upload: Optional[int] = None
 
     @property
     def trusted(self) -> bool:
@@ -155,6 +156,15 @@ class DeviceRegistry:
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc):
                     raise
+        # Per-device log-upload switch (spec 2026-09-28). NULLABLE on purpose:
+        # NULL = no opinion (the device's own switch decides), 1 = force on,
+        # 0 = force off. A DEFAULT 0 would read as a standing opinion and
+        # silently void the local switch.
+        try:
+            self._conn.execute("ALTER TABLE devices ADD COLUMN log_upload INTEGER")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
 
     # ── write ──
     def upsert(
@@ -260,6 +270,7 @@ class DeviceRegistry:
             ws_session_id=row["ws_session_id"],
             ip_address=row["ip_address"],
             trust=bool(row["trust"]),
+            log_upload=self.get_log_upload(row["device_id"]),
         )
 
     def get_secret(self, device_id: str) -> Optional[str]:
@@ -286,6 +297,7 @@ class DeviceRegistry:
             ws_session_id=row["ws_session_id"],
             ip_address=row["ip_address"],
             trust=bool(row["trust"]),
+            log_upload=self.get_log_upload(row["device_id"]),
         )
 
     def set_token(self, device_id: str, token: str) -> None:
@@ -320,6 +332,36 @@ class DeviceRegistry:
             return row["power_counters"]
         except (IndexError, KeyError):
             return None
+
+    def set_log_upload(self, device_id: str, value: Optional[int]) -> None:
+        """Persist the service-side log-upload opinion.
+
+        ``None`` clears it back to "no opinion" so the device's own switch
+        decides again; ``1``/``0`` force on/off and override the device.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET log_upload = ? WHERE device_id = ?",
+                (value, device_id),
+            )
+
+    def get_log_upload(self, device_id: str) -> Optional[int]:
+        """The service-side opinion: None (no opinion) / 1 / 0.
+
+        Unset, unknown device, or SQL NULL all read as None. A stored 0 is a
+        real opinion and is returned as 0 -- the two must not collapse.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT log_upload FROM devices WHERE device_id = ?", (device_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            raw = row["log_upload"]
+        except (IndexError, KeyError):
+            return None
+        return None if raw is None else int(raw)
 
     def add_battery_sample(self, device_id: str, ts: int, mv: int, pct: int,
                            charge: int, counters: dict) -> None:
@@ -368,6 +410,7 @@ class DeviceRegistry:
                 ws_session_id=r["ws_session_id"],
                 ip_address=r["ip_address"],
                 trust=bool(r["trust"]),
+                log_upload=self.get_log_upload(r["device_id"]),
             )
             for r in rows
         ]
