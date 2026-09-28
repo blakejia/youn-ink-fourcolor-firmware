@@ -45,6 +45,14 @@ void rf_logbuf_stats(uint32_t* dropped, uint32_t* used);
  * the previous hook so the serial console still prints. */
 void rf_logbuf_install_hook(void);
 
+/* The device holder's own opinion about log upload — three-state
+ * (RF_LOG_OPINION_NONE/OFF/ON in log_upload_policy.h), stored in NVS by
+ * shim.cpp because the device deep-sleeps and loses RAM. Declared here, with
+ * the ring it belongs to, so no C++ file has to hand-declare the symbols: the
+ * settings menu's 日志上报 row is the only writer. */
+uint8_t rf_log_upload_local_get(void);
+void rf_log_upload_local_set(uint8_t opinion);
+
 #ifdef __cplusplus
 }
 #endif

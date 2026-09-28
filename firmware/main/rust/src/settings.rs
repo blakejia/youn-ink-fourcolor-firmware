@@ -53,6 +53,10 @@ pub const ITEM_WIFI_ERROR: u8 = 10;
 /// Wi-Fi credentials *and* the pairing: the device has to be set up again from
 /// the provisioning page, code and all.
 pub const ITEM_RESET_DEVICE: u8 = 11;
+/// Log upload: the device holder's own consent (NVS, not RAM — the device
+/// deep-sleeps every ~10 minutes). Three-state, so this row is a switch and
+/// not an action; the opinion encoding lives in `log_upload_policy`.
+pub const ITEM_LOG_UPLOAD: u8 = 12;
 
 /// Rows that wipe something and therefore ask twice before running. The
 /// renderer draws them in the danger colour, the application arms and confirms
@@ -141,6 +145,21 @@ pub fn wifi_switch_shown(intent: WifiSwitch, connected: bool) -> bool {
     }
 }
 
+/// Cycles the device-side log-upload opinion. Three states, so a single press
+/// walks NONE -> ON -> OFF -> NONE. The NONE position is what hands control
+/// back to the service.
+///
+/// Total by construction: anything that is not one of the three opinions lands
+/// on ON, so a corrupt NVS byte cannot panic the press that reads it.
+pub fn log_upload_toggle_target(current: u8) -> u8 {
+    use crate::log_upload_policy::{OPINION_NONE, OPINION_OFF, OPINION_ON};
+    match current {
+        OPINION_ON => OPINION_OFF,
+        OPINION_OFF => OPINION_NONE,
+        _ => OPINION_ON,
+    }
+}
+
 use Item as I;
 
 const SYSTEM_ITEMS: &[Item] = &[
@@ -157,6 +176,7 @@ const NETWORK_ITEMS: &[Item] = &[
     I { id: ITEM_WIFI_IP, label: c"IP 地址", kind: Kind::Info },
     I { id: ITEM_WIFI_SIGNAL, label: c"信号强度", kind: Kind::Info },
     I { id: ITEM_WIFI_ERROR, label: c"失败原因", kind: Kind::Info },
+    I { id: ITEM_LOG_UPLOAD, label: c"日志上报", kind: Kind::Toggle },
     I { id: ITEM_SERVER, label: c"服务端", kind: Kind::Info },
 ];
 
@@ -405,6 +425,15 @@ pub extern "C" fn rf_settings_wifi_switch_shown(intent: u8, connected: u8) -> u8
     if wifi_switch_shown(intent, connected != 0) { 1 } else { 0 }
 }
 
+/// What one press on the 日志上报 row writes to NVS. The device's own opinion
+/// is three-state (`rf_log_upload_opinion_t`), and the direction is the rule's,
+/// not the renderer's: the row redraws the opinion that was just written, so
+/// NONE has to be a position a press can reach and not merely a stored value.
+#[unsafe(no_mangle)]
+pub extern "C" fn rf_settings_log_upload_toggle(current: u8) -> u8 {
+    log_upload_toggle_target(current)
+}
+
 /// How long the confirm window is, in milliseconds, for the prompt the panel
 /// shows. Exposed so the sentence on the row cannot drift from the rule in
 /// `confirm_step`.
@@ -535,6 +564,7 @@ pub unsafe extern "C" fn rf_settings_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_upload_policy::{OPINION_NONE, OPINION_OFF, OPINION_ON};
 
     fn nav(section: u8) -> Cursor {
         Cursor { section, focus: Focus::Nav, option: 0 }
@@ -623,16 +653,17 @@ mod tests {
         let labels: Vec<String> = NETWORK_ITEMS.iter().map(|i| i.label.to_str().unwrap().to_string()).collect();
         assert_eq!(
             labels,
-            vec!["Wi-Fi", "连接状态", "Wi-Fi 名称", "Wi-Fi 密码", "IP 地址", "信号强度", "失败原因", "服务端"]
+            vec!["Wi-Fi", "连接状态", "Wi-Fi 名称", "Wi-Fi 密码", "IP 地址", "信号强度", "失败原因", "日志上报", "服务端"]
         );
-        // Two rows can be acted on: the switch, and the password reveal. Every
-        // other row is a read-out the cursor never rests on.
+        // Three rows can be acted on: the Wi-Fi switch, the password reveal and
+        // the device's own log-upload consent. Every other row is a read-out
+        // the cursor never rests on.
         let actionable: Vec<u8> = NETWORK_ITEMS
             .iter()
             .filter(|i| i.kind != Kind::Info)
             .map(|i| i.id)
             .collect();
-        assert_eq!(actionable, vec![ITEM_WIFI_TOGGLE, ITEM_WIFI_PASSWORD]);
+        assert_eq!(actionable, vec![ITEM_WIFI_TOGGLE, ITEM_WIFI_PASSWORD, ITEM_LOG_UPLOAD]);
         assert_eq!(NETWORK_ITEMS[0].kind, Kind::Toggle);
         assert_eq!(NETWORK_ITEMS[3].kind, Kind::Action);
     }
@@ -794,13 +825,17 @@ mod tests {
 
     #[test]
     fn the_cursor_skips_info_rows_and_stops_at_the_last_option() {
-        // 网络: 0 is the toggle, 1–2 are read-outs, 3 is the password reveal,
-        // and everything after that is a read-out again.
+        // 网络: 0 is the Wi-Fi toggle, 1–2 are read-outs, 3 is the password
+        // reveal, 4–6 are read-outs and 7 is the log-upload switch — the last
+        // option, with 服务端 read-only past it.
         let (c, _) = step(opts(1, 0), Button::Down);
         assert_eq!(c.option, 3, "the read-outs between the two options are skipped");
+        let (c, _) = step(opts(1, 3), Button::Down);
+        assert_eq!(c.option, 7, "the read-outs between password and log upload are skipped too");
         assert_eq!(first_selectable(&SECTIONS[1]), Some(0));
         assert_eq!(next_selectable(&SECTIONS[1], 0), Some(3));
-        assert_eq!(next_selectable(&SECTIONS[1], 3), None, "the password is the last option");
+        assert_eq!(next_selectable(&SECTIONS[1], 3), Some(7));
+        assert_eq!(next_selectable(&SECTIONS[1], 7), None, "the log-upload switch is the last option");
     }
 
     #[test]
@@ -904,11 +939,36 @@ mod tests {
 
     #[test]
     fn a_section_with_only_info_rows_never_takes_the_cursor() {
-        // The read-outs past the last option are no more reachable than the
-        // ones between: DOWN from the password row stays where it is, and the
-        // row it stays on is not an Info row.
-        let (c, _) = step(opts(1, 3), Button::Down);
-        assert_eq!(c.option, 3);
+        // The read-out past the last option (服务端) is no more reachable than
+        // the ones between: DOWN from the log-upload switch stays where it is,
+        // and the row it stays on is not an Info row.
+        let (c, _) = step(opts(1, 7), Button::Down);
+        assert_eq!(c.option, 7);
         assert!(NETWORK_ITEMS[c.option as usize].kind != Kind::Info);
+    }
+
+    // ── the device-side log-upload switch ──────────────────────────────
+
+    #[test]
+    fn log_upload_row_exists_as_a_toggle() {
+        let items: Vec<_> = NETWORK_ITEMS.iter().filter(|i| i.id == ITEM_LOG_UPLOAD).collect();
+        assert_eq!(items.len(), 1, "exactly one log-upload row");
+        assert_eq!(items[0].kind, Kind::Toggle, "it is a switch, not an action");
+    }
+
+    #[test]
+    fn toggle_target_cycles_none_on_off() {
+        // Three states, so the press has to say where it goes. NONE is the
+        // "let the service decide" position and must be reachable -- without
+        // it, a user who once pressed the switch could never hand control back.
+        assert_eq!(log_upload_toggle_target(OPINION_NONE), OPINION_ON);
+        assert_eq!(log_upload_toggle_target(OPINION_ON), OPINION_OFF);
+        assert_eq!(log_upload_toggle_target(OPINION_OFF), OPINION_NONE);
+    }
+
+    #[test]
+    fn toggle_target_is_total() {
+        // An out-of-range byte must not panic.
+        assert_eq!(log_upload_toggle_target(99), OPINION_ON);
     }
 }

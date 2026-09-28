@@ -84,6 +84,9 @@ enum {
     /* Wi-Fi credentials and the pairing: set up again from the provisioning
      * page, code and all. */
     RF_SETTINGS_ITEM_RESET_DEVICE = 11,
+    /* 日志上报：设备侧的同意开关（NVS）。三态，见 log_upload_policy.h 的
+     * opinion 编码。第三种状态（无意见 = 让服务端决定）由按键循环抵达。 */
+    RF_SETTINGS_ITEM_LOG_UPLOAD = 12,
 };
 
 /* How many masking dots to draw for a password of `len` bytes; the renderer
@@ -120,6 +123,13 @@ uint8_t rf_settings_wifi_switch_next(uint8_t shown);
 
 /* What the switch draws: the intent once there is one, else the connection. */
 uint8_t rf_settings_wifi_switch_shown(uint8_t intent, uint8_t connected);
+
+/* What one press on the 日志上报 row writes to NVS: the device-side log-upload
+ * opinion, three-state (`rf_log_upload_opinion_t`). C++ owns the storage, so
+ * this is only the rule the press asks for. Exposed so the redraw cannot
+ * invent its own direction — the row shows the opinion just written, not the
+ * one the row drew before. */
+uint8_t rf_settings_log_upload_toggle(uint8_t current);
 
 /* Nothing is armed. */
 #define RF_SETTINGS_CONFIRM_NONE 0xFF

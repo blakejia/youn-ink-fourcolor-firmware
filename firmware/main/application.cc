@@ -34,6 +34,8 @@
 #include "power.h"
 #include "rust/include/time_gate_policy.h"
 #include "rust/include/notify_policy.h"
+#include "rust/include/log_upload_policy.h"
+#include "rust/include/shim_log.h"
 #include <nvs.h>
 
 #include <sys/time.h>
@@ -759,6 +761,24 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
                     UpdateStatusBarForUi();
                     break;
                 }
+                case RF_SETTINGS_ITEM_LOG_UPLOAD: {
+                    // Three states, so the direction is the model's rule, not
+                    // the renderer's two-way `target`: `target` is ignored
+                    // here on purpose. NONE (let the service decide) has to be
+                    // somewhere a press can land, or a holder who once touched
+                    // this switch could never hand control back.
+                    const uint8_t current = rf_log_upload_local_get();
+                    const uint8_t next = rf_settings_log_upload_toggle(current);
+                    rf_log_upload_local_set(next);
+                    ESP_LOGI(kTag, "日志上报: local opinion %u -> %u",
+                             (unsigned)current, (unsigned)next);
+                    // The row shows the opinion just written. The checkbox can
+                    // only say ON/OFF — the third position is invisible until
+                    // the renderer grows a three-state switch.
+                    sr->SetItemChecked(RF_SETTINGS_ITEM_LOG_UPLOAD,
+                                       next == RF_LOG_OPINION_ON);
+                    break;
+                }
                 case RF_SETTINGS_ITEM_WIFI_PASSWORD:
                     // 网络's second actionable row. The dots come off for as long
                     // as the user is on the row; the renderer puts them back.
@@ -771,6 +791,11 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
         sr->SetItemValue(RF_SETTINGS_ITEM_RESET_NETWORK, "清凭据重启");
         sr->SetItemValue(RF_SETTINGS_ITEM_SLEEP, "手动进入");
         UpdateWifiSettingsItem(sr, wifi_connected_.load(std::memory_order_acquire));
+        // The row draws the opinion the holder has already stated, read back
+        // from NVS — the device deep-sleeps, so a RAM mirror would draw OFF on
+        // every wake and the first press would look like it did nothing.
+        sr->SetItemChecked(RF_SETTINGS_ITEM_LOG_UPLOAD,
+                           rf_log_upload_local_get() == RF_LOG_OPINION_ON);
         sr->SetFirmwareVersion("v" PROJECT_VER);
 
         uint8_t mac_bytes[6] = {};
