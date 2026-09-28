@@ -153,6 +153,20 @@ def _require_known_device(device: str) -> str:
     return device
 
 
+def _require_safe_device_id(device_id: str) -> str:
+    """A device id becomes a log filename, so it must be a safe component.
+
+    devicelog._path_for raises ValueError on an unsafe id; letting that escape
+    turns a caller-supplied string ("..", a backslash) into a 500. The id is
+    either attacker-influenced (an operator-supplied path parameter) or
+    device-chosen (pair-start accepts any string), so it is checked here
+    rather than trusted — same guard, and same 401, as get_schedule.
+    """
+    if not pages_mod.is_safe_component(device_id):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return device_id
+
+
 
 # ── app factory ───────────────────────────────────────────────────────
 def create_app() -> FastAPI:
@@ -545,6 +559,7 @@ def create_app() -> FastAPI:
         text to devicelog, which owns the on-disk layout.
         """
         dev = _require_device_token(request)
+        _require_safe_device_id(dev.device_id)
         try:
             seq_hi = int(body.get("seq_hi"))
             dropped = int(body.get("dropped", 0))
@@ -584,6 +599,7 @@ def create_app() -> FastAPI:
     @app.get("/api/devices/{device_id}/logs")
     async def device_logs(device_id: str, request: Request, tail: int = Query(500)):
         _require_operator(request)
+        _require_safe_device_id(device_id)
         n = max(1, min(int(tail), devicelog.MAX_LINES_PER_REQUEST))
         lines, truncated = devicelog.tail_lines(device_id, n)
         return {"lines": lines, "truncated": truncated}
@@ -682,6 +698,12 @@ def create_app() -> FastAPI:
         # of showing an enabled service setting that appears to do nothing.
         # Absent (old firmware) reads as 0 = no opinion.
         local_lo = _u32("lo")
+        # Store it, so the admin UI can read the device's own opinion between
+        # polls. Only on an explicit `lo=`: an absent key is old firmware that
+        # has no opinion to report, which is not the same as reporting 0 and
+        # must not overwrite what the device last said.
+        if qp.get("lo") is not None:
+            registry.set_local_log_upload(dev.device_id, local_lo)
         # `rr` is the esp_reset_reason_t enum the device sampled at boot
         # (e.g. 15=BROWNOUT, 8=RTCWDT). Old firmware omits it: keep the last
         # stored reason instead of clobbering it with "unknown" — the reason is

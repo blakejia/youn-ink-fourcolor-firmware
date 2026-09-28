@@ -14,29 +14,45 @@ import pytest
 from fastapi.testclient import TestClient
 
 from youn_server.app import create_app, _pairing_store
+from youn_server.devices import registry
 from youn_server.config import settings
 from youn_server import devicelog
 
 from .device_sig import signed_headers
 
+#: Device ids this module registers, so teardown can drop the rows it created
+#: instead of leaking them into the next test in the file.
+_DEVICE_IDS = ("NOTE4C-TEST", "EVIL/ID")
+
+
 
 @pytest.fixture(autouse=True)
-def _isolate_device_log_dir():
-    """Point device_log_dir at a fresh temp dir and restore after."""
+def _isolate_device_state():
+    """Per-test isolation: fresh log dir, fresh pairing windows, fresh device row.
+
+    ``settings.devices_db`` is one session-wide temp DB (conftest points it at a
+    throwaway path), so a device row created by one test is still there for the
+    next. That made the log_upload tests order-dependent: the "defaults to no
+    opinion" test only passed because it happened to run before the test that
+    stores 0 — run in the other order it reads the other test's row. Dropping
+    the row in teardown is what makes a test prove something on its own.
+    """
     tmp = tempfile.mkdtemp(prefix="devicelog_test_")
     orig = settings.device_log_dir
     settings.device_log_dir = Path(tmp)
     # The pairing rate-limit windows are process-local on the shared
-    # PairingStore (5 pair-starts per IP per 5 min). This module pairs ten
-    # times from the one test-client IP, so without a reset every test after
-    # the fifth fails in the fixture with 429 — same reason test_pairing and
-    # test_notify clear these.
+    # PairingStore (5 pair-starts per IP per 5 min). This module pairs once per
+    # test from the one test-client IP, so without a reset the rate limiter
+    # trips mid-file — same reason test_pairing and test_notify clear these.
     _pairing_store._rate_limits.clear()
     _pairing_store._claim_failures.clear()
     yield
     settings.device_log_dir = orig
     _pairing_store._rate_limits.clear()
     _pairing_store._claim_failures.clear()
+    for device_id in _DEVICE_IDS:
+        registry._conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
+        registry._conn.execute("DELETE FROM device_secrets WHERE device_id = ?", (device_id,))
 
 
 def test_append_then_tail_round_trips():
@@ -117,19 +133,25 @@ def client():
 
 
 @pytest.fixture()
-def trusted_device(client):
-    """Register + trust a device through the real pairing flow."""
+def trusted_device(request):
+    """Register + trust a device through the real pairing flow.
+
+    Indirect-parametrizable so a test can pair a deliberately unsafe id — the
+    endpoints have to survive a device_id that is not a safe path component.
+    """
+    device_id = getattr(request, "param", "NOTE4C-TEST")
+    client = request.getfixturevalue("client")
     r = client.post("/api/devices/pair-start",
-                    json={"device_id": "NOTE4C-TEST", "board_type": "NOTE4C"},
-                    headers=signed_headers("NOTE4C-TEST"))
+                    json={"device_id": device_id, "board_type": "NOTE4C"},
+                    headers=signed_headers(device_id))
     assert r.status_code == 200
     code = r.json()["code"]
     client.post("/api/devices/pair-confirm",
-                json={"device_id": "NOTE4C-TEST", "code": code},
+                json={"device_id": device_id, "code": code},
                 headers={"X-Operator-Token": ""})
     r = client.post("/api/devices/pair-claim",
-                    json={"device_id": "NOTE4C-TEST", "code": code})
-    return "NOTE4C-TEST", r.json()["token"]
+                    json={"device_id": device_id, "code": code})
+    return device_id, r.json()["token"]
 
 
 def test_log_upload_defaults_to_no_opinion(client, trusted_device):
@@ -240,3 +262,76 @@ def test_logs_tail_endpoint_returns_lines(client, trusted_device):
     assert len(body["lines"]) == 2
     assert body["lines"][-1].endswith("c")
     assert body["truncated"] is True
+
+
+# ── fix round 1: unsafe device_id, persisted local opinion, test isolation ──
+
+@pytest.mark.parametrize("device_id", ["%2E%2E", "a%5Cb"])
+def test_logs_endpoint_rejects_unsafe_device_id(client, device_id):
+    """`..`/a backslash reach devicelog._path_for, which raises ValueError.
+
+    Unhandled that is a 500 on a caller-supplied string — the sibling
+    /power-history route answers 200 for the same input. An unsafe id is a
+    rejected request, not a server fault.
+    """
+    r = client.get(f"/api/devices/{device_id}/logs",
+                   headers={"X-Operator-Token": ""})
+    assert r.status_code == 401
+
+
+@pytest.mark.parametrize("trusted_device", ["EVIL/ID"], indirect=True)
+def test_device_log_rejects_unsafe_device_id(client, trusted_device):
+    """The device side too: pair-start accepts any id, so a real unit can hold
+    one that is not a safe filename component. Uploading must not 500."""
+    device_id, token = trusted_device
+    r = client.post("/api/device-log",
+                    json={"seq_hi": 1, "dropped": 0,
+                          "lines": base64.b64encode(b"x\n").decode()},
+                    headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 401
+
+
+def test_schedule_persists_local_opinion_for_operator_view(client, trusted_device):
+    """`local_log_upload` is echoed per-request, but the admin UI needs to read
+    it between polls — so the uplink opinion is stored per device too."""
+    device_id, token = trusted_device
+    r = client.get("/api/pages/schedule?lo=2",
+                   headers={"Authorization": f"Bearer {token}"})
+    assert r.json()["local_log_upload"] == 2
+
+    r = client.get("/api/devices", headers={"X-Operator-Token": ""})
+    dev = next(d for d in r.json()["devices"] if d["device_id"] == device_id)
+    assert dev["local_log_upload"] == 2
+
+
+def test_schedule_without_lo_keeps_stored_local_opinion(client, trusted_device):
+    """Absent `lo=` means old firmware, not "the device turned it off". It must
+    not clobber the stored opinion — that would make the devices page flicker
+    to "no opinion" on every poll from a unit that has the feature off."""
+    device_id, token = trusted_device
+    client.get("/api/pages/schedule?lo=1",
+               headers={"Authorization": f"Bearer {token}"})
+    r = client.get("/api/pages/schedule",
+                   headers={"Authorization": f"Bearer {token}"})
+    assert r.json()["local_log_upload"] == 0, "echo is per-request"
+
+    r = client.get("/api/devices", headers={"X-Operator-Token": ""})
+    dev = next(d for d in r.json()["devices"] if d["device_id"] == device_id)
+    assert dev["local_log_upload"] == 1, "stored opinion survived the bare poll"
+
+
+def test_local_opinion_zero_is_distinct_from_unset(client, trusted_device):
+    """Same NULL-vs-0 discipline as log_upload: the device explicitly reporting
+    "no local switch" is data, not the absence of data."""
+    device_id, token = trusted_device
+    r = client.get("/api/devices", headers={"X-Operator-Token": ""})
+    dev = next(d for d in r.json()["devices"] if d["device_id"] == device_id)
+    assert dev["local_log_upload"] is None
+
+    client.get("/api/pages/schedule?lo=0",
+               headers={"Authorization": f"Bearer {token}"})
+    r = client.get("/api/devices", headers={"X-Operator-Token": ""})
+    dev = next(d for d in r.json()["devices"] if d["device_id"] == device_id)
+    assert dev["local_log_upload"] == 0
+    assert dev["local_log_upload"] is not None
+

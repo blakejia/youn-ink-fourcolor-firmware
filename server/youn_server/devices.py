@@ -47,6 +47,7 @@ class Device:
     ip_address: Optional[str]
     trust: bool
     log_upload: Optional[int] = None
+    local_log_upload: Optional[int] = None
 
     @property
     def trusted(self) -> bool:
@@ -165,6 +166,15 @@ class DeviceRegistry:
         except sqlite3.OperationalError as exc:
             if "duplicate column name" not in str(exc):
                 raise
+        # The device's *own* switch opinion, last seen on the schedule uplink.
+        # Same NULL discipline: absent means "this device has never reported
+        # one", which is different from a device that reports 0 (explicitly no
+        # local switch). Stored so the admin UI can read it between polls.
+        try:
+            self._conn.execute("ALTER TABLE devices ADD COLUMN local_log_upload INTEGER")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
 
     # ── write ──
     def upsert(
@@ -271,6 +281,7 @@ class DeviceRegistry:
             ip_address=row["ip_address"],
             trust=bool(row["trust"]),
             log_upload=self.get_log_upload(row["device_id"]),
+            local_log_upload=self.get_local_log_upload(row["device_id"]),
         )
 
     def get_secret(self, device_id: str) -> Optional[str]:
@@ -298,6 +309,7 @@ class DeviceRegistry:
             ip_address=row["ip_address"],
             trust=bool(row["trust"]),
             log_upload=self.get_log_upload(row["device_id"]),
+            local_log_upload=self.get_local_log_upload(row["device_id"]),
         )
 
     def set_token(self, device_id: str, token: str) -> None:
@@ -345,23 +357,40 @@ class DeviceRegistry:
                 (value, device_id),
             )
 
-    def get_log_upload(self, device_id: str) -> Optional[int]:
-        """The service-side opinion: None (no opinion) / 1 / 0.
+    def _get_opinion(self, device_id: str, column: str) -> Optional[int]:
+        """Read one of the tri-state log-upload opinion columns.
 
-        Unset, unknown device, or SQL NULL all read as None. A stored 0 is a
-        real opinion and is returned as 0 -- the two must not collapse.
+        Unset, unknown device, or SQL NULL all read as None; a stored 0 is a
+        real opinion and is returned as 0. The two must never collapse, which
+        is why the column is nullable and has no DEFAULT.
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT log_upload FROM devices WHERE device_id = ?", (device_id,)
+                f"SELECT {column} FROM devices WHERE device_id = ?", (device_id,)
             ).fetchone()
         if row is None:
             return None
         try:
-            raw = row["log_upload"]
+            raw = row[column]
         except (IndexError, KeyError):
             return None
         return None if raw is None else int(raw)
+
+    def get_log_upload(self, device_id: str) -> Optional[int]:
+        """The service-side opinion: None (no opinion) / 1 / 0."""
+        return self._get_opinion(device_id, "log_upload")
+
+    def set_local_log_upload(self, device_id: str, value: Optional[int]) -> None:
+        """Store the device's own switch opinion, as last reported on `lo=`."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET local_log_upload = ? WHERE device_id = ?",
+                (value, device_id),
+            )
+
+    def get_local_log_upload(self, device_id: str) -> Optional[int]:
+        """The device-side opinion: None (never reported) / 0 / 1 / 2."""
+        return self._get_opinion(device_id, "local_log_upload")
 
     def add_battery_sample(self, device_id: str, ts: int, mv: int, pct: int,
                            charge: int, counters: dict) -> None:
@@ -411,6 +440,7 @@ class DeviceRegistry:
                 ip_address=r["ip_address"],
                 trust=bool(r["trust"]),
                 log_upload=self.get_log_upload(r["device_id"]),
+                local_log_upload=self.get_local_log_upload(r["device_id"]),
             )
             for r in rows
         ]
