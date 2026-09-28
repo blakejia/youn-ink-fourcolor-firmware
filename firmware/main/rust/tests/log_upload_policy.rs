@@ -165,3 +165,65 @@ fn c_structs_match_the_header_layout() {
     assert_eq!(offset_of!(Decision, action), 0);
     assert_eq!(offset_of!(Decision, max_bytes), 4);
 }
+// ── C ABI ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn c_abi_resolve_pins_the_conflict_rule() {
+    // Absolute, not relative to `resolve_enabled`: the table below IS the
+    // conflict rule, so breaking the rule in the code must break this test.
+    // (local, server) -> expected.
+    let table: [(u8, u8, u8); 9] = [
+        (OPINION_NONE, OPINION_ON, 1),
+        (OPINION_ON, OPINION_OFF, 0),
+        (OPINION_OFF, OPINION_ON, 1),
+        (OPINION_NONE, OPINION_NONE, 0),
+        (OPINION_ON, OPINION_NONE, 1),
+        (OPINION_OFF, OPINION_NONE, 0),
+        (OPINION_ON, OPINION_ON, 1),
+        (OPINION_OFF, OPINION_OFF, 0),
+        (OPINION_NONE, OPINION_OFF, 0),
+    ];
+    for (local, server, want) in table {
+        assert_eq!(
+            rf_log_upload_resolve(local, server),
+            want,
+            "local={local} server={server}",
+        );
+    }
+}
+
+#[test]
+fn c_abi_decide_pins_each_action_through_a_pointer() {
+    // Same: concrete literal expectations, driven through the raw-pointer
+    // path that Task 5 calls (`shim::rf_log_upload_decide(&inputs)`).
+    let up = base();
+    // SAFETY: pointer is to a local that outlives the call.
+    let got = unsafe { rf_log_upload_decide(&up) };
+    assert_eq!(got.action, UPLOAD);
+    assert_eq!(got.max_bytes, MAX_UPLOAD_BYTES);
+
+    let disabled = Inputs { server_set: OPINION_OFF, ..base() };
+    // SAFETY: pointer is to a local that outlives the call.
+    assert_eq!(unsafe { rf_log_upload_decide(&disabled).action }, SKIP_DISABLED);
+
+    let empty = Inputs { has_pending: 0, pending_bytes: 0, pending_lines: 0, ..base() };
+    // SAFETY: pointer is to a local that outlives the call.
+    assert_eq!(unsafe { rf_log_upload_decide(&empty).action }, SKIP_EMPTY);
+
+    let offline = Inputs { wifi_ready: 0, ..base() };
+    // SAFETY: pointer is to a local that outlives the call.
+    assert_eq!(unsafe { rf_log_upload_decide(&offline).action }, SKIP_NO_NET);
+
+    let held = Inputs { fail_streak: 2, last_fail_s: 900, now_s: 1000, ..base() };
+    // SAFETY: pointer is to a local that outlives the call.
+    assert_eq!(unsafe { rf_log_upload_decide(&held).action }, SKIP_BACKOFF);
+}
+
+#[test]
+fn c_abi_backoff_pins_the_literal_values() {
+    assert_eq!(rf_log_upload_backoff_s(0, 60, 900), 0);
+    assert_eq!(rf_log_upload_backoff_s(1, 60, 900), 60);
+    assert_eq!(rf_log_upload_backoff_s(2, 60, 900), 120);
+    assert_eq!(rf_log_upload_backoff_s(5, 60, 900), 900, "capped");
+    assert_eq!(rf_log_upload_backoff_s(99, 60, 900), 900, "no overflow at high streaks");
+}
