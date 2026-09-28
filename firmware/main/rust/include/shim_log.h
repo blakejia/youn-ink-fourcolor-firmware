@@ -34,9 +34,9 @@ void rf_logbuf_read(char* out, int cap, uint32_t* out_seq_lo, uint32_t* out_line
 
 /* Advance the tail past every line with seq <= seq_hi. Call only after the
  * server accepted the payload. */
-void rf_logbuf_ack(uint32_t seq_hi);
+void rf_logbuf_ack(uint32_t seq_hi, uint32_t reported_dropped);
 
-/* `dropped`: lines lost to ring overwrite since the last power cycle.
+/* `dropped`: lines lost to ring overwrite since the last ack.
  * `used`: bytes currently held. */
 void rf_logbuf_stats(uint32_t* dropped, uint32_t* used);
 

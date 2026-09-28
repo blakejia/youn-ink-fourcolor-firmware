@@ -140,7 +140,7 @@ unsafe extern "C" {
     pub fn rf_logbuf_install_hook();
     pub fn rf_logbuf_read(out: *mut c_char, cap: c_int, out_seq_lo: *mut u32,
                           out_lines: *mut u32);
-    pub fn rf_logbuf_ack(seq_hi: u32);
+    pub fn rf_logbuf_ack(seq_hi: u32, reported_dropped: u32);
     pub fn rf_logbuf_stats(dropped: *mut u32, used: *mut u32);
     // Service opinion (RTC byte in shim.cpp): NONE/OFF/ON = 0/1/2.
     pub fn rf_log_upload_server_get() -> u8;
@@ -1064,10 +1064,12 @@ pub(crate) mod host {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "C" fn rf_logbuf_ack(seq_hi: u32) {
+    pub extern "C" fn rf_logbuf_ack(seq_hi: u32, reported_dropped: u32) {
         *LOG_ACKED.lock().unwrap_or_else(|e| e.into_inner()) = Some(seq_hi);
-        // Mirror shim_log.cpp: acking a batch accounts for its drops.
-        *LOG_DROPPED.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        // Mirror shim_log.cpp: subtract the reported drops, NOT clear, so a
+        // drop that lands during the upload is still reported next batch.
+        let mut d = LOG_DROPPED.lock().unwrap_or_else(|e| e.into_inner());
+        *d = d.saturating_sub(reported_dropped);
     }
 
     #[unsafe(no_mangle)]

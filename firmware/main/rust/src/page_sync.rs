@@ -1179,7 +1179,8 @@ fn log_upload_with_buffers(
     };
     // 201 Created is the endpoint's declared success code.
     if status == 201 {
-        unsafe { shim::rf_logbuf_ack(seq_hi) };
+        // Report only the drops sampled before the POST (subtract semantics).
+        unsafe { shim::rf_logbuf_ack(seq_hi, dropped) };
         record_log_upload(true, fail_streak);
         log_i!("PageSync", "log upload ok: {} lines, {} B", lines, take);
         return true;
@@ -1673,7 +1674,14 @@ mod tests {
         // the third whitespace-separated token of the recorded "http_post" line.
         let body = posted[0].splitn(3, ' ').nth(2).expect("http_post carries the body");
         let b = body.as_bytes();
-        assert!(crate::json::skip_value(b, 0).is_some(), "body is well-formed JSON: {body}");
+        // Whole-body, not a prefix: a trailing byte after the closing brace
+        // (e.g. a doubled quote) must also fail, since the server's parser
+        // rejects trailing data. skip_value returns the offset past the value;
+        // require it to be exactly the body length.
+        match crate::json::skip_value(b, 0) {
+            Some(end) if end == b.len() => {}
+            other => panic!("body is well-formed JSON with no trailing bytes: {:?}; body={}", other.map(|e| (e, b.len())), body),
+        }
         let hi = crate::json::member(b, 0, "seq_hi").and_then(|at| crate::json::int_value(b, at));
         assert!(hi.is_some(), "seq_hi parses as an int: {body}");
         let dr = crate::json::member(b, 0, "dropped").and_then(|at| crate::json::int_value(b, at));
@@ -1710,6 +1718,38 @@ mod tests {
         let all = shim::host::calls_matching("http_post");
         assert_eq!(all.len(), 2, "two uploads");
         assert_eq!(dropped_of(&all[1..]), Some(0), "ack accounted for the earlier drops");
+    }
+
+    #[test]
+    fn drops_survive_a_failed_upload_and_are_reported_later() {
+        // The reset must fire on ACK (201), not on read or on attempt: a failed
+        // upload does not ack, so its drops must carry into the next successful
+        // batch. A reset on read/attempt would pass the once-per-batch test
+        // while destroying the marker — this is the discriminating case.
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_log_opinion(log_upload_policy::OPINION_ON, log_upload_policy::OPINION_NONE);
+        shim::host::stage_log_lines(&["failed batch"]);
+
+        // First attempt fails (500): nothing acked, drops NOT cleared.
+        shim::host::script_get("/api/device-log", 500, b"");
+        assert!(!log_upload_try_once(), "500 -> not accepted");
+
+        // The failed attempt ratchets the fail streak, which gates the next
+        // attempt by a backoff window (60s at streak 1). Advance the clock past
+        // it so this test exercises the retry, not the gate.
+        let now = shim::host::log_fail_state().0;
+        shim::host::set_time_s(now + 61);
+
+        // Second attempt succeeds: the body must still carry the earlier drops.
+        shim::host::script_get("/api/device-log", 201, b"{}");
+        shim::host::stage_log_lines(&["second batch"]);
+        assert!(log_upload_try_once(), "201 -> accepted");
+        let all = shim::host::calls_matching("http_post");
+        let body = all[1].splitn(3, ' ').nth(2).unwrap();
+        let b = body.as_bytes();
+        let dropped = crate::json::member(b, 0, "dropped").and_then(|at| crate::json::int_value(b, at));
+        assert_eq!(dropped, Some(3), "drops are cleared only on ack, not on a failed attempt: {body}");
     }
 
     #[test]

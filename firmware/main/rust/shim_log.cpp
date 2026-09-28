@@ -212,7 +212,7 @@ extern "C" void rf_logbuf_read(char* out, int cap, uint32_t* out_seq_lo, uint32_
 
 // Contract: pass seq_lo + lines - 1 from the read that produced the payload.
 // Acks only frames the reader actually returned (contiguous from the tail).
-extern "C" void rf_logbuf_ack(uint32_t seq_hi) {
+extern "C" void rf_logbuf_ack(uint32_t seq_hi, uint32_t reported_dropped) {
     portENTER_CRITICAL(&g_mux);
     ensure_init_locked();
     int at = (int)g_ring.tail;
@@ -231,10 +231,12 @@ extern "C" void rf_logbuf_ack(uint32_t seq_hi) {
         g_ring.tail = at;
         remaining -= 6u + len;
     }
-    // `dropped` is reported per upload; once a batch is acked the drops it
-    // carried are accounted for, so reset the counter or every later batch
-    // would re-stamp the same stale total (final-review P2).
-    g_ring.dropped = 0;
+    // `dropped` is reported per upload. Subtract the count this batch
+    // reported (sampled before the POST), NOT clear: lines pushed during the
+    // up-to-10s upload window are drops too, and clearing would discard them
+    // unreported. Saturating so a corrupt `reported` can't underflow.
+    g_ring.dropped -= g_ring.dropped < reported_dropped ? g_ring.dropped
+                                                        : reported_dropped;
     portEXIT_CRITICAL(&g_mux);
 }
 
