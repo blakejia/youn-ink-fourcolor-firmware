@@ -1636,6 +1636,21 @@ fn log_upload_try_once() -> bool {
 
 在 `RunPowerCycle` 里、`page_sync_sync_once()` 返回成功之后调用一次 `log_upload_try_once()`（`application.cc` 已有该调用点）。
 
+- [ ] **Step 5b: schedule 上行加 `&lo=`（本地意见回传，spec §5）**
+
+服务端（Task 2）与前端（Task 7）都消费 `&lo=`，但**没有任何任务在设备侧产出它**——这是计划的孤儿步骤。补在 `fetch_schedule`（`page_sync.rs`）里，与 `v/p/c` 同一段写查询串：
+
+```rust
+    // The device's own switch opinion rides every schedule poll (spec §5):
+    // the server echoes it back and the admin UI can say "the device has it
+    // off" instead of an enabled service setting that appears to do nothing.
+    // Path budget: current ~93 B, limit 160, `&lo=2` adds 5 B — plenty.
+    let lo = unsafe { shim::rf_log_upload_local_get() };
+    let _ = write!(path, "&lo={}", lo);
+```
+
+注意：直接读 `rf_log_upload_local_get()`，**不要**复用 `Inputs` 的构造（`fetch_schedule` 在上行时还没有 `used`/`lines`）。三态不能折平：未设置 = 0（无意见），服务端只在显式 `lo=` 时才落库。
+
 - [ ] **Step 6: 装钩子**
 
 `application.cc` 的 `app_main` 之后最早期（`Application::Initialize` 之前）加一次：
@@ -1653,7 +1668,7 @@ Run:
 ```bash
 cd firmware/main/rust && export PATH="$HOME/.cargo/bin:$PATH" && cargo test
 ```
-Expected: PASS（375 + 12 = 387 左右）
+Expected: PASS（当前 404：含 Task 4 的 22 个 log_upload_policy + Task 5 新增；以 `cargo test` 实际总数为准，此数随任务增长）
 
 Run:
 ```bash
@@ -1671,7 +1686,7 @@ Run:
 source ~/data/esp-idf-v6.0/export.sh
 xtensa-esp32s3-elf-nm firmware/build/xiaozhi.elf | grep -E "rf_log_upload|rf_logbuf"
 ```
-Expected: `rf_log_upload_decide`、`rf_log_upload_enabled_get/set`、4 个 `rf_logbuf_*` 全部为 `T`
+Expected: `page_sync_log_upload_once`、`rf_log_upload_server_get/set`、`rf_log_upload_local_get/set`、`rf_log_upload_fail_state`、`rf_log_upload_fail_record`、4 个 `rf_logbuf_*` 全部为 `T`。（`rf_log_upload_enabled_get/set` 不存在，曾误写；`rf_log_upload_decide/resolve` 是被内联进 `page_sync_log_upload_once` 的薄包装，不单独出现于 ELF，属正常。）
 
 - [ ] **Step 9: 提交**
 
