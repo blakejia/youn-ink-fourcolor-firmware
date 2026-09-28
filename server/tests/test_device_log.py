@@ -22,7 +22,7 @@ from .device_sig import signed_headers
 
 #: Device ids this module registers, so teardown can drop the rows it created
 #: instead of leaking them into the next test in the file.
-_DEVICE_IDS = ("NOTE4C-TEST", "EVIL/ID")
+_DEVICE_IDS = ("NOTE4C-TEST", "EVIL/ID", "WEIRD..ID")
 
 
 
@@ -266,13 +266,18 @@ def test_logs_tail_endpoint_returns_lines(client, trusted_device):
 
 # ── fix round 1: unsafe device_id, persisted local opinion, test isolation ──
 
-@pytest.mark.parametrize("device_id", ["%2E%2E", "a%5Cb"])
+@pytest.mark.parametrize("device_id", ["%2E%2E", "a%5Cb", "a..b"])
 def test_logs_endpoint_rejects_unsafe_device_id(client, device_id):
     """`..`/a backslash reach devicelog._path_for, which raises ValueError.
 
     Unhandled that is a 500 on a caller-supplied string — the sibling
     /power-history route answers 200 for the same input. An unsafe id is a
     rejected request, not a server fault.
+
+    `a..b` is the residual that reopened this: the guard once used
+    `pages.is_safe_component`, which accepts `a..b`, while `_path_for`
+    rejects any id *containing* `..` — so it sailed through the guard and
+    still 500ed. The guard now shares devicelog's own predicate.
     """
     r = client.get(f"/api/devices/{device_id}/logs",
                    headers={"X-Operator-Token": ""})
@@ -283,6 +288,18 @@ def test_logs_endpoint_rejects_unsafe_device_id(client, device_id):
 def test_device_log_rejects_unsafe_device_id(client, trusted_device):
     """The device side too: pair-start accepts any id, so a real unit can hold
     one that is not a safe filename component. Uploading must not 500."""
+    device_id, token = trusted_device
+    r = client.post("/api/device-log",
+                    json={"seq_hi": 1, "dropped": 0,
+                          "lines": base64.b64encode(b"x\n").decode()},
+                    headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 401
+
+
+@pytest.mark.parametrize("trusted_device", ["WEIRD..ID"], indirect=True)
+def test_device_log_rejects_dotdot_containing_device_id(client, trusted_device):
+    """Same residual on the device side: `WEIRD..ID` passes `is_safe_component`
+    but not `_path_for`. The shared predicate must catch it here too."""
     device_id, token = trusted_device
     r = client.post("/api/device-log",
                     json={"seq_hi": 1, "dropped": 0,
@@ -334,4 +351,46 @@ def test_local_opinion_zero_is_distinct_from_unset(client, trusted_device):
     dev = next(d for d in r.json()["devices"] if d["device_id"] == device_id)
     assert dev["local_log_upload"] == 0
     assert dev["local_log_upload"] is not None
+
+
+# ── fix round 2: guard and path layer share one predicate ──
+
+@pytest.mark.parametrize("device_id", ["ok-id", "a.b", "a..b", "..", "a\\b", ".", ""])
+def test_safety_predicate_matches_what_the_path_layer_accepts(device_id):
+    """The guard must accept exactly what `_path_for` accepts — no wider.
+
+    A wider guard is the bug: the id passes the check, then the path layer
+    raises and the caller gets a 500. `a..b` is the case the two predicates
+    disagreed on, so it is in the list alongside the obvious rejects.
+    """
+    try:
+        devicelog._path_for(device_id)
+        path_layer_ok = True
+    except ValueError:
+        path_layer_ok = False
+    assert devicelog.is_safe_device_id(device_id) is path_layer_ok
+
+
+def test_ordinary_device_id_still_reaches_the_endpoint(client, trusted_device):
+    """Positive control: the guard rejects nothing legitimate. A safe id must
+    still get a real answer, so the fix cannot be a blanket 401."""
+    device_id, token = trusted_device
+    r = client.get(f"/api/devices/{device_id}/logs",
+                   headers={"X-Operator-Token": ""})
+    assert r.status_code == 200
+
+    r = client.post("/api/device-log",
+                    json={"seq_hi": 1, "dropped": 0,
+                          "lines": base64.b64encode(b"hello\n").decode()},
+                    headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 201
+    assert r.json()["written"] == 1
+
+
+def test_dotted_but_safe_device_id_is_accepted(client, trusted_device):
+    """`a.b` has a dot and is still a single safe component — the strictest
+    reading of "no dots at all" would wrongly refuse it."""
+    assert devicelog.is_safe_device_id("a.b") is True
+    r = client.get("/api/devices/a.b/logs", headers={"X-Operator-Token": ""})
+    assert r.status_code == 200
 

@@ -31,10 +31,16 @@ _ROTATE_BYTES = 5 * 1024 * 1024
 _ROTATE_KEEP = 3
 
 
-def _path_for(device_id: str) -> "os.PathLike[str] | str":
-    if not device_id or any(bad in device_id for bad in _UNSAFE):
-        raise ValueError("unsafe device id")
-    return settings.device_log_dir / f"{device_id}.log"
+def is_safe_device_id(device_id: str) -> bool:
+    """Whether ``device_id`` is a single safe log-filename component.
+
+    The HTTP layer (`_require_safe_device_id` in app.py) calls this *before*
+    touching the path so an unsafe id is a 4xx, not a 500 from `_path_for`.
+    Both must consult this one predicate — a second, almost-but-not-identical
+    check in app.py is how a `..`-containing id once slipped through the guard
+    and still 500ed in `_path_for`.
+    """
+    return bool(device_id) and not any(bad in device_id for bad in _UNSAFE)
 
 
 def _rotate_if_needed(path) -> None:
@@ -50,6 +56,12 @@ def _rotate_if_needed(path) -> None:
         if older.exists():
             os.replace(older, newer)
     os.replace(path, path.with_suffix(path.suffix + ".1"))
+
+
+def _path_for(device_id: str) -> "os.PathLike[str] | str":
+    if not is_safe_device_id(device_id):
+        raise ValueError("unsafe device id")
+    return settings.device_log_dir / f"{device_id}.log"
 
 
 def append_lines(device_id: str, received_iso: str, text: str, dropped: int) -> int:

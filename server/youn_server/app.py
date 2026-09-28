@@ -156,13 +156,17 @@ def _require_known_device(device: str) -> str:
 def _require_safe_device_id(device_id: str) -> str:
     """A device id becomes a log filename, so it must be a safe component.
 
-    devicelog._path_for raises ValueError on an unsafe id; letting that escape
-    turns a caller-supplied string ("..", a backslash) into a 500. The id is
-    either attacker-influenced (an operator-supplied path parameter) or
+    Checks the *same* predicate the path layer enforces
+    (`devicelog.is_safe_device_id`), before `_path_for` is ever reached: an
+    unsafe id is a rejected request (401, like the get_schedule neighbour),
+    never a ValueError escaping into a 500. The id is either
+    attacker-influenced (an operator-supplied path parameter) or
     device-chosen (pair-start accepts any string), so it is checked here
-    rather than trusted — same guard, and same 401, as get_schedule.
+    rather than trusted. `devicelog` owns the predicate because it owns the
+    on-disk contract; duplicating it here with `is_safe_component` is what
+    once let `..`-containing ids pass the guard and still 500 in `_path_for`.
     """
-    if not pages_mod.is_safe_component(device_id):
+    if not devicelog.is_safe_device_id(device_id):
         raise HTTPException(status_code=401, detail="unauthorized")
     return device_id
 
