@@ -133,6 +133,28 @@ def test_tail_reports_truncation():
     assert lines[-1].endswith("line 49")
 
 
+def test_rotation_moves_the_full_file_aside(monkeypatch):
+    """Design §7 lists rotation as a required case. Shrink the threshold rather
+    than writing 5 MB; the constant is the module's only knob."""
+    monkeypatch.setattr(devicelog, "_ROTATE_BYTES", 64)
+    devicelog.append_lines("NOTE4C-TEST", "t0", "a" * 100 + "\n", dropped=0)
+    devicelog.append_lines("NOTE4C-TEST", "t1", "second\n", dropped=0)
+    base = settings.device_log_dir / "NOTE4C-TEST.log"
+    assert base.read_text() == "t1 second\n", "current holds only the fresh append"
+    assert (settings.device_log_dir / "NOTE4C-TEST.log.1").read_text().startswith("t0 aaa")
+
+
+def test_rotation_keeps_newest_previous_at_1_and_caps(monkeypatch):
+    monkeypatch.setattr(devicelog, "_ROTATE_BYTES", 8)
+    for i in range(5):
+        devicelog.append_lines("NOTE4C-TEST", f"t{i}", "x" * 20 + "\n", dropped=0)
+    d = settings.device_log_dir
+    assert (d / "NOTE4C-TEST.log.1").read_text().startswith("t3")
+    assert (d / "NOTE4C-TEST.log.2").read_text().startswith("t2")
+    assert (d / "NOTE4C-TEST.log.3").read_text().startswith("t1")
+    assert not (d / "NOTE4C-TEST.log.4").exists(), "capped at .3"
+
+
 def test_tail_unknown_device_is_empty():
     lines, truncated = devicelog.tail_lines("NO-SUCH-DEVICE", 10)
     assert lines == []
@@ -265,7 +287,7 @@ def tail_lines(device_id: str, n: int) -> Tuple[List[str], bool]:
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `cd server && .venv/bin/python -m pytest tests/test_device_log.py -q`
-Expected: PASS（6 passed）
+Expected: PASS（8 passed）
 
 - [ ] **Step 6: 提交**
 
