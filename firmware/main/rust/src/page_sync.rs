@@ -1131,7 +1131,7 @@ fn log_upload_with_buffers(
     // output is ASCII, so no JSON escaping is needed.
     use core::fmt::Write as _;
     let mut head = CBuf::<64>::new();
-    let _ = write!(head, r#"{{"seq_hi":{},"dropped":{},"lines":""#, seq_hi, dropped);
+    let _ = write!(head, r#"{{"seq_hi":{},"dropped":{},"lines":"#, seq_hi, dropped);
     if head.overflowed() {
         log_w!("PageSync", "log upload envelope overflow");
         record_log_upload(false, fail_streak);
@@ -1666,6 +1666,20 @@ mod tests {
         assert_eq!(posted.len(), 1, "exactly one POST per attempt");
         assert!(posted[0].contains("/api/device-log"), "posted to the log endpoint");
         assert!(posted[0].contains("seq_hi"), "carries seq_hi");
+        // The whole point of the POST is a body the server can parse; a bare
+        // substring check did NOT catch the doubled-quote bug the final review
+        // found (every upload was a 422). Parse the body with the crate's own
+        // scanner and require the three fields the endpoint needs. The body is
+        // the third whitespace-separated token of the recorded "http_post" line.
+        let body = posted[0].splitn(3, ' ').nth(2).expect("http_post carries the body");
+        let b = body.as_bytes();
+        assert!(crate::json::skip_value(b, 0).is_some(), "body is well-formed JSON: {body}");
+        let hi = crate::json::member(b, 0, "seq_hi").and_then(|at| crate::json::int_value(b, at));
+        assert!(hi.is_some(), "seq_hi parses as an int: {body}");
+        let dr = crate::json::member(b, 0, "dropped").and_then(|at| crate::json::int_value(b, at));
+        assert!(dr.is_some(), "dropped parses as an int: {body}");
+        let ln = crate::json::member(b, 0, "lines").and_then(|at| crate::json::str_value(b, at));
+        assert!(matches!(ln, Some(s) if !s.is_empty()), "lines is a non-empty string: {body}");
     }
 
     #[test]
