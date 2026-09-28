@@ -24,17 +24,33 @@ constexpr uint32_t kMagic = 0x4c4f4731u;  // "LOG1"
 constexpr int kDataBytes = 2048;
 constexpr int kMaxLine = 256;             // one line's cap incl. NUL
 
+// One byte is reserved (kCapBytes = kDataBytes - 1) so that head == tail
+// unambiguously means EMPTY. Occupancy is then DERIVED from the two cursors
+// rather than stored: a stored counter is updated non-atomically with the bytes
+// it describes, and this buffer lives in `.rtc_noinit` — the one region a reset
+// mid-write is guaranteed to preserve — so a stored counter can go stale and
+// stay stale into the next boot. Cursor-derived occupancy cannot.
+constexpr int kCapBytes = kDataBytes - 1;
+// An absurd (or torn) `len` field can make the drop step a multiple of
+// kDataBytes, which would stall the make-room loop forever; every walk is
+// bounded by this, the most frames that can physically fit.
+constexpr int kMaxFrames = kDataBytes / 6 + 1;
+
 struct Ring {
     uint32_t magic;
     uint32_t seq;      // next line number to assign
     uint32_t head;     // write offset into data[]
     uint32_t tail;     // acked offset into data[]
-    uint32_t used;     // bytes held; head==tail is NOT empty-vs-full safe alone
     uint32_t dropped;  // lines lost to overwrite
     uint8_t  data[kDataBytes];
 };
 
 RTC_NOINIT_ATTR static Ring g_ring;
+
+// Bytes currently held: derived, so it cannot disagree with the cursors.
+inline uint32_t ring_used_locked() {
+    return (g_ring.head + kDataBytes - g_ring.tail) % kDataBytes;
+}
 
 portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 vprintf_like_t g_prev_vprintf = nullptr;
@@ -46,7 +62,6 @@ inline void ensure_init_locked() {
         g_ring.seq = 0;
         g_ring.head = 0;
         g_ring.tail = 0;
-        g_ring.used = 0;
         g_ring.dropped = 0;
     }
 }
@@ -69,35 +84,36 @@ void ring_copy_out(uint8_t* dst, uint32_t at, int n) {
 }
 
 // Append one framed line. Caller holds the mux.
+//
+// The frame is written at `head` and `head` is advanced LAST: a reset inside
+// this function therefore leaves no half-frame inside [tail, head), so the next
+// boot simply reads the previous backlog.
 void push_locked(const char* text, int len) {
     if (len <= 0) return;
     if (len > kMaxLine - 1) len = kMaxLine - 1;
     const int frame = 4 + 2 + len;
-    if (frame > kDataBytes) return;
+    if (frame > kCapBytes) return;  // cannot be stored at all
 
-    // Make room from the tail until it fits. Occupancy is tracked explicitly:
-    // with head/tail alone a ring holding exactly kDataBytes bytes has
-    // head == tail and is indistinguishable from empty, which would discard
-    // the whole backlog and never count it as dropped.
-    while (g_ring.used + (uint32_t)frame > kDataBytes) {
-        if (g_ring.used == 0) break;  // nothing left to drop
+    // Make room from the tail. Bounded twice: by the cursor-derived occupancy
+    // (so it stops when genuinely empty) and by an explicit frame cap (so a
+    // garbage `len` whose step is a multiple of kDataBytes cannot stall it).
+    for (int guard = 0; guard <= kMaxFrames; guard++) {
+        if (ring_used_locked() + (uint32_t)frame <= (uint32_t)kCapBytes) break;
+        if (g_ring.tail == g_ring.head) break;  // empty and still too big
         uint16_t old_len = 0;
         ring_copy_out((uint8_t*)&old_len, (g_ring.tail + 4) % kDataBytes, 2);
-        const uint32_t step = 4 + 2 + old_len;
+        uint32_t step = 4 + 2 + old_len;
+        if (step < 6 || step > (uint32_t)kDataBytes) step = 6;  // absurd len: skip the header only
         g_ring.tail = (g_ring.tail + step) % kDataBytes;
-        g_ring.used -= step;
         g_ring.dropped++;
     }
 
     const uint32_t seq = g_ring.seq++;
     uint16_t len16 = (uint16_t)len;
     ring_copy_in(g_ring.head, (const uint8_t*)&seq, 4);
-    g_ring.head = (g_ring.head + 4) % kDataBytes;
-    ring_copy_in(g_ring.head, (const uint8_t*)&len16, 2);
-    g_ring.head = (g_ring.head + 2) % kDataBytes;
-    ring_copy_in(g_ring.head, (const uint8_t*)text, len);
-    g_ring.head = (g_ring.head + (uint32_t)len) % kDataBytes;
-    g_ring.used += (uint32_t)frame;
+    ring_copy_in((g_ring.head + 4) % kDataBytes, (const uint8_t*)&len16, 2);
+    ring_copy_in((g_ring.head + 6) % kDataBytes, (const uint8_t*)text, len);
+    g_ring.head = (g_ring.head + (uint32_t)frame) % kDataBytes;  // publish last
 }
 
 int capture_hook(const char* fmt, va_list args) {
@@ -124,12 +140,12 @@ int capture_hook(const char* fmt, va_list args) {
 
 }  // namespace
 
-// The check and the exchange run under the same mux, so a concurrent second
-// caller cannot both install and end up with g_prev_vprintf == capture_hook
-// (which would forward to itself and recurse without bound). Safe to hold the
-// leaf lock across esp_log_set_vprintf: it is a single __atomic_exchange_n
-// (log/src/os/log_write.c:19-26), no logging, no other lock.
 extern "C" void rf_logbuf_install_hook(void) {
+    // The check AND the exchange are under the lock: a concurrent second caller
+    // could otherwise observe the hook installed and capture capture_hook as
+    // `g_prev_vprintf`, making the hook forward to itself (unbounded recursion).
+    // esp_log_set_vprintf is a single __atomic_exchange_n, so holding this leaf
+    // lock across it is safe.
     portENTER_CRITICAL(&g_mux);
     if (!g_hook_installed) {
         g_prev_vprintf = esp_log_set_vprintf(&capture_hook);
@@ -153,13 +169,12 @@ extern "C" void rf_logbuf_read(char* out, int cap, uint32_t* out_seq_lo, uint32_
     ensure_init_locked();
     int written = 0;
     int at = (int)g_ring.tail;
-    // Bound the walk by the byte budget, NOT by `at != head`: a ring holding
-    // exactly kDataBytes bytes has head == tail, and a cursor comparison would
-    // read that full ring as empty.
-    int remaining = (int)g_ring.used;
+    // Walk the occupancy span, bounded by both the span and a frame cap: the
+    // span alone would stall on a torn/garbage length field.
+    uint32_t remaining = ring_used_locked();
     uint32_t lines = 0;
     uint32_t first_seq = 0;
-    while (remaining >= 6) {
+    for (int guard = 0; guard <= kMaxFrames && remaining >= 6; guard++) {
         uint32_t seq = 0;
         uint16_t len = 0;
         ring_copy_out((uint8_t*)&seq, (uint32_t)at, 4);
@@ -167,11 +182,12 @@ extern "C" void rf_logbuf_read(char* out, int cap, uint32_t* out_seq_lo, uint32_
         ring_copy_out((uint8_t*)&len, (uint32_t)at, 2);
         at = (at + 2) % kDataBytes;
         if (written + (int)len + 1 >= cap) break;
+        if (6u + len > remaining) break;  // never read past the span
         ring_copy_out((uint8_t*)out + written, (uint32_t)at, len);
         written += len;
         out[written++] = '\n';
         at = (at + len) % kDataBytes;
-        remaining -= 4 + 2 + (int)len;
+        remaining -= 6u + len;
         if (lines == 0) first_seq = seq;
         lines++;
     }
@@ -191,23 +207,20 @@ extern "C" void rf_logbuf_ack(uint32_t seq_hi) {
     portENTER_CRITICAL(&g_mux);
     ensure_init_locked();
     int at = (int)g_ring.tail;
-    // Same budget-driven walk as read: `at != head` cannot distinguish a full
-    // ring from an empty one.
-    int remaining = (int)g_ring.used;
-    while (remaining >= 6) {
+    // Same bounded walk as read.
+    uint32_t remaining = ring_used_locked();
+    for (int guard = 0; guard <= kMaxFrames && remaining >= 6; guard++) {
         uint32_t seq = 0;
         uint16_t len = 0;
         ring_copy_out((uint8_t*)&seq, (uint32_t)at, 4);
         at = (at + 4) % kDataBytes;
         ring_copy_out((uint8_t*)&len, (uint32_t)at, 2);
         if (seq > seq_hi) break;
-        // `at` points at the len field; the next frame starts 2 + len later,
-        // and the whole frame (which `used` counts) is 4 + 2 + len.
-        const uint32_t step = 4 + 2 + len;
+        if (6u + len > remaining) break;
+        // `at` points at the len field; the next frame starts 2 + len later.
         at = (at + 2 + len) % kDataBytes;
-        g_ring.used -= step;
         g_ring.tail = at;
-        remaining -= (int)step;
+        remaining -= 6u + len;
     }
     portEXIT_CRITICAL(&g_mux);
 }
@@ -216,6 +229,6 @@ extern "C" void rf_logbuf_stats(uint32_t* dropped, uint32_t* used) {
     portENTER_CRITICAL(&g_mux);
     ensure_init_locked();
     if (dropped) *dropped = g_ring.dropped;
-    if (used) *used = g_ring.used;
+    if (used) *used = ring_used_locked();
     portEXIT_CRITICAL(&g_mux);
 }
