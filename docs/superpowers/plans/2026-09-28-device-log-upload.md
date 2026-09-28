@@ -602,12 +602,12 @@ from . import devicelog
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `cd server && .venv/bin/python -m pytest tests/test_device_log.py -q`
-Expected: PASS（16 passed = Task 1 的 6 + Task 2 的 10）
+Expected: PASS（18 passed = Task 1 的 8 + Task 2 的 10）
 
 - [ ] **Step 6: 跑全量服务端测试确认没打破既有契约**
 
 Run: `cd server && .venv/bin/python -m pytest tests/ -q`
-Expected: PASS（302 + 16 = 318 左右）
+Expected: PASS（302 + 18 = 320 左右）
 
 - [ ] **Step 7: 从端点抓一次真实响应，确认 `policy` 字段形状**
 
