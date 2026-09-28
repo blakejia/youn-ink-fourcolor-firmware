@@ -314,6 +314,8 @@ git commit -m "feat(server): device log mirror with rotation and tail"
   - HTTP `POST /api/devices/{device_id}/log-upload` body `{"value": 1|0|null}` → 200 `{"log_upload": 1|0|null}`
   - HTTP `GET /api/devices/{device_id}/logs?tail=N` → 200 `{"lines": [...], "truncated": bool}`
   - schedule 响应 `policy.log_upload: null | 1 | 0`
+  - schedule 响应顶层 `local_log_upload: 0|1|2`（`lo=` 回显）
+  - `registry.set_local_log_upload(device_id, value: Optional[int])` / `registry.get_local_log_upload(device_id) -> Optional[int]`——**持久化**最近一次 `lo=`，并随 `/api/devices` 行输出（列 `local_log_upload`，可空）。原因：`local_log_upload` 若只活在设备 token 的 schedule 响应里，运维端永远读不到（`/api/pages/schedule` 对 operator token 返回 401），Task 7 的覆盖提示就永远渲染不出来。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -482,6 +484,15 @@ Expected: FAIL — 新用例 404 / KeyError（端点与字段尚不存在）
         except sqlite3.OperationalError as exc:
             if "duplicate column name" not in str(exc):
                 raise
+        # The device's own switch opinion, persisted from the `lo=` uplink so
+        # the operator UI can explain a service setting that appears to do
+        # nothing. It must be durable: the only other carrier is the
+        # device-token schedule response, which an operator token cannot read.
+        try:
+            self._conn.execute("ALTER TABLE devices ADD COLUMN local_log_upload INTEGER")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
 ```
 
 然后加两个方法（注意 `None` 的语义是「无意见」，不是「关」）：
@@ -498,6 +509,27 @@ Expected: FAIL — 新用例 404 / KeyError（端点与字段尚不存在）
                 "UPDATE devices SET log_upload = ? WHERE device_id = ?",
                 (value, device_id),
             )
+
+    def set_local_log_upload(self, device_id: str, value: Optional[int]) -> None:
+        """Persist the device's own opinion from the `lo=` uplink (0/1/2)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET local_log_upload = ? WHERE device_id = ?",
+                (value, device_id),
+            )
+
+    def get_local_log_upload(self, device_id: str) -> Optional[int]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT local_log_upload FROM devices WHERE device_id = ?", (device_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            raw = row["local_log_upload"]
+        except (IndexError, KeyError):
+            return None
+        return None if raw is None else int(raw)
 
     def get_log_upload(self, device_id: str) -> Optional[int]:
         """The service-side opinion: None (no opinion) / 1 / 0.
@@ -597,7 +629,18 @@ from . import devicelog
         local_lo = _u32("lo")
 ```
 
-并在返回值里加 `"local_log_upload": local_lo,`（与 `"power": power` 同级）。
+并在返回值里加 `"local_log_upload": local_lo,`（与 `"power": power` 同级）。**同时把 `local_lo` 持久化**——运维端读不到这个响应，它必须落到设备行上：
+
+```python
+        # The device's opinion must outlive this request: an operator token
+        # cannot read this endpoint (401), so the UI's only source is the
+        # device row. Absent `lo=` (old firmware) leaves the stored value
+        # alone rather than clearing it.
+        if qp.get("lo") is not None:
+            registry.set_local_log_upload(dev.device_id, local_lo)
+```
+
+`Device` 数据类再加字段 `local_log_upload: Optional[int] = None`，并在三处行映射（`get`/`get_device_by_token`/`list_all`）带上该列（照 `log_upload=self.get_log_upload(...)` 的写法）。`dict(d.__dict__)` 会自动把它输出到 `/api/devices`，Task 7 的 `d.local_log_upload` 因此可用。
 
 - [ ] **Step 5: 跑测试确认通过**
 
