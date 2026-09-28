@@ -1644,23 +1644,23 @@ fn log_upload_try_once() -> bool {
     // The device's own switch opinion rides every schedule poll (spec §5):
     // the server echoes it back and the admin UI can say "the device has it
     // off" instead of an enabled service setting that appears to do nothing.
-    // Path budget: current ~93 B, limit 160, `&lo=2` adds 5 B — plenty.
+    // Path budget: current ~93 B, limit 160 (159 usable), `&lo=2` adds 5 B;
     let lo = unsafe { shim::rf_log_upload_local_get() };
     let _ = write!(path, "&lo={}", lo);
 ```
 
-注意：直接读 `rf_log_upload_local_get()`，**不要**复用 `Inputs` 的构造（`fetch_schedule` 在上行时还没有 `used`/`lines`）。三态不能折平：未设置 = 0（无意见），服务端只在显式 `lo=` 时才落库。
+注意：直接读 `rf_log_upload_local_get()`，**不要**复用 `Inputs` 的构造（`fetch_schedule` 在上行时还没有 `used`/`lines`）。三态不能折平：未设置 = 0（无意见），服务端只在显式 `lo=` 时才落库。路径预算最坏情况约 **149 B**（5 个 u32 电源计数 + 2 个 u32 面板计数 + rr + v/p/c + `&lo=2`），对 `CBuf::<160>` 的 159 可用字节余量约 10 B。
 
 - [ ] **Step 6: 装钩子**
 
-`application.cc` 的 `app_main` 之后最早期（`Application::Initialize` 之前）加一次：
+在 `main.cc` 的 `app_main` 里、`Application::GetInstance().Initialize()` **之前**加一次（修订：原写 `application.cc`，落地时改为 `main.cc:108`——钩子要抓住 Initialize 之前的第一条日志；`main.cc:19` 声明，`main.cc:111` Initialize）：
 
 ```cpp
     // Capture logs from the very first boot line; idempotent.
     rf_logbuf_install_hook();
 ```
 
-（需在 `application.cc` 顶部声明 `extern "C" void rf_logbuf_install_hook(void);`。）
+（在 `main.cc` 顶部声明 `extern "C" void rf_logbuf_install_hook(void);`，不要在 `application.cc`。）
 
 - [ ] **Step 7: 双门禁**
 
