@@ -62,6 +62,7 @@ set(SOURCES
     "common/holiday_fetcher.cc"
     "common/server_pairing.cc"
     "rust/shim.cpp"
+    "rust/shim_log.cpp"
     "common/http_client_wrapper.cc"
     "ui/renderers/rawdraw/ebook_renderer.cc"
     "ui/renderers/rawdraw/chat_renderer.cc"
