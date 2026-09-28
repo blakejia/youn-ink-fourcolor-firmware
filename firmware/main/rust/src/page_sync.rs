@@ -1683,6 +1683,36 @@ mod tests {
     }
 
     #[test]
+    fn the_drop_marker_is_reported_once_per_batch() {
+        // g_ring.dropped is cumulative; acking a batch must account for the
+        // drops it carried, or every later batch re-stamps the same stale
+        // total into the file (the final-review P2). First upload reports the
+        // backlog's drops; the next reports only what dropped in between.
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_log_opinion(log_upload_policy::OPINION_ON, log_upload_policy::OPINION_NONE);
+        shim::host::stage_log_lines(&["first batch"]);
+        shim::host::script_get("/api/device-log", 201, b"{}");
+
+        let dropped_of = |posted: &[String]| {
+            let body = posted[0].splitn(3, ' ').nth(2).unwrap();
+            let b = body.as_bytes();
+            crate::json::member(b, 0, "dropped").and_then(|at| crate::json::int_value(b, at))
+        };
+
+        assert!(log_upload_try_once());
+        let first = shim::host::calls_matching("http_post");
+        assert_eq!(dropped_of(&first), Some(3), "the first batch carries the backlog's drops");
+
+        // A second batch with no new drops must report 0, not the stale 3.
+        shim::host::stage_log_lines(&["second batch"]);
+        assert!(log_upload_try_once());
+        let all = shim::host::calls_matching("http_post");
+        assert_eq!(all.len(), 2, "two uploads");
+        assert_eq!(dropped_of(&all[1..]), Some(0), "ack accounted for the earlier drops");
+    }
+
+    #[test]
     fn a_rejected_upload_keeps_the_lines_and_advances_the_streak() {
         // read does not move the tail: a failed upload must leave the lines
         // pending, or the device silently discards the crash we wanted.

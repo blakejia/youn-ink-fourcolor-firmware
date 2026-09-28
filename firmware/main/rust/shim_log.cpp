@@ -231,6 +231,10 @@ extern "C" void rf_logbuf_ack(uint32_t seq_hi) {
         g_ring.tail = at;
         remaining -= 6u + len;
     }
+    // `dropped` is reported per upload; once a batch is acked the drops it
+    // carried are accounted for, so reset the counter or every later batch
+    // would re-stamp the same stale total (final-review P2).
+    g_ring.dropped = 0;
     portEXIT_CRITICAL(&g_mux);
 }
 

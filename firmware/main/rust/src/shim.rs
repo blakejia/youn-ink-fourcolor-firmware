@@ -315,6 +315,7 @@ pub(crate) mod host {
         *LOG_OPINION.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0);
         *LOG_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = (-1, 0);
         *LOG_ACKED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *LOG_DROPPED.lock().unwrap_or_else(|e| e.into_inner()) = 3;
         *POWER.lock().unwrap_or_else(|e| e.into_inner()) = [0; 5];
         AUDIO_ON.store(true, std::sync::atomic::Ordering::SeqCst);
         guard
@@ -995,6 +996,10 @@ pub(crate) mod host {
     static LOG_FAIL: Mutex<(i64, u32)> = Mutex::new((-1, 0));
     /// Highest seq handed to `rf_logbuf_ack`, or None when never acked.
     static LOG_ACKED: Mutex<Option<u32>> = Mutex::new(None);
+    /// Lines dropped to overwrite since the last ack (mirrors g_ring.dropped:
+    /// cumulative per-upload, reset on ack so a later batch does not re-stamp
+    /// a stale total).
+    static LOG_DROPPED: Mutex<u32> = Mutex::new(3);
 
     /// Stage the lines the next `rf_logbuf_read` will return.
     pub fn stage_log_lines(lines: &[&str]) {
@@ -1061,6 +1066,8 @@ pub(crate) mod host {
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_logbuf_ack(seq_hi: u32) {
         *LOG_ACKED.lock().unwrap_or_else(|e| e.into_inner()) = Some(seq_hi);
+        // Mirror shim_log.cpp: acking a batch accounts for its drops.
+        *LOG_DROPPED.lock().unwrap_or_else(|e| e.into_inner()) = 0;
     }
 
     #[unsafe(no_mangle)]
@@ -1068,7 +1075,7 @@ pub(crate) mod host {
         let g = LOG_RING.lock().unwrap_or_else(|e| e.into_inner());
         let used_bytes: usize = g.iter().map(|l| l.len() + 1).sum();
         if !dropped.is_null() {
-            unsafe { *dropped = 3 };
+            unsafe { *dropped = *LOG_DROPPED.lock().unwrap_or_else(|e| e.into_inner()) };
         }
         if !used.is_null() {
             unsafe { *used = used_bytes as u32 };
