@@ -237,8 +237,9 @@ EPD 锁语义；Wi-Fi 的缓存/快连/重连拆分与 `endpoint_missing` 处理
   `firmware/main/rust/target/`、`firmware/managed_components/`、`firmware/sdkconfig`、
   `frontend/dist/`、`node_modules/`、`.env`、`*.bin`、`*.elf`、`*.map`、`*.zip`、
   `server/*.log`、`server/*.db`、`server/data/{uploads,images}/`、`.worktrees/`。
-- 注意 `server/data/pages/` 是**混合目录**：`*.bin`（渲染产物）与 `*.bmp.json`
-  不入库，但 `server/data/pages/<device>/*.json`（页面源文件）**属于版本控制**。
+- 注意 `server/data/pages/` 是**混合目录**：只有 `*.bin`（渲染产物，`gitignore:74`）
+  不入库；`*.bmp.json`（内容寻址元数据）与 `server/data/pages/<device>/*.json`
+  （页面源文件）都**属于版本控制**。服务端每 30 分钟推页会 churn 这两类文件。
 - 需要隔离工作区时用 git worktree（`.worktrees/` 已忽略），普通 checkout 先问用户。
 
 ---
