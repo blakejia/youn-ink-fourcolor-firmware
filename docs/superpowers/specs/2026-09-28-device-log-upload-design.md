@@ -130,14 +130,15 @@ esp_log(config, tag, LOG_FORMAT(I, format), esp_log_timestamp(), tag, ##__VA_ARG
 ```rust
 #[repr(C)]
 pub struct Inputs {
-    pub enabled: u8,         /* 开关，来自 schedule 响应 */
+    /* 两个开关都是三态：0 = 无意见, 1 = 明确关, 2 = 明确开（见 §5 合成语义）。 */
+    pub local_set: u8,       /* 设备侧设置菜单（NVS） */
+    pub server_set: u8,      /* schedule 响应 policy.log_upload */
     pub has_pending: u8,
     pub wifi_ready: u8,
-    _pad: [u8; 1],           /* 补齐到 4 */
     pub pending_bytes: u32,  /* @4  */
     pub pending_lines: u32,  /* @8  */
     pub fail_streak: u32,    /* @12 */
-    _pad2: [u8; 4],          /* @16, 补齐到 8 以对齐 i64 */
+    _pad: [u8; 4],           /* @16, 补齐到 8 以对齐 i64 */
     pub last_fail_s: i64,    /* @24 */
     pub now_s: i64,          /* @32 */
 }                            /* size == 40，8 字节对齐 */
@@ -148,15 +149,34 @@ pub enum Action {
 }
 ```
 
+合成（独立函数，可单独测）：
+
+```rust
+pub const OPINION_NONE: u8 = 0;
+pub const OPINION_OFF: u8 = 1;
+pub const OPINION_ON: u8 = 2;
+
+/// 服务端明确 → 服务端；否则本地明确 → 本地；都无意见 → 关。
+pub fn resolve_enabled(local_set: u8, server_set: u8) -> bool {
+    match server_set {
+        OPINION_ON => true,
+        OPINION_OFF => false,
+        _ => local_set == OPINION_ON,
+    }
+}
+```
+
 决策表（顺序即优先级，与 `power.rs` 同风格）：
 
 | 条件 | Action | reason |
 | --- | --- | --- |
-| `enabled == 0` | Skip | `"disabled"` |
+| `resolve_enabled(...) == false` | Skip | `"disabled"` |
 | `has_pending == 0` | Skip | `"empty"` |
 | `wifi_ready == 0` | Skip | `"no_net"` |
 | 退避未到期 | Skip | `"backoff"` |
 | 否则 | Upload | — |
+
+- **关掉时 `resolve_enabled` 必须先判**，两态合成失败（都无意见）也走 `"disabled"`，与「默认关闭」一致。
 
 - **退避复用既有模式**（60 s → ×2 → 上限 900 s；失败递增、成功清零），与 `notify_policy` 一致，不发明第二套约定。
 - **分段上限 1024 B/次**：单次 HTTP 在深睡周期内有超时预算（`notify.rs` 用 10 s），且请求体要能放进定长缓冲。
@@ -171,13 +191,29 @@ pub enum Action {
 
 ## 5. 服务端
 
-### 开关状态
+共有**两个**开关：设备侧（本地，面板设置菜单）与服务端（后台 UI）。两者都是信任点；**冲突时以服务端为准**。
 
-`devices` 表加列 `log_upload INTEGER DEFAULT 0`，读写照 `set_power_counters`/`get_power_counters`（`server/youn_server/devices.py:303-322`）。
+### 合成语义（三态，可判定）
 
-### 下发
+「冲突」要求两侧都表达过意见，所以服务端开关是**可空三态**，不是布尔：
 
-`get_schedule` 的 `policy` 块加 `"log_upload": 0|1`（`server/youn_server/app.py:678-687`）。
+| 服务端 | 本地 | 生效 | 依据 |
+| --- | --- | --- | --- |
+| 明确开 / 明确关 | 任意 | **服务端** | 冲突以服务端为准 |
+| 无意见（`NULL`） | 开 / 关 | **本地** | 无冲突 |
+| 无意见 | 无意见 | 关 | 两侧都未表达 |
+
+服务端列因此是 `log_upload INTEGER DEFAULT NULL`（`NULL` = 无意见），**不是** `DEFAULT 0`——后者等于「永远有意见」，会让本地开关彻底失效，与「两侧都能开」矛盾。后台 UI 相应是三态控件（开 / 关 / 跟随设备）。
+
+设备侧本地开关存 NVS（`Settings` 类，`firmware/main/settings.h`），新增设置项照 `Kind::Toggle` 机制（`settings_menu.h:69-87` 加 `RF_SETTINGS_ITEM_LOG_UPLOAD = 12`；Rust 菜单模型在 `settings.rs`，模板是 `ITEM_WIFI_TOGGLE`）。
+
+**本地开关必须落 NVS，不能照抄 Wi-Fi 开关。** 现有的 `g_wifi_switch_intent`（`application.cc:145`）是 RAM 静态量、不持久化；设备每 10 分钟深睡一次会掉 RAM，本地设置会静默失效。
+
+### 下发与回传
+
+- 下发：`get_schedule` 的 `policy` 块加 `"log_upload": null | 1 | 0`（`app.py:678-687`）。
+- 回传：schedule **上行**加 `&lo=<0|1|2>`（本地意见：0 无意见、1 关、2 开）。实测 path 现在 93 B、上限 160；最坏情况（各计数器取 u32 最大值）加 `&lo=2` 后 125 B，余量充足。
+- 后台据此显示状态：服务端明确关且本地开 → 「设备端已开（服务端已覆盖）」。**没有这个回传，运维看到「关」会以为自己没点上。**
 
 ### 上行端点
 
@@ -207,9 +243,10 @@ pub enum Action {
 
 ## 6. 前端
 
-- `frontend/src/pages/Devices.jsx` 表格加一列「日志上报」，用既有 `BusyButton` 范式（`:321-328`）。默认关，按钮显示「开启」。
+- `frontend/src/pages/Devices.jsx` 表格加一列「日志上报」。**三态控件**（开 / 关 / 跟随设备），对应服务端的 `1 / 0 / NULL`；照既有 `BusyButton` 范式（`:321-328`）。
+- 该列同时显示**生效结果**与**本地意见**（后者来自 schedule 上行的 `lo=`）：例如服务端明确关、本地明确开 → 「服务端已覆盖：设备端已开」。只看服务端值会让运维以为没点上。
 - 日志查看复用 `BatteryDetail` 的弹窗范式（`:437` 一族）：等宽 `pre`、显示服务端时间戳列、顶部显示「共 N 行 / 已截断」、一个手动刷新按钮（**不做自动轮询**）。
-- `frontend/src/api.js` 加 `deviceLogEnabled(id, enabled)` 与 `deviceLogs(id, tail)`。既有 `request()` 在非 JSON 时返回 `Response`（`api.js:21-23`），拿到后自行 `.text()`，**无需改 `request()`**。
+- `frontend/src/api.js` 加 `setLogUpload(id, value)`（`value` 为 `true`/`false`/`null`）与 `deviceLogs(id, tail)`。既有 `request()` 在非 JSON 时返回 `Response`（`api.js:21-23`），`deviceLogs` 自行 `.json()`，**无需改 `request()`**。
 - **UI 必须标明**：正文里的 `(27930)` 是设备 uptime，不是墙钟；行首才是服务端接收时刻。
 - 重建前端后**必须重启服务端**（`frontend/dist` 在 app 启动时挂载）。
 
@@ -217,11 +254,12 @@ pub enum Action {
 
 每步独立可验证、独立提交、可单独回滚。
 
-1. **服务端**：列 + 两端点 + 下发 + 目录 + 轮转 + pytest。可先脱离固件用 curl 验证。
+1. **服务端**：可空列 + 两端点 + `policy.log_upload` 三态下发 + 目录 + 轮转 + pytest。可先脱离固件用 curl 验证。
 2. **固件 C++**：缓冲 + 钩子 + ABI + 布局契约测试。
-3. **固件 Rust**：`log_upload_policy.rs` + 单测 + 接线。
-4. **前端**：开关列 + 弹窗 + `api.js`。
-5. **端到端真机验收**：打开开关 → 日志到达；制造一次复位 → 崩溃前日志仍在。
+3. **固件 Rust**：`log_upload_policy.rs`（含 `resolve_enabled` 合成）+ 单测 + 接线；schedule 上行加 `&lo=`。
+4. **固件本地开关**：`settings_menu.h` 新项 + `settings.rs` 菜单 + NVS 读写 + 设置页 Toggle 接线。
+5. **前端**：三态控件 + 弹窗 + `api.js`。
+6. **端到端真机验收**：两侧开关的四种组合各验一遍；制造一次复位 → 崩溃前日志仍在。
 
 ### 测试要求（沿用既有纪律）
 
