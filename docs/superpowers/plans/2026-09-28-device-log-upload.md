@@ -1703,6 +1703,7 @@ git commit -m "feat(firmware): wire log capture, switch parsing and periodic upl
 - Modify: `firmware/main/rust/include/settings_menu.h`（item 枚举）
 - Modify: `firmware/main/rust/src/settings.rs`（菜单项 + `ITEM_*` 常量 + 切换规则 + 单测）
 - Modify: `firmware/main/application.cc`（Toggle 分支：写 NVS + 重绘）
+- Modify: `firmware/main/rust/include/shim_log.h`（`rf_log_upload_local_get/set` 的 C 声明——在 shim.cpp 实现但原本没有头文件，application.cc 直接用会编译失败；修订补入，D1）
 - Test: `firmware/main/rust/src/settings.rs` 的 `mod tests`
 
 **Interfaces:**
@@ -1801,7 +1802,7 @@ Run:
 ```bash
 cd firmware/main/rust && export PATH="$HOME/.cargo/bin:$PATH" && cargo test
 ```
-Expected: PASS
+Expected: PASS。**注意**：加一行 `NETWORK_ITEMS` 会改 3 个既有设置测试的断言（行清单、`密码` 是最后一条、钳位锚点）——它们断言的是可观察行为，应**更新到新行**而非删除；并补一条 0->3->7 的光标遍历断言（D2）。
 
 Run:
 ```bash
@@ -1815,7 +1816,7 @@ Expected: `Project build complete`
 - [ ] **Step 6: 提交**
 
 ```bash
-git add firmware/main/rust/include/settings_menu.h firmware/main/rust/src/settings.rs firmware/main/application.cc
+git add firmware/main/rust/include/settings_menu.h firmware/main/rust/include/shim_log.h firmware/main/rust/src/settings.rs firmware/main/application.cc
 git commit -m "feat(firmware): device-side log-upload switch in the settings menu"
 ```
 
