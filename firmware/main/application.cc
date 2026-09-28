@@ -46,6 +46,10 @@ extern "C" void ZectrixRtcDisarmAwakeWatchdog();
 extern "C" void ZectrixRtcSetEpoch(uint32_t epoch);
 extern "C" int ZectrixRtcNowEpoch(uint32_t* epoch);
 extern "C" uint32_t ZectrixAwakeWatchdogFired();
+// Log ring capture hook (rust/shim_log.cpp): chained onto the ESP_LOG vprintf
+// so every formatted line lands in the RTC buffer, including the ones that
+// precede this translation unit.
+extern "C" void rf_logbuf_install_hook(void);
 
 // RTC slow-memory retains this stamp across deep-sleep wakes; it is cleared
 // only by a cold reset/power loss. SNTP's success callback updates it.
@@ -442,6 +446,9 @@ Application::~Application() {
 }
 
 void Application::Initialize(bool quiet) {
+    // Capture logs from the very first boot line, before anything below can
+    // log. Idempotent, so a re-entry is harmless.
+    rf_logbuf_install_hook();
     // Quiet is honoured only on a provisioned AND paired device: the
     // provisioning and pairing pages are rendered by the UI manager, so a
     // quiet boot there would strand the user in a flow with no screen.
@@ -1217,6 +1224,12 @@ void Application::RunPowerCycle() {
     // could observe a half-finished cycle.
     sync_attempted_ = true;
     sync_result_ok_ = page_sync_sync_once();
+    // Task 5: one log-upload attempt inside the same radio window, right
+    // after the schedule sync. Gated in Rust (both switch opinions, ring
+    // occupancy, backoff), so this call is cheap when disabled and the HTTP
+    // only runs when the policy says upload. The ring is acked only on 201,
+    // so a failure keeps the lines for the next wake.
+    page_sync_log_upload_once();
     // Task 4: only when the server says something is waiting — an empty poll
     // is a whole radio round-trip for nothing. Absent-safe: an old server
     // sends no field, which reads as pending (behave as today: fetch).

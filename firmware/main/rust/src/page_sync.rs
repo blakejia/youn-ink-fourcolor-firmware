@@ -15,8 +15,12 @@ use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+
 use crate::battery_activity_policy;
 use crate::json;
+use crate::log_upload_policy;
 use crate::page_compare_policy;
 use crate::protocol_parse;
 use crate::{log_e, log_i, log_w};
@@ -304,6 +308,11 @@ pub struct ParsedSchedule {
     /// empty `/api/notifications/next` poll). Absent = old server = true,
     /// i.e. behave exactly as today (fetch).
     pub notify_pending: bool,
+    /// The service's log-upload opinion (Task 5), three-state:
+    /// OPINION_NONE / OFF / ON. `null` and an absent key both mean "no
+    /// opinion" — deliberately NOT the same as "off", or the device's own
+    /// switch could never take effect.
+    pub log_upload: u8,
 }
 
 const EMPTY_PAGE: ParsedPage = ParsedPage { md5: [0; MD5_LEN], duration_s: 0 };
@@ -358,6 +367,33 @@ pub fn parse_policy(body: &[u8]) -> Policy {
     Policy { poll_s, sleep_poll_s, screen_active }
 }
 
+/// The service's log-upload opinion from `policy.log_upload`, as a three-state
+/// value. Pure, so it is unit-tested on the host.
+///
+/// JSON `null` and an absent key BOTH mean "no opinion" (OPINION_NONE) — not
+/// "off". Collapsing the two would make the service permanently override the
+/// device's own switch, which is the whole point of a nullable column.
+///
+/// The distinction `int_value` cannot make: it parses with `parse::<i64>()`, so
+/// `null` and "key absent" both come back `None`. `member` does distinguish
+/// them — `None` = no such key, `Some(at)` = the key is there — and at that
+/// offset a leading `n` is the literal `null`.
+fn parse_log_upload_opinion(body: &[u8]) -> u8 {
+    let Some(at) = json::path(body, &["policy", "log_upload"]) else {
+        return log_upload_policy::OPINION_NONE;  // key absent = old server
+    };
+    if body.get(at) == Some(&b'n') {
+        return log_upload_policy::OPINION_NONE;  // explicit JSON null
+    }
+    match json::int_value(body, at) {
+        Some(1) => log_upload_policy::OPINION_ON,
+        Some(0) => log_upload_policy::OPINION_OFF,
+        // Anything else (a string, a float, an out-of-range number) is not an
+        // opinion we can act on; treat it as silence rather than guessing.
+        _ => log_upload_policy::OPINION_NONE,
+    }
+}
+
 /// Parse `/api/pages/schedule`. Pure, so it is unit-tested on the host.
 ///
 /// Entries without a usable md5/duration are skipped rather than failing the
@@ -380,6 +416,7 @@ pub fn parse_schedule(body: &[u8]) -> Option<ParsedSchedule> {
     let notify_pending = json::member(body, 0, "notify_pending")
         .and_then(|at| json::bool_value(body, at))
         .unwrap_or(true);
+    let log_upload = parse_log_upload_opinion(body);
     let mut out = ParsedSchedule {
         md5,
         pages: [EMPTY_PAGE; MAX_PAGES],
@@ -388,6 +425,7 @@ pub fn parse_schedule(body: &[u8]) -> Option<ParsedSchedule> {
         current_index,
         seconds_until_next_page,
         notify_pending,
+        log_upload,
     };
     json::for_each_item(body, pages_at, &mut |item| {
         if out.count >= MAX_PAGES {
@@ -477,6 +515,11 @@ fn sync_schedule(body: &[u8]) -> bool {
     // fast path below, which returns early: staleness here would pin an old
     // answer across wakes.
     NOTIFY_PENDING.store(parsed.notify_pending, Ordering::Release);
+    // Same reasoning for the log-upload opinion: commit on every parsed body,
+    // including the unchanged-md5 fast path below, so a service that stops
+    // sending the key falls back to "no opinion" instead of keeping a stale
+    // "on" forever.
+    log_upload_server_set(parsed.log_upload);
 
     let policy_changed = with_table(|t| {
         let prev = t.policy;
@@ -946,6 +989,139 @@ pub fn screen_active() -> bool {
 }
 
 
+// ── device log upload (Task 5) ──────────────────────────────────────────────
+// The decision lives in `log_upload_policy.rs` (pure); this owns the
+// orchestration: snapshot the ring, ask the gate, POST, and ack only what the
+// server accepted.
+
+/// The service's log-upload opinion from the last schedule response, as a
+/// three-state value. Kept in the RTC snapshot with the power counters, so a
+/// deep-sleep wake (RAM cleared) reads OPINION_NONE until the next sync.
+pub fn log_upload_server_get() -> u8 {
+    unsafe { shim::rf_log_upload_server_get() }
+}
+
+pub fn log_upload_server_set(v: u8) {
+    unsafe { shim::rf_log_upload_server_set(v) }
+}
+
+/// base64 of a 1536-byte read is 2048 chars, and the body adds the JSON
+/// envelope plus a NUL — 2048 is the spec's body budget for a 1024-byte cap,
+/// so the ring read is sized to fit it.
+const LOG_READ_BUF: usize = 1536;
+const LOG_BODY_BUF: usize = 2048;
+const LOG_URL_BUF: usize = 320;
+const LOG_HTTP_TIMEOUT_MS: i32 = 10_000;
+
+/// One upload attempt. Returns true when the server accepted the batch.
+///
+/// Caller must already hold no lock: HTTP can block for seconds.
+pub fn log_upload_try_once() -> bool {
+    let mut dropped = 0u32;
+    let mut used = 0u32;
+    unsafe { shim::rf_logbuf_stats(&mut dropped, &mut used) };
+
+    // Read BEFORE building the inputs: `rf_logbuf_read` is the only source
+    // that knows how many whole frames the pending bytes contain, and that
+    // count is what the ack arithmetic needs. Reading is a bounded byte copy
+    // under the ring lock — cheap, unlike the HTTP that `decide` gates.
+    // `seq_lo` is meaningful only when `lines > 0`.
+    let mut read_buf = CBuf::<LOG_READ_BUF>::new();
+    let mut seq_lo = 0u32;
+    let mut lines = 0u32;
+    unsafe {
+        shim::rf_logbuf_read(read_buf.as_mut_ptr(), LOG_READ_BUF as i32,
+                             &mut seq_lo, &mut lines);
+    }
+    read_buf.set_len_from_terminator();
+
+    let mut last_fail_s = -1i64;
+    let mut fail_streak = 0u32;
+    unsafe { shim::rf_log_upload_fail_state(&mut last_fail_s, &mut fail_streak) };
+    let inputs = log_upload_policy::Inputs {
+        // Both opinions are three-state: the schedule policy is 0=none/1=off/
+        // 2=on, and the device's own NVS switch uses the same encoding.
+        local_set: unsafe { shim::rf_log_upload_local_get() },
+        server_set: log_upload_server_get(),
+        has_pending: if used > 0 { 1 } else { 0 },
+        wifi_ready: 1,  // the caller only reaches here on a completed sync
+        pending_bytes: used,
+        pending_lines: lines,
+        fail_streak,
+        _pad: [0; 4],
+        last_fail_s,
+        now_s: unsafe { shim::rf_time_now_s() },
+    };
+    let d = unsafe { shim::rf_log_upload_decide(&inputs) };
+    if d.action != log_upload_policy::UPLOAD {
+        return false;
+    }
+    // A UPLOAD verdict with nothing to send: `pending_bytes` was non-zero but
+    // no whole frame fit the read buffer. Acking here would compute
+    // `seq_lo + 0 - 1` and underflow to 0xFFFFFFFF, acking the ENTIRE ring.
+    if lines == 0 {
+        log_w!("PageSync", "log upload gated on but no whole line fits; not acking");
+        return false;
+    }
+
+    // The gate caps the payload; take at most that many bytes of the read.
+    let take = (d.max_bytes as usize).min(read_buf.as_bytes().len());
+    let seq_hi = seq_lo + lines - 1;
+    let mut body = CBuf::<LOG_BODY_BUF>::new();
+    let mut b64 = [0u8; LOG_BODY_BUF];
+    let n = B64.encode_slice(&read_buf.as_bytes()[..take], &mut b64).unwrap_or(0);
+    if n == 0 {
+        log_w!("PageSync", "log base64 encode failed");
+        record_log_upload(false, fail_streak);
+        return false;
+    }
+    use core::fmt::Write as _;
+    let _ = write!(body, r#"{{"seq_hi":{},"dropped":{},"lines":"{}"}}"#,
+                   seq_hi, dropped,
+                   core::str::from_utf8(&b64[..n]).unwrap_or(""));
+    if body.overflowed() {
+        log_w!("PageSync", "log upload body overflow ({} B)", body.as_bytes().len());
+        record_log_upload(false, fail_streak);
+        return false;
+    }
+
+    let mut path = CBuf::<64>::new();
+    path.push("/api/device-log");
+    let mut url = CBuf::<LOG_URL_BUF>::new();
+    if unsafe { shim::rf_build_endpoint(path.as_ptr(), url.as_mut_ptr(), LOG_URL_BUF as i32) } == 0 {
+        log_w!("PageSync", "cannot build device-log endpoint");
+        record_log_upload(false, fail_streak);
+        return false;
+    }
+    let mut token = CBuf::<80>::new();
+    unsafe { shim::rf_get_token(token.as_mut_ptr(), 80) };
+    let mut resp = CBuf::<128>::new();
+    let mut resp_len = 128i32;
+    let status = unsafe {
+        shim::rf_http_post_json(url.as_ptr(), token.as_ptr(), body.as_ptr(),
+                                resp.as_mut_ptr(), &mut resp_len,
+                                LOG_HTTP_TIMEOUT_MS)
+    };
+    // 201 Created is the endpoint's declared success code.
+    if status == 201 {
+        unsafe { shim::rf_logbuf_ack(seq_hi) };
+        record_log_upload(true, fail_streak);
+        log_i!("PageSync", "log upload ok: {} lines, {} B", lines, take);
+        return true;
+    }
+    log_w!("PageSync", "log upload failed (status={}), {} lines stay pending",
+           status, lines);
+    record_log_upload(false, fail_streak);
+    false
+}
+
+/// Book one attempt's outcome for the backoff ladder: a success clears the
+/// streak, a failure advances it (capped, so the shift stays bounded).
+fn record_log_upload(ok: bool, streak: u32) {
+    let next = if ok { 0 } else { (streak + 1).min(8) };
+    unsafe { shim::rf_log_upload_fail_record(shim::rf_time_now_s(), if ok { 0 } else { 1 }, next) }
+}
+
 // ── C ABI ──────────────────────────────────────────────────────────────────
 
 /// # Safety
@@ -1025,6 +1201,13 @@ pub extern "C" fn page_sync_sync_ok() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn page_sync_notify_pending() -> bool {
     notify_pending()
+}
+
+/// One log-upload attempt inside the caller's power cycle. True when the
+/// server accepted the batch.
+#[unsafe(no_mangle)]
+pub extern "C" fn page_sync_log_upload_once() -> bool {
+    log_upload_try_once()
 }
 
 /// `policy.poll_interval_minutes * 60`.
@@ -1339,6 +1522,142 @@ mod tests {
         assert!(!sync_once());
         assert!(notify_pending(), "unparseable body must not reuse the stale false");
     }
+    /// `schedule_json` plus a `policy.log_upload` field carrying `raw`
+    /// verbatim, so a test can send `1`, `0` or JSON `null`.
+    fn schedule_json_log_upload_raw(raw: &str) -> Vec<u8> {
+        format!(
+            r#"{{"schedule_md5":"{}","policy":{{"log_upload":{}}},"pages":[]}}"#,
+            md5hex(0x11),
+            raw,
+        )
+        .into_bytes()
+    }
+
+    fn schedule_json_log_upload(n: i32) -> Vec<u8> {
+        schedule_json_log_upload_raw(&n.to_string())
+    }
+
+    fn schedule_json_log_upload_null() -> Vec<u8> {
+        schedule_json_log_upload_raw("null")
+    }
+
+    #[test]
+    fn schedule_policy_log_upload_is_parsed_as_three_states() {
+        // The service switch arrives in the policy block (the query string has
+        // no room: CBuf::<160> is already ~93 bytes and overflow voids the
+        // whole GET). null must survive as OPINION_NONE -- collapsing it to 0
+        // would make the service permanently override the local switch.
+        let _g = shim::host::lock();
+
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json_log_upload(1));
+        assert!(sync_once());
+        assert_eq!(log_upload_server_get(), log_upload_policy::OPINION_ON);
+
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json_log_upload(0));
+        assert!(sync_once());
+        assert_eq!(log_upload_server_get(), log_upload_policy::OPINION_OFF);
+
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json_log_upload_null());
+        assert!(sync_once());
+        assert_eq!(log_upload_server_get(), log_upload_policy::OPINION_NONE,
+                   "null is 'no opinion', not 'off'");
+
+        // Old firmware / old server: the key is absent entirely. Same meaning.
+        reset_for_test();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        assert!(sync_once());
+        assert_eq!(log_upload_server_get(), log_upload_policy::OPINION_NONE);
+    }
+
+    #[test]
+    fn an_accepted_upload_acks_exactly_the_lines_it_sent() {
+        // The ack arithmetic is the dangerous part: `seq_lo + lines - 1` with
+        // lines == 0 underflows to 0xFFFFFFFF and acks the whole ring.
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_log_opinion(log_upload_policy::OPINION_ON, log_upload_policy::OPINION_NONE);
+        shim::host::stage_log_lines(&["boot line", "sync line"]);
+        shim::host::script_get("/api/device-log", 201, b"{}");
+
+        assert!(log_upload_try_once(), "201 -> accepted");
+        // The stub reports seq_lo = 7 for 2 lines -> seq_hi = 8.
+        assert_eq!(shim::host::log_acked(), Some(8));
+        assert_eq!(shim::host::log_fail_state().1, 0, "success clears the streak");
+
+        let posted = shim::host::calls_matching("http_post");
+        assert_eq!(posted.len(), 1, "exactly one POST per attempt");
+        assert!(posted[0].contains("/api/device-log"), "posted to the log endpoint");
+        assert!(posted[0].contains("seq_hi"), "carries seq_hi");
+    }
+
+    #[test]
+    fn a_rejected_upload_keeps_the_lines_and_advances_the_streak() {
+        // read does not move the tail: a failed upload must leave the lines
+        // pending, or the device silently discards the crash we wanted.
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_log_opinion(log_upload_policy::OPINION_ON, log_upload_policy::OPINION_NONE);
+        shim::host::stage_log_lines(&["boot line"]);
+        shim::host::script_get("/api/device-log", 500, b"");
+
+        assert!(!log_upload_try_once(), "500 -> not accepted");
+        assert_eq!(shim::host::log_acked(), None, "nothing acked on failure");
+        assert_eq!(shim::host::log_fail_state().1, 1, "the streak climbs");
+    }
+
+    #[test]
+    fn a_zero_line_read_never_acks() {
+        // bytes pending but no whole frame fits: acking would underflow
+        // seq_lo + 0 - 1 and ack the entire ring.
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_log_opinion(log_upload_policy::OPINION_ON, log_upload_policy::OPINION_NONE);
+        shim::host::stage_log_lines(&[]);
+        shim::host::script_get("/api/device-log", 201, b"{}");
+
+        assert!(!log_upload_try_once());
+        assert_eq!(shim::host::log_acked(), None, "zero lines must not ack");
+    }
+
+    #[test]
+    fn a_disabled_switch_never_reaches_the_network() {
+        // Both sides silent resolves to off (log_upload_policy::decide), so
+        // the POST must not happen at all.
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_log_opinion(log_upload_policy::OPINION_NONE, log_upload_policy::OPINION_NONE);
+        shim::host::stage_log_lines(&["boot line"]);
+
+        assert!(!log_upload_try_once());
+        assert!(shim::host::calls_matching("http_post").is_empty(), "no POST when off");
+    }
+
+    #[test]
+    fn an_explicit_service_off_overrides_a_local_on() {
+        // Two separate tests, not two halves of one: the harness lock is a
+        // single Mutex, so a second `lock()` in the same test would deadlock.
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_log_opinion(log_upload_policy::OPINION_OFF, log_upload_policy::OPINION_ON);
+        shim::host::stage_log_lines(&["boot line"]);
+        assert!(!log_upload_try_once(), "an explicit service 'off' wins");
+        assert!(shim::host::calls_matching("http_post").is_empty());
+    }
+
+    #[test]
+    fn a_silent_service_defers_to_a_local_on() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_log_opinion(log_upload_policy::OPINION_NONE, log_upload_policy::OPINION_ON);
+        shim::host::stage_log_lines(&["boot line"]);
+        shim::host::script_get("/api/device-log", 201, b"{}");
+        assert!(log_upload_try_once(), "no service opinion -> the local switch decides");
+        assert_eq!(shim::host::log_acked(), Some(7));
+    }
+
     /// A bitmap body whose every byte is `fill`, so the framebuffer shows which
     /// page was blitted.
     fn bitmap_body(fill: u8) -> Vec<u8> {

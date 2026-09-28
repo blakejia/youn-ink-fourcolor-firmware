@@ -43,6 +43,7 @@
 #include "notify.h"
 #include "page_sync.h"
 #include "server_pairing.h"
+#include "settings.h"
 #include "rust/include/time_gate_policy.h"
 #include "rust/include/battery_activity_policy.h"
 
@@ -625,4 +626,49 @@ extern "C" void device_sign_pair_start(const char *device_id,
     devsig_sign(device_id, mac, (int64_t)time(NULL), nonce,
                 mac_out, mac_len, ts_out, ts_len,
                 nonce_out, nonce_len, sig_out, sig_len);
+}
+
+// ── device log upload switch + backoff stamps (Task 5) ──
+// The service opinion arrives in the schedule `policy.log_upload` and is
+// stored here in RTC slow memory: every duty-cycle sleep is a reboot that
+// clears RAM (same reason as g_fail_streak above). RTC_DATA_ATTR is zeroed
+// on cold boot, which reads as OPINION_NONE — the correct fresh start.
+RTC_DATA_ATTR static uint8_t g_log_upload_server_set;
+extern "C" uint8_t rf_log_upload_server_get(void) { return g_log_upload_server_set; }
+extern "C" void rf_log_upload_server_set(uint8_t v) { g_log_upload_server_set = v; }
+
+// Device-side log-upload switch, three-state expressed with two bools:
+// `present` records whether the holder ever stated an opinion, `on` its
+// direction. Unset => 0 (OPINION_NONE), so the service switch can decide.
+//
+// Unlike the Wi-Fi switch (a RAM static, g_wifi_switch_intent), this must
+// land in NVS — the device deep-sleeps every ~10 minutes and loses RAM.
+extern "C" uint8_t rf_log_upload_local_get(void) {
+    Settings s("wifi");
+    if (!s.GetBool("log_up_present", false)) return 0;   // OPINION_NONE
+    return s.GetBool("log_up_on", false) ? 2 : 1;        // ON / OFF
+}
+
+extern "C" void rf_log_upload_local_set(uint8_t v) {
+    Settings s("wifi", /* read_write = */ true);
+    if (v == 0) {
+        s.SetBool("log_up_present", false);
+        return;
+    }
+    s.SetBool("log_up_present", true);
+    s.SetBool("log_up_on", v == 2);
+}
+
+// Upload backoff stamps (same shape as the notify pull gate): last failure
+// second + consecutive-failure streak, in RTC slow memory. -1 = no failure
+// outstanding.
+RTC_DATA_ATTR static int64_t g_log_upload_last_fail_s = -1;
+RTC_DATA_ATTR static uint32_t g_log_upload_fail_streak;
+extern "C" void rf_log_upload_fail_state(int64_t* last_s, uint32_t* streak) {
+    if (last_s) *last_s = g_log_upload_last_fail_s;
+    if (streak) *streak = g_log_upload_fail_streak;
+}
+extern "C" void rf_log_upload_fail_record(int64_t now_s, uint8_t failed, uint32_t streak) {
+    if (failed) g_log_upload_last_fail_s = now_s;
+    g_log_upload_fail_streak = streak;
 }

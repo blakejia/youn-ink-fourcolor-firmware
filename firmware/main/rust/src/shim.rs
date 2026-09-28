@@ -134,6 +134,27 @@ unsafe extern "C" {
     /// Persist one pull outcome: stamp the attempt, plus the failure stamp
     /// and the streak step computed by `notify_policy::record_result`.
     pub fn rf_notify_gate_record(now_s: i64, failed: u8, streak: u32);
+    // ── device log upload (log_upload_policy.rs decides; C++ owns storage) ──
+    // Ring buffer (shim_log.cpp). Buffer ownership is C++'s: Rust only reads
+    // a snapshot and acks what the server accepted.
+    pub fn rf_logbuf_install_hook();
+    pub fn rf_logbuf_read(out: *mut c_char, cap: c_int, out_seq_lo: *mut u32,
+                          out_lines: *mut u32);
+    pub fn rf_logbuf_ack(seq_hi: u32);
+    pub fn rf_logbuf_stats(dropped: *mut u32, used: *mut u32);
+    // Service opinion (RTC byte in shim.cpp): NONE/OFF/ON = 0/1/2.
+    pub fn rf_log_upload_server_get() -> u8;
+    pub fn rf_log_upload_server_set(v: u8);
+    // Device opinion (NVS "wifi" namespace): same 0/1/2 encoding.
+    pub fn rf_log_upload_local_get() -> u8;
+    pub fn rf_log_upload_local_set(v: u8);
+    // Upload backoff stamps (RTC, mirrors rf_notify_gate_stats/record).
+    pub fn rf_log_upload_fail_state(last_s: *mut i64, streak: *mut u32);
+    pub fn rf_log_upload_fail_record(now_s: i64, failed: u8, streak: u32);
+    // The gate itself lives in Rust (log_upload_policy.rs); declared here so
+    // every cross-boundary call goes through `shim`.
+    pub fn rf_log_upload_decide(inp: *const crate::log_upload_policy::Inputs)
+        -> crate::log_upload_policy::Decision;
 }
 
 /// `abort()`, used by the panic handler.
@@ -290,6 +311,10 @@ pub(crate) mod host {
         *NOTIFY_GATE.lock().unwrap_or_else(|e| e.into_inner()) = (-1, -1, 0);
         *TIME_NOW.lock().unwrap_or_else(|e| e.into_inner()) = 1_700_000_000;
         reset_battery_staging();
+        *LOG_RING.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+        *LOG_OPINION.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0);
+        *LOG_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = (-1, 0);
+        *LOG_ACKED.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *POWER.lock().unwrap_or_else(|e| e.into_inner()) = [0; 5];
         AUDIO_ON.store(true, std::sync::atomic::Ordering::SeqCst);
         guard
@@ -959,6 +984,139 @@ pub(crate) mod host {
     pub extern "C" fn rf_draw_empty_hint() {
         counters(|c| c.hint_draws += 1);
         note("empty_hint");
+    }
+
+    // ── device log upload (device: shim_log.cpp / shim.cpp) ──
+    /// Staged ring: the lines a read hands out, as framed text.
+    static LOG_RING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    /// `(server_set, local_set)`.
+    static LOG_OPINION: Mutex<(u8, u8)> = Mutex::new((0, 0));
+    /// `(last_fail_s, streak)`.
+    static LOG_FAIL: Mutex<(i64, u32)> = Mutex::new((-1, 0));
+    /// Highest seq handed to `rf_logbuf_ack`, or None when never acked.
+    static LOG_ACKED: Mutex<Option<u32>> = Mutex::new(None);
+
+    /// Stage the lines the next `rf_logbuf_read` will return.
+    pub fn stage_log_lines(lines: &[&str]) {
+        *LOG_RING.lock().unwrap_or_else(|e| e.into_inner()) =
+            lines.iter().map(|s| s.to_string()).collect();
+    }
+
+    pub fn set_log_opinion(server: u8, local: u8) {
+        *LOG_OPINION.lock().unwrap_or_else(|e| e.into_inner()) = (server, local);
+    }
+
+    pub fn set_log_fail_state(last_s: i64, streak: u32) {
+        *LOG_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = (last_s, streak);
+    }
+
+    pub fn log_fail_state() -> (i64, u32) {
+        *LOG_FAIL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The seq_hi the last accepted upload acked, if any.
+    pub fn log_acked() -> Option<u32> {
+        *LOG_ACKED.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_logbuf_install_hook() {
+        note("logbuf_install");
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_logbuf_read(
+        out: *mut c_char,
+        cap: c_int,
+        out_seq_lo: *mut u32,
+        out_lines: *mut u32,
+    ) {
+        let g = LOG_RING.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let cap = cap.max(0) as usize;
+        let mut written = 0usize;
+        let mut lines = 0u32;
+        for l in &g {
+            if written + l.len() + 1 >= cap {
+                break;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(l.as_ptr(), out.add(written), l.len());
+                written += l.len();
+                *out.add(written) = b'\n';
+            }
+            written += 1;
+            lines += 1;
+        }
+        if !out.is_null() && cap > 0 {
+            unsafe { *out.add(written.min(cap - 1)) = 0 };
+        }
+        if !out_seq_lo.is_null() {
+            unsafe { *out_seq_lo = 7 };
+        }
+        if !out_lines.is_null() {
+            unsafe { *out_lines = lines };
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_logbuf_ack(seq_hi: u32) {
+        *LOG_ACKED.lock().unwrap_or_else(|e| e.into_inner()) = Some(seq_hi);
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_logbuf_stats(dropped: *mut u32, used: *mut u32) {
+        let g = LOG_RING.lock().unwrap_or_else(|e| e.into_inner());
+        let used_bytes: usize = g.iter().map(|l| l.len() + 1).sum();
+        if !dropped.is_null() {
+            unsafe { *dropped = 3 };
+        }
+        if !used.is_null() {
+            unsafe { *used = used_bytes as u32 };
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_log_upload_server_get() -> u8 {
+        LOG_OPINION.lock().unwrap_or_else(|e| e.into_inner()).0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_log_upload_server_set(v: u8) {
+        let mut g = LOG_OPINION.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = v;
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_log_upload_local_get() -> u8 {
+        LOG_OPINION.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_log_upload_local_set(v: u8) {
+        let mut g = LOG_OPINION.lock().unwrap_or_else(|e| e.into_inner());
+        g.1 = v;
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_log_upload_fail_state(last_s: *mut i64, streak: *mut u32) {
+        let g = *LOG_FAIL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            if !last_s.is_null() {
+                *last_s = g.0;
+            }
+            if !streak.is_null() {
+                *streak = g.1;
+            }
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_log_upload_fail_record(now_s: i64, failed: u8, streak: u32) {
+        let mut g = LOG_FAIL.lock().unwrap_or_else(|e| e.into_inner());
+        if failed != 0 {
+            g.0 = now_s;
+        }
+        g.1 = streak;
     }
 }
 

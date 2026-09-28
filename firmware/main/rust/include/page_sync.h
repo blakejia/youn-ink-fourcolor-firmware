@@ -48,6 +48,11 @@ bool page_sync_sync_ok(void);
 /** Task 4: whether the last parsed schedule says a notification is waiting. */
 bool page_sync_notify_pending(void);
 
+/** One device-log upload attempt inside the caller's power cycle (Task 5).
+ *  The gate lives in `log_upload_policy.rs`; this performs the ring read, the
+ *  POST and — only on 201 — the ack. True when the server accepted the batch. */
+bool page_sync_log_upload_once(void);
+
 /** `policy.poll_interval_minutes * 60`. */
 uint32_t page_sync_poll_s(void);
 
