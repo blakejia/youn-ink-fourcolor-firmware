@@ -103,10 +103,19 @@ void push_locked(const char* text, int len) {
         uint16_t old_len = 0;
         ring_copy_out((uint8_t*)&old_len, (g_ring.tail + 4) % kDataBytes, 2);
         uint32_t step = 4 + 2 + old_len;
-        if (step < 6 || step > (uint32_t)kDataBytes) step = 6;  // absurd len: skip the header only
+        // `>= kDataBytes`, not `>`: a step of exactly kDataBytes moves the
+        // cursor nowhere (mod kDataBytes), so the loop would burn every guard
+        // iteration without freeing a byte, inflate `dropped`, and — because
+        // head then advances by frame onto tail — leave the ring reading as
+        // empty and lose the whole backlog. Skip only the header in that case.
+        if (step < 6 || step >= (uint32_t)kDataBytes) step = 6;
         g_ring.tail = (g_ring.tail + step) % kDataBytes;
         g_ring.dropped++;
     }
+    // Belt and braces: the loop above is bounded, so it can exit without having
+    // made room (garbage metadata). Never publish a frame that would overflow
+    // the capacity — dropping this one line is the honest failure.
+    if (ring_used_locked() + (uint32_t)frame > (uint32_t)kCapBytes) return;
 
     const uint32_t seq = g_ring.seq++;
     uint16_t len16 = (uint16_t)len;
