@@ -1431,7 +1431,7 @@ Expected: PASS（18 passed）
 Expected: `disabled_switch_skips`、`disabled_beats_everything`、`service_off_overrides_local_on`、`local_off_alone_disables`、`neither_side_speaking_leaves_it_off` FAIL，其余仍 PASS。改回。
 
 把 `resolve_enabled` 里的 `if server_set == OPINION_OFF { return false; }` 删掉，重跑：
-（注：直接删掉会让 `OPINION_OFF` 分支落到末尾的 `local_set == OPINION_ON` 上，而这在 Rust 里是**另一个分支**、删掉后 `server_set == OPINION_OFF` 只剩一个不可达的 match 臂 —— 用 if 形式时它会编译为 E0317「if may be missing an else clause」。等价且可编译的变异：把该 `if` 的 body 改成 `return true;`（即让 OFF 不再否决），效果相同。）
+（注：`resolve_enabled` 用的是 early `return`，删掉 OFF 那一臂后函数仍然完整，编译通过；E0317 只在先把它改写成 if/else if/else 时才会出现。所以这条变异就是 brief 的原样指令，按原样执行即可。）
 Expected: 只有 `service_off_overrides_local_on` 与 `resolve_enabled_is_the_conflict_rule` FAIL——**这两个测试正是「冲突以服务端为准」这条规则的守卫**。改回。
 
 把 `if i.wifi_ready == 0` 改成 `if false`，重跑：
