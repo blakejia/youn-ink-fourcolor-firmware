@@ -26,6 +26,7 @@ pub mod input;
 pub mod json;
 pub mod lifecycle;
 pub mod log;
+pub mod log_upload_policy;
 pub mod notify;
 pub mod notify_policy;
 pub mod page_compare_policy;
