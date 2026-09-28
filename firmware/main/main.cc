@@ -14,6 +14,10 @@
 #include "shim_power.h"
 #include "system_info.h"
 
+// Log ring capture hook (rust/shim_log.cpp): chained onto the ESP_LOG
+// vprintf so every formatted line lands in the RTC buffer.
+extern "C" void rf_logbuf_install_hook(void);
+
 #define TAG "main"
 
 // Persists across soft resets and deep sleep, cleared only on power-on.
@@ -97,6 +101,12 @@ extern "C" void app_main(void)
         pm.light_sleep_enable = false;
         ESP_ERROR_CHECK(esp_pm_configure(&pm));
     }
+    // Capture logs from the very first boot line: the install must precede
+    // Application::Initialize and everything it touches, or the boot-path
+    // lines that explain a crash are exactly the ones never recorded.
+    // Idempotent, so a re-entry is harmless.
+    rf_logbuf_install_hook();
+
     auto& app = Application::GetInstance();
     app.Initialize(quiet_boot);
     app.Run();  // This function runs the main event loop and never returns

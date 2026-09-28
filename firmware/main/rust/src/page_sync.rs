@@ -224,6 +224,13 @@ fn fetch_schedule(buf: &mut [u8]) -> Option<usize> {
         }
     }
 
+    // Task 5b: report the device's OWN switch opinion so the admin UI can say
+    // "the device has it off" instead of showing an enabled service setting
+    // that appears to do nothing. Read straight from the shim: there is no
+    // Inputs struct at uplink time, and flattening the three states here would
+    // make the server store 0 (off) for a device that has no opinion.
+    let _ = write!(path, "&lo={}", unsafe { shim::rf_log_upload_local_get() });
+
     let mut url = CBuf::<320>::new();
     if unsafe { shim::rf_build_endpoint(path.as_ptr(), url.as_mut_ptr(), 320) } == 0 {
         log_w!("PageSync", "cannot build schedule endpoint");
@@ -1005,17 +1012,26 @@ pub fn log_upload_server_set(v: u8) {
     unsafe { shim::rf_log_upload_server_set(v) }
 }
 
-/// base64 of a 1536-byte read is 2048 chars, and the body adds the JSON
-/// envelope plus a NUL — 2048 is the spec's body budget for a 1024-byte cap,
-/// so the ring read is sized to fit it.
-const LOG_READ_BUF: usize = 1536;
-const LOG_BODY_BUF: usize = 2048;
+/// The read is capped at the policy's own per-upload ceiling, so
+/// `take == read_len` always holds and the ack range can never run past what
+/// was actually sent. (Reading more and then truncating is the bug this
+/// comment replaces: `seq_hi` came from the untruncated line count, so a
+/// backlog over 1024 B acked lines that never left the device.)
+const LOG_READ_BUF: usize = log_upload_policy::MAX_UPLOAD_BYTES as usize;
+const LOG_B64_BUF: usize = 2048;   // base64(1024 B) = 1368 chars, rounded up
+const LOG_BODY_BUF: usize = 2048;  // envelope + base64 + NUL
 const LOG_URL_BUF: usize = 320;
 const LOG_HTTP_TIMEOUT_MS: i32 = 10_000;
 
 /// One upload attempt. Returns true when the server accepted the batch.
 ///
 /// Caller must already hold no lock: HTTP can block for seconds.
+///
+/// The three working buffers live in PSRAM, not on the stack: this runs on the
+/// esp_timer task (8 KB) and the base64 + JSON + read buffers would add ~5.6 KB
+/// of frame on top of the mbedtls chain — and a stack overflow there would
+/// corrupt the very RTC ring this feature exists to protect. Same reason
+/// `sync_once` keeps the schedule buffer in PSRAM.
 pub fn log_upload_try_once() -> bool {
     let mut dropped = 0u32;
     let mut used = 0u32;
@@ -1026,14 +1042,45 @@ pub fn log_upload_try_once() -> bool {
     // count is what the ack arithmetic needs. Reading is a bounded byte copy
     // under the ring lock — cheap, unlike the HTTP that `decide` gates.
     // `seq_lo` is meaningful only when `lines > 0`.
-    let mut read_buf = CBuf::<LOG_READ_BUF>::new();
+    let read_ptr = unsafe { shim::rf_alloc(LOG_READ_BUF + 1) };
+    let b64_ptr = unsafe { shim::rf_alloc(LOG_B64_BUF) };
+    let body_ptr = unsafe { shim::rf_alloc(LOG_BODY_BUF) };
+    if read_ptr.is_null() || b64_ptr.is_null() || body_ptr.is_null() {
+        log_e!("PageSync", "log upload alloc failed");
+        unsafe {
+            if !read_ptr.is_null() { shim::rf_free(read_ptr); }
+            if !b64_ptr.is_null() { shim::rf_free(b64_ptr); }
+            if !body_ptr.is_null() { shim::rf_free(body_ptr); }
+        }
+        return false;
+    }
+    // Guards keep the two exit paths below from duplicating the frees.
+    let ok = log_upload_with_buffers(read_ptr, b64_ptr, body_ptr, used, dropped);
+    unsafe {
+        shim::rf_free(read_ptr);
+        shim::rf_free(b64_ptr);
+        shim::rf_free(body_ptr);
+    }
+    ok
+}
+
+/// The attempt proper, with all three buffers already in PSRAM.
+fn log_upload_with_buffers(
+    read_ptr: *mut u8,
+    b64_ptr: *mut u8,
+    body_ptr: *mut u8,
+    used: u32,
+    dropped: u32,
+) -> bool {
     let mut seq_lo = 0u32;
     let mut lines = 0u32;
     unsafe {
-        shim::rf_logbuf_read(read_buf.as_mut_ptr(), LOG_READ_BUF as i32,
+        shim::rf_logbuf_read(read_ptr as *mut core::ffi::c_char, LOG_READ_BUF as i32,
                              &mut seq_lo, &mut lines);
     }
-    read_buf.set_len_from_terminator();
+    // `rf_logbuf_read` NUL-terminates within cap, so scan for it in place.
+    let read_slice = unsafe { core::slice::from_raw_parts(read_ptr, LOG_READ_BUF) };
+    let read_len = read_slice.iter().position(|b| *b == 0).unwrap_or(LOG_READ_BUF);
 
     let mut last_fail_s = -1i64;
     let mut fail_streak = 0u32;
@@ -1059,31 +1106,57 @@ pub fn log_upload_try_once() -> bool {
     // A UPLOAD verdict with nothing to send: `pending_bytes` was non-zero but
     // no whole frame fit the read buffer. Acking here would compute
     // `seq_lo + 0 - 1` and underflow to 0xFFFFFFFF, acking the ENTIRE ring.
+
+
+    // THE zero-line guard, and the only one. `lines == 0` implies an empty
+    // read, so the `seq_hi` computed just below would be `seq_lo + 0 - 1` =
+    // 0xFFFFFFFF and the ack would swallow the entire ring. A second early
+    // return catching the same input silently hides this line from the tests:
+    // a `n == 0` base64 check did exactly that (encode_slice on an empty slice
+    // returns Ok(0)), and the suite stayed green after this guard was deleted.
     if lines == 0 {
         log_w!("PageSync", "log upload gated on but no whole line fits; not acking");
         return false;
     }
 
-    // The gate caps the payload; take at most that many bytes of the read.
-    let take = (d.max_bytes as usize).min(read_buf.as_bytes().len());
+    // The read was capped at MAX_UPLOAD_BYTES and the ring hands out whole
+    // frames only, so everything read is inside the policy's byte budget and
+    // `seq_hi` below covers exactly the payload that was sent.
+    let take = read_len;
     let seq_hi = seq_lo + lines - 1;
-    let mut body = CBuf::<LOG_BODY_BUF>::new();
-    let mut b64 = [0u8; LOG_BODY_BUF];
-    let n = B64.encode_slice(&read_buf.as_bytes()[..take], &mut b64).unwrap_or(0);
-    if n == 0 {
-        log_w!("PageSync", "log base64 encode failed");
-        record_log_upload(false, fail_streak);
-        return false;
-    }
+    let b64 = unsafe { core::slice::from_raw_parts_mut(b64_ptr, LOG_B64_BUF) };
+    let n = B64.encode_slice(&read_slice[..take], b64).unwrap_or(0);
+    // The envelope head is ~48 bytes of ASCII JSON and stays on the stack; the
+    // base64 payload and the assembled body are what live in PSRAM. base64
+    // output is ASCII, so no JSON escaping is needed.
     use core::fmt::Write as _;
-    let _ = write!(body, r#"{{"seq_hi":{},"dropped":{},"lines":"{}"}}"#,
-                   seq_hi, dropped,
-                   core::str::from_utf8(&b64[..n]).unwrap_or(""));
-    if body.overflowed() {
-        log_w!("PageSync", "log upload body overflow ({} B)", body.as_bytes().len());
+    let mut head = CBuf::<64>::new();
+    let _ = write!(head, r#"{{"seq_hi":{},"dropped":{},"lines":""#, seq_hi, dropped);
+    if head.overflowed() {
+        log_w!("PageSync", "log upload envelope overflow");
         record_log_upload(false, fail_streak);
         return false;
     }
+    let body = unsafe { core::slice::from_raw_parts_mut(body_ptr, LOG_BODY_BUF) };
+    let b64_slice = unsafe { core::slice::from_raw_parts(b64_ptr, n) };
+    let mut written = 0usize;
+    // +3: the closing quote, the closing brace and the NUL.
+    if head.as_bytes().len() + n + 3 > body.len() {
+        log_w!("PageSync", "log upload body overflow");
+        record_log_upload(false, fail_streak);
+        return false;
+    }
+    body[..head.as_bytes().len()].copy_from_slice(head.as_bytes());
+    written = head.as_bytes().len();
+    body[written] = b'"';
+    written += 1;
+    body[written..written + n].copy_from_slice(b64_slice);
+    written += n;
+    body[written] = b'"';
+    written += 1;
+    body[written] = b'}';
+    written += 1;
+    body[written] = 0;
 
     let mut path = CBuf::<64>::new();
     path.push("/api/device-log");
@@ -1095,10 +1168,12 @@ pub fn log_upload_try_once() -> bool {
     }
     let mut token = CBuf::<80>::new();
     unsafe { shim::rf_get_token(token.as_mut_ptr(), 80) };
+    // Response buffer stays on the stack: the endpoint answers a tiny JSON.
     let mut resp = CBuf::<128>::new();
     let mut resp_len = 128i32;
+    let body_ptr_c = body_ptr as *const core::ffi::c_char;
     let status = unsafe {
-        shim::rf_http_post_json(url.as_ptr(), token.as_ptr(), body.as_ptr(),
+        shim::rf_http_post_json(url.as_ptr(), token.as_ptr(), body_ptr_c,
                                 resp.as_mut_ptr(), &mut resp_len,
                                 LOG_HTTP_TIMEOUT_MS)
     };
@@ -1610,16 +1685,76 @@ mod tests {
 
     #[test]
     fn a_zero_line_read_never_acks() {
-        // bytes pending but no whole frame fits: acking would underflow
-        // seq_lo + 0 - 1 and ack the entire ring.
+        // The line must be LONGER than the read cap, so `used > 0` (the gate
+        // passes) while the read returns no whole frame (lines == 0). Staging
+        // zero lines would return SKIP_EMPTY at the decide branch and never
+        // reach the `lines == 0` guard at all — the test would pass with the
+        // guard deleted, which is exactly what it did before.
+        let long = "x".repeat(LOG_READ_BUF + 64);
         let _g = shim::host::lock();
         reset_for_test();
         shim::host::set_log_opinion(log_upload_policy::OPINION_ON, log_upload_policy::OPINION_NONE);
-        shim::host::stage_log_lines(&[]);
+        shim::host::stage_log_lines(&[&long]);
         shim::host::script_get("/api/device-log", 201, b"{}");
 
         assert!(!log_upload_try_once());
         assert_eq!(shim::host::log_acked(), None, "zero lines must not ack");
+    }
+
+    #[test]
+    fn a_backlog_over_the_cap_sends_everything_it_acks() {
+        // The read is capped at MAX_UPLOAD_BYTES and the ring hands out whole
+        // frames only, so `seq_hi` always covers exactly the payload that
+        // went on the wire. Truncating after the read (the old code) acked
+        // lines that were never sent.
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_log_opinion(log_upload_policy::OPINION_ON, log_upload_policy::OPINION_NONE);
+        // Far more than one cap of text: the ring must give back whole frames
+        // only, and the ack must stop at the last one actually sent.
+        let filler = "a".repeat(300);
+        let lines: Vec<&str> = core::iter::repeat_n(filler.as_str(), 20).collect();
+        shim::host::stage_log_lines(&lines);
+        shim::host::script_get("/api/device-log", 201, b"{}");
+
+        assert!(log_upload_try_once(), "201 -> accepted");
+        let posted = shim::host::calls_matching("http_post");
+        assert_eq!(posted.len(), 1);
+        assert!(posted[0].contains("/api/device-log"));
+        // Whatever the frame count, the ack must equal what was sent; the
+        // stub hands out seq_lo = 7, so seq_hi = 7 + lines - 1.
+        assert_eq!(shim::host::log_acked(), Some(7 + 3 - 1),
+                   "1024 B cap admits 3 x 300-char frames; ack must match exactly");
+    }
+
+    /// Run one schedule sync and return the single URL it fetched.
+    fn schedule_get_url(local_set: u8) -> String {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_log_opinion(log_upload_policy::OPINION_NONE, local_set);
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[]));
+        assert!(sync_once());
+        let gets = shim::host::calls_matching("http_get");
+        assert_eq!(gets.len(), 1, "exactly one schedule GET per sync");
+        gets[0].clone()
+    }
+
+    #[test]
+    fn the_uplink_reports_no_opinion_as_zero() {
+        // Task 5b: `&lo=` tells the service what the device's own switch
+        // says. Unset must read as 0 (no opinion) — never off, which would
+        // make the service store a decision the device never made.
+        let url = schedule_get_url(log_upload_policy::OPINION_NONE);
+        assert!(url.contains("&lo=0"), "no local opinion -> lo=0, got {url}");
+    }
+
+    #[test]
+    fn the_uplink_reports_the_local_opinion_unflattened() {
+        // 2 (on) must not read as 1, and 1 (off) must not read as 0.
+        let url = schedule_get_url(log_upload_policy::OPINION_ON);
+        assert!(url.contains("&lo=2"), "local on -> lo=2, got {url}");
+        let url = schedule_get_url(log_upload_policy::OPINION_OFF);
+        assert!(url.contains("&lo=1"), "local off -> lo=1, got {url}");
     }
 
     #[test]
