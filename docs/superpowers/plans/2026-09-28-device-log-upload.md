@@ -681,7 +681,7 @@ git commit -m "feat(server): device-log endpoint, per-device switch, schedule po
 **Interfaces:**
 - Produces（供 Task 4 与 `shim.rs` 消费）：
   - `void rf_logbuf_read(char* out, int cap, uint32_t* out_seq_lo, uint32_t* out_lines)` — 取最早未 ack 的连续段，**不推进 tail**
-  - `void rf_logbuf_ack(uint32_t seq_hi)` — 上报成功后才推进 tail
+  - `void rf_logbuf_ack(uint32_t seq_hi, uint32_t reported_dropped)` — 上报成功后才推进 tail，并减去已上报的 dropped
   - `void rf_logbuf_stats(uint32_t* dropped, uint32_t* used)`
   - `void rf_logbuf_install_hook(void)` — 装 `esp_log_set_vprintf` 钩子（幂等）
 
@@ -722,7 +722,7 @@ void rf_logbuf_read(char* out, int cap, uint32_t* out_seq_lo, uint32_t* out_line
 
 /* Advance the tail past every line with seq <= seq_hi. Call only after the
  * server accepted the payload. */
-void rf_logbuf_ack(uint32_t seq_hi);
+void rf_logbuf_ack(uint32_t seq_hi, uint32_t reported_dropped);
 
 /* `dropped`: lines lost to ring overwrite since the last power cycle.
  * `used`: bytes currently held. */
@@ -953,7 +953,7 @@ extern "C" void rf_logbuf_read(char* out, int cap, uint32_t* out_seq_lo, uint32_
 
 // Contract: pass seq_lo + lines - 1 from the read that produced the payload.
 // Acks only frames the reader actually returned (contiguous from the tail).
-extern "C" void rf_logbuf_ack(uint32_t seq_hi) {
+extern "C" void rf_logbuf_ack(uint32_t seq_hi, uint32_t reported_dropped) {
     portENTER_CRITICAL(&g_mux);
     ensure_init_locked();
     int at = (int)g_ring.tail;

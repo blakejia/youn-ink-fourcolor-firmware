@@ -33,7 +33,10 @@ extern "C" {
 void rf_logbuf_read(char* out, int cap, uint32_t* out_seq_lo, uint32_t* out_lines);
 
 /* Advance the tail past every line with seq <= seq_hi. Call only after the
- * server accepted the payload. */
+ * server accepted the payload. `reported_dropped` is the `dropped` count the
+ * caller sampled BEFORE the POST (and put in the body): the ack subtracts
+ * exactly that (saturating), so a drop that lands during the upload is not
+ * discarded unreported. */
 void rf_logbuf_ack(uint32_t seq_hi, uint32_t reported_dropped);
 
 /* `dropped`: lines lost to ring overwrite since the last ack.

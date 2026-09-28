@@ -118,7 +118,7 @@ esp_log(config, tag, LOG_FORMAT(I, format), esp_log_timestamp(), tag, ##__VA_ARG
 | 符号 | 方向 | 语义 |
 | --- | --- | --- |
 | `void rf_logbuf_read(char* out, int cap, uint32_t* out_seq_lo, uint32_t* out_lines)` | Rust ← C++ | 取最早未 ack 的连续段；**不移动 tail** |
-| `void rf_logbuf_ack(uint32_t seq_hi)` | Rust → C++ | 上报成功后才推进 tail |
+| `void rf_logbuf_ack(uint32_t seq_hi, uint32_t reported_dropped)` | Rust → C++ | 上报成功后才推进 tail，并减去已上报的 dropped |
 | `void rf_logbuf_stats(uint32_t* dropped, uint32_t* used)` | Rust ← C++ | 覆盖丢弃计数与已用字节 |
 
 **read 不改状态、ack 才改**——与 `g_panel_rec` 的「pending 只在刷新真正 idle 后才 commit」是同一防丢思路（`shim.cpp:88-90`）。上报失败若不推进 tail，日志在下次重试时仍在。

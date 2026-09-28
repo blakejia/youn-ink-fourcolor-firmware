@@ -1753,6 +1753,40 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_landing_during_the_upload_is_reported_in_the_next_batch() {
+        // The ack must SUBTRACT the reported count, not CLEAR the counter:
+        // a line overwritten while the POST is in flight (after the stats
+        // sample, before the ack) is a real drop, and a clear would discard
+        // it unreported. The one-shot hook bumps the counter inside the POST,
+        // so the sampled value (3) is stale by ack time; the next batch must
+        // report the +1 that a clear would have lost.
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_log_opinion(log_upload_policy::OPINION_ON, log_upload_policy::OPINION_NONE);
+        shim::host::stage_log_lines(&["first"]);
+        shim::host::script_get("/api/device-log", 201, b"{}");
+
+        let dropped_of = |posted: &str| {
+            let b = posted.as_bytes();
+            crate::json::member(b, 0, "dropped").and_then(|at| crate::json::int_value(b, at))
+        };
+
+        // First batch: samples 3, then a drop lands DURING the POST (1 more).
+        // ack subtracts the reported 3 -> 1 remains. A CLEAR would zero it.
+        shim::host::drop_during_next_post(1);
+        assert!(log_upload_try_once());
+        let all = shim::host::calls_matching("http_post");
+        assert_eq!(dropped_of(all[0].splitn(3, ' ').nth(2).unwrap()), Some(3),
+                   "the first batch reports the pre-upload sample");
+
+        // Next batch must report the mid-upload drop.
+        shim::host::stage_log_lines(&["second"]);
+        assert!(log_upload_try_once());
+        let all = shim::host::calls_matching("http_post");
+        assert_eq!(dropped_of(all[1].splitn(3, ' ').nth(2).unwrap()), Some(1),
+                   "the mid-upload drop survived the ack (subtract, not clear)");
+    }
+    #[test]
     fn a_rejected_upload_keeps_the_lines_and_advances_the_streak() {
         // read does not move the tail: a failed upload must leave the lines
         // pending, or the device silently discards the crash we wanted.

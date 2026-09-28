@@ -316,6 +316,7 @@ pub(crate) mod host {
         *LOG_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = (-1, 0);
         *LOG_ACKED.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *LOG_DROPPED.lock().unwrap_or_else(|e| e.into_inner()) = 3;
+        *LOG_DROP_DURING_POST.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         *POWER.lock().unwrap_or_else(|e| e.into_inner()) = [0; 5];
         AUDIO_ON.store(true, std::sync::atomic::Ordering::SeqCst);
         guard
@@ -917,6 +918,16 @@ pub(crate) mod host {
         let url = cstr(url);
         let payload = cstr(body);
         note(format!("http_post {url} {payload}"));
+        // Simulate a line overwritten while the POST is in flight (after the
+        // stats sample, before the ack): the mid-upload window the ack must not
+        // silently clear. One-shot.
+        {
+            let mut once = LOG_DROP_DURING_POST.lock().unwrap_or_else(|e| e.into_inner());
+            if *once > 0 {
+                *LOG_DROPPED.lock().unwrap_or_else(|e| e.into_inner()) += *once;
+                *once = 0;
+            }
+        }
         let cap = unsafe { *len }.max(0) as usize;
         let hit = {
             let g = RESPONSES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1000,6 +1011,10 @@ pub(crate) mod host {
     /// cumulative per-upload, reset on ack so a later batch does not re-stamp
     /// a stale total).
     static LOG_DROPPED: Mutex<u32> = Mutex::new(3);
+    /// One-shot: bump LOG_DROPPED by this during the NEXT rf_http_post_json, to
+    /// simulate a line overwritten mid-upload (after the stats sample, before
+    /// the ack). Lets a test distinguish ack-time subtract from clear.
+    static LOG_DROP_DURING_POST: Mutex<u32> = Mutex::new(0);
 
     /// Stage the lines the next `rf_logbuf_read` will return.
     pub fn stage_log_lines(lines: &[&str]) {
@@ -1013,6 +1028,19 @@ pub(crate) mod host {
 
     pub fn set_log_fail_state(last_s: i64, streak: u32) {
         *LOG_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = (last_s, streak);
+    }
+
+    /// Add `n` to the staged drop counter, as if lines were overwritten between
+    /// the stats sample and the ack. Lets a test pin the ack-time subtract (vs
+    /// a clear, which would discard these drops unreported).
+    pub fn bump_log_dropped(n: u32) {
+        *LOG_DROPPED.lock().unwrap_or_else(|e| e.into_inner()) += n;
+    }
+
+    /// Stage a drop to land DURING the next POST (the mid-upload window). One
+    /// shot: consumed by the next rf_http_post_json.
+    pub fn drop_during_next_post(n: u32) {
+        *LOG_DROP_DURING_POST.lock().unwrap_or_else(|e| e.into_inner()) = n;
     }
 
     pub fn log_fail_state() -> (i64, u32) {
