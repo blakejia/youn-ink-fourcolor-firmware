@@ -1385,7 +1385,34 @@ extern "C" uint8_t rf_log_upload_server_get(void) { return g_log_upload_server_s
 extern "C" void rf_log_upload_server_set(uint8_t v) { g_log_upload_server_set = v; }
 ```
 
-同时在 `shim.rs` 声明这两个符号。
+同时加本地开关的 NVS 读写——**本任务拥有它**（上行要读它才能编译；Task 6 只加菜单与切换规则）：
+
+```cpp
+// 本地日志上报开关，三态。用两个布尔表达：present 记"用户是否表过态"，
+// on 记方向。未设置 => 0（无意见），所以服务端开关能生效。
+//
+// 与 Wi-Fi 开关的关键差别：那个是 RAM 静态量（g_wifi_switch_intent），
+// 本项必须落 NVS —— 设备每 10 分钟深睡一次会掉 RAM。
+extern "C" uint8_t rf_log_upload_local_get(void) {{
+    Settings s("wifi");
+    if (!s.GetBool("log_up_present", false)) return 0;   // OPINION_NONE
+    return s.GetBool("log_up_on", false) ? 2 : 1;        // ON / OFF
+}}
+
+extern "C" void rf_log_upload_local_set(uint8_t v) {{
+    Settings s("wifi", /* read_write = */ true);
+    if (v == 0) {{
+        s.SetBool("log_up_present", false);
+        return;
+    }}
+    s.SetBool("log_up_present", true);
+    s.SetBool("log_up_on", v == 2);
+}}
+```
+
+（`#include "settings.h"` 加到 `shim.cpp` 顶部 include 区。）
+
+在 `shim.rs` 声明这四个符号（server get/set + local get/set）。
 
 - [ ] **Step 5: 实现上报函数**
 
@@ -1427,6 +1454,7 @@ fn log_upload_try_once() -> bool {
 | 符号 | 来源 |
 | --- | --- |
 | `rf_log_upload_server_get() -> u8`（`page_sync.rs` 内包一层 `log_upload_server_get()`） | schedule 响应的 `policy.log_upload`（`null`→0、`0`→1、`1`→2），存 RTC |
+| `rf_log_upload_local_get() -> u8` | 读 NVS 的本地开关，映射成 `0/1/2`（未设置 = 0 无意见）。**本任务实现它**——上行要读它才能编译；Task 6 只加菜单项与切换规则，不重复实现 |
 | `rf_log_upload_fail_state(out_last_s: *mut i64, out_streak: *mut u32)` | RTC 里的退避戳与失败计数，与 `rf_fail_streak_*` 同位置 |
 
 上面代码里的 `log_upload_server_get()` 就是 `page_sync.rs` 对 `rf_log_upload_server_get()` 的薄包装（与既有的 `log_upload_enabled()` 同一手法）。**三态映射不能折平**：`policy.log_upload` 的 `null` 必须落成 `OPINION_NONE`，否则本地开关永远被覆盖。
@@ -1487,14 +1515,12 @@ git commit -m "feat(firmware): wire log capture, switch parsing and periodic upl
 - Modify: `firmware/main/rust/include/settings_menu.h`（item 枚举）
 - Modify: `firmware/main/rust/src/settings.rs`（菜单项 + `ITEM_*` 常量 + 切换规则 + 单测）
 - Modify: `firmware/main/application.cc`（Toggle 分支：写 NVS + 重绘）
-- Modify: `firmware/main/rust/shim.cpp`（`rf_log_upload_local_get/set` 读 NVS）
 - Test: `firmware/main/rust/src/settings.rs` 的 `mod tests`
 
 **Interfaces:**
-- Consumes: Task 4 的 `OPINION_NONE/OFF/ON`
+- Consumes: Task 4 的 `OPINION_NONE/OFF/ON`；**Task 5 已实现的** `rf_log_upload_local_get()` / `rf_log_upload_local_set(u8)`（NVS 读写归 Task 5，本任务不重复实现）
 - Produces:
   - 设置项 id `RF_SETTINGS_ITEM_LOG_UPLOAD = 12`（Rust `ITEM_LOG_UPLOAD: u8 = 12`）
-  - `rf_log_upload_local_get() -> u8` / `rf_log_upload_local_set(u8)`（NVS，映射到三态）
   - `fn settings::log_upload_toggle_target(current: u8) -> u8` — 三态切换规则
 
 - [ ] **Step 1: 写失败测试**
@@ -1564,36 +1590,7 @@ pub fn log_upload_toggle_target(current: u8) -> u8 {
     I { id: ITEM_LOG_UPLOAD, label: c"日志上报", kind: Kind::Toggle },
 ```
 
-- [ ] **Step 4: 接 NVS 读写**
-
-`firmware/main/rust/shim.cpp` 加（用既有 `Settings` 类，`firmware/main/settings.h` 的 `GetBool/SetBool`；namespace 沿用配网页的 `"wifi"`，与 `sleep_mode` 同处）：
-
-```cpp
-// 本地日志上报开关，三态。用两个布尔表达：present 记"用户是否表过态"，
-// on 记方向。未设置 => 0（无意见），所以服务端开关能生效。
-//
-// 与 Wi-Fi 开关的关键差别：那个是 RAM 静态量（g_wifi_switch_intent），
-// 本项必须落 NVS —— 设备每 10 分钟深睡一次会掉 RAM。
-extern "C" uint8_t rf_log_upload_local_get(void) {
-    Settings s("wifi");
-    if (!s.GetBool("log_up_present", false)) return 0;         // OPINION_NONE
-    return s.GetBool("log_up_on", false) ? 2 : 1;              // ON / OFF
-}
-
-extern "C" void rf_log_upload_local_set(uint8_t v) {
-    Settings s("wifi", /* read_write = */ true);
-    if (v == 0) {
-        s.SetBool("log_up_present", false);
-        return;
-    }
-    s.SetBool("log_up_present", true);
-    s.SetBool("log_up_on", v == 2);
-}
-```
-
-在 `shim.rs` 声明这两个符号（与 Task 5 的 `rf_log_upload_server_get/set` 并列）。
-
-- [ ] **Step 5: 接设置页的 Toggle 分支**
+- [ ] **Step 4: 接设置页的 Toggle 分支**
 
 `firmware/main/application.cc` 的设置项 switch（`RF_SETTINGS_ITEM_WIFI_TOGGLE` 兄弟分支）加：
 
@@ -1610,7 +1607,7 @@ extern "C" void rf_log_upload_local_set(uint8_t v) {
 
 （`rf_settings_log_upload_toggle` 是 `settings.rs` 的 `log_upload_toggle_target` 导出的 C ABI 包装，与既有 `rf_settings_wifi_switch_shown` 同一手法。）
 
-- [ ] **Step 6: 双门禁**
+- [ ] **Step 5: 双门禁**
 
 Run:
 ```bash
@@ -1627,10 +1624,10 @@ IDF_TARGET=esp32s3 idf.py build
 ```
 Expected: `Project build complete`
 
-- [ ] **Step 7: 提交**
+- [ ] **Step 6: 提交**
 
 ```bash
-git add firmware/main/rust/include/settings_menu.h firmware/main/rust/src/settings.rs firmware/main/application.cc firmware/main/rust/shim.cpp firmware/main/rust/src/shim.rs
+git add firmware/main/rust/include/settings_menu.h firmware/main/rust/src/settings.rs firmware/main/application.cc
 git commit -m "feat(firmware): device-side log-upload switch in the settings menu"
 ```
 
@@ -1921,6 +1918,6 @@ git commit -m "docs: device log upload on-device acceptance notes"
 
 **② 占位符扫描**：无 "TBD/TODO/类似 Task N"。Task 6 的 NVS 三态编码（两个布尔）与 Task 5 的服务端三态映射都给了完整代码；Task 5 Step 4 提到「查一下 `json.rs` 是否已有 null 识别」已就地核实并写明结论（扫描器识别 `null`，但 `int_value` 会把 `null` 与缺键折平，须用 `member()` 区分）。Task 5 Step 5 的 `log_upload_try_once` 给出了完整签名、输入构造、成功/失败分支与每条约束（CBuf 尺寸、base64、ack 时机、streak 更新）；省略的只有逐行样板，已指明照 `notify.rs` 的哪一处。Task 5 Step 2 的测试辅助 `schedule_json_with_policy_log_upload` 已说明构造方式（照同模块既有 `schedule_json` 加一个字段）。
 
-**③ 类型一致性**：`Inputs` 字段顺序/偏移在 Task 4 的 Rust 与 `log_upload_policy.h` 两处逐字一致（size 40，`local_set`@0、`server_set`@1、`has_pending`@2、`wifi_ready`@3、`pending_bytes`@4、`pending_lines`@8、`fail_streak`@12、`last_fail_s`@24、`now_s`@32）；`Decision` size 8、`max_bytes`@4 两处一致；三态枚举 `OPINION_NONE/OFF/ON` 与 `RF_LOG_OPINION_NONE/OFF/ON` 数值一致（0/1/2）；`rf_logbuf_read/ack/stats/install_hook` 在 Task 3 头文件、Task 3 实现、Task 5 的 `shim.rs` 声明三处同名同参；`rf_log_upload_server_get/set` 在 Task 5 的 `shim.rs` 与计划给出的 C++ 定义两处一致；`rf_log_upload_local_get/set` 在 Task 6 两处一致；`MAX_UPLOAD_BYTES` 在 Task 4 定义为 1024，Task 5 的 body 缓冲 2048 与其 base64 膨胀一致；`devicelog.append_lines/tail_lines` 在 Task 1 定义、Task 2 消费，参数名与类型一致；服务端 `value` 与前端 `setLogUpload(id, value)` 的三态（`1`/`0`/`null`）贯通。
+**③ 类型一致性**：`Inputs` 字段顺序/偏移在 Task 4 的 Rust 与 `log_upload_policy.h` 两处逐字一致（size 40，`local_set`@0、`server_set`@1、`has_pending`@2、`wifi_ready`@3、`pending_bytes`@4、`pending_lines`@8、`fail_streak`@12、`last_fail_s`@24、`now_s`@32）；`Decision` size 8、`max_bytes`@4 两处一致；三态枚举 `OPINION_NONE/OFF/ON` 与 `RF_LOG_OPINION_NONE/OFF/ON` 数值一致（0/1/2）；`rf_logbuf_read/ack/stats/install_hook` 在 Task 3 头文件、Task 3 实现、Task 5 的 `shim.rs` 声明三处同名同参；`rf_log_upload_server_get/set` 在 Task 5 的 `shim.rs` 与计划给出的 C++ 定义两处一致；`rf_log_upload_local_get/set` 在 Task 5 的 `shim.rs` 声明与 C++ 定义两处一致，Task 6 只消费；`MAX_UPLOAD_BYTES` 在 Task 4 定义为 1024，Task 5 的 body 缓冲 2048 与其 base64 膨胀一致；`devicelog.append_lines/tail_lines` 在 Task 1 定义、Task 2 消费，参数名与类型一致；服务端 `value` 与前端 `setLogUpload(id, value)` 的三态（`1`/`0`/`null`）贯通。
 
 **④ 一处已知的实现风险（不阻塞，Task 7 观测）**：`capture_hook` 内用 `vsnprintf`，而钩子可能落在 cache 关闭窗口。若真机出现该窗口下的异常，Task 7 Step 5 记录后另开任务处理——本计划不预先加防护，因为没有证据表明它在实践中发生。
