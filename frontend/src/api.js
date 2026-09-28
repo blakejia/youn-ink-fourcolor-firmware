@@ -102,4 +102,13 @@ export const api = {
   },
   powerHistory: (deviceId, hours = 24) =>
     request(`/devices/${encodeURIComponent(deviceId)}/power-history?hours=${hours}`),
+  // value is a three-state opinion: 1 = force on, 0 = force off, null = let
+  // the device decide. Not a boolean -- passing false would mean "force off"
+  // and permanently override the device's own switch.
+  setLogUpload: (id, value) =>
+    request(`/devices/${encodeURIComponent(id)}/log-upload`, { method: 'POST', body: { value } }),
+  // request() already parses a JSON response into its payload, so no .json()
+  // here -- calling it would throw on a plain object.
+  deviceLogs: (id, tail = 500) =>
+    request(`/devices/${encodeURIComponent(id)}/logs?tail=${tail}`),
 };

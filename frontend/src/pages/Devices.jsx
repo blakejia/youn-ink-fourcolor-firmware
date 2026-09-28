@@ -120,6 +120,8 @@ export default function Devices() {
   const [busy, setBusy] = useState('');
   // Battery detail modal: null = closed, else the device row to inspect.
   const [detailDevice, setDetailDevice] = useState(null);
+  // Device log viewer modal: null = closed, else the device row to inspect.
+  const [logDevice, setLogDevice] = useState(null);
 
   const fetchDevices = async () => {
     try { setDevices(await api.devices()); setErr(''); }
@@ -168,6 +170,19 @@ export default function Devices() {
     try {
       if (trust) await api.approve(device.device_id);
       else await api.revoke(device.device_id);
+      await fetchDevices();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(''); }
+  };
+
+  // 'auto' is the wire encoding for "no opinion" (null) -- never collapsed to 0,
+  // which would pin the service into forcing uploads off for good.
+  const setLogUpload = async (d, raw) => {
+    const value = raw === 'auto' ? null : Number(raw);
+    setBusy('log:' + d.device_id);
+    setErr('');
+    try {
+      await api.setLogUpload(d.device_id, value);
       await fetchDevices();
     } catch (e) { setErr(e.message); }
     finally { setBusy(''); }
@@ -281,6 +296,7 @@ export default function Devices() {
                   <th scope="col">板型</th>
                   <th scope="col">最近在线</th>
                   <th scope="col">首次上线</th>
+                  <th scope="col">日志上报</th>
                   <th scope="col">信任</th>
                   <th scope="col">电量</th>
                   <th scope="col">操作</th>
@@ -295,6 +311,26 @@ export default function Devices() {
                         exact timestamp on hover. */}
                     <td title={formatTime(d.last_seen)}>{timeAgo(d.last_seen)}</td>
                     <td className="muted" title={formatTime(d.first_seen)}>{formatTime(d.first_seen)}</td>
+                    {/* Three-state control: 开启 (1) / 关闭 (0) / 跟随设备 (null).
+                        A boolean switch cannot express "no opinion", and without
+                        that state the service could never hand control back to
+                        the device. */}
+                    <td>
+                      <select
+                        aria-label={`${d.device_id} 日志上报`}
+                        value={d.log_upload === null || d.log_upload === undefined ? 'auto' : String(d.log_upload)}
+                        disabled={busy === 'log:' + d.device_id}
+                        onChange={(e) => setLogUpload(d, e.target.value)}
+                        style={{ fontSize: 12 }}
+                      >
+                        <option value="1">开启</option>
+                        <option value="0">关闭</option>
+                        <option value="auto">跟随设备</option>
+                      </select>
+                      {localOverrideNote(d) && (
+                        <div className="muted" style={{ fontSize: 11 }}>{localOverrideNote(d)}</div>
+                      )}
+                    </td>
                     <td><span className={`badge ${d.trust ? 'on' : 'off'}`}>{d.trust ? '已信任' : '未信任'}</span></td>
                     {(() => {
                       const p = d.power;
@@ -318,14 +354,22 @@ export default function Devices() {
                       ) : <td style={{ fontSize: 12, color: '#aaa' }}>—</td>;
                     })()}
                     <td>
-                      <BusyButton
-                        className={d.trust ? 'btn danger' : 'btn'}
-                        busy={busy === 'trust:' + d.device_id}
-                        busyText="处理中…"
-                        onClick={() => setTrust(d, !d.trust)}
-                      >
-                        {d.trust ? '吊销' : '信任'}
-                      </BusyButton>
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <BusyButton
+                          className={d.trust ? 'btn danger' : 'btn'}
+                          busy={busy === 'trust:' + d.device_id}
+                          busyText="处理中…"
+                          onClick={() => setTrust(d, !d.trust)}
+                        >
+                          {d.trust ? '吊销' : '信任'}
+                        </BusyButton>
+                        {/* Opening the modal is not a request in itself — the
+                            modal owns its own load and refresh — so there is no
+                            in-flight state for a BusyButton to report here. */}
+                        <button type="button" className="btn secondary" onClick={() => setLogDevice(d)}>
+                          日志
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -337,6 +381,9 @@ export default function Devices() {
 
       {detailDevice && (
         <BatteryDetail device={detailDevice} onClose={() => setDetailDevice(null)} />
+      )}
+      {logDevice && (
+        <DeviceLog device={logDevice} onClose={() => setLogDevice(null)} />
       )}
     </div>
   );
@@ -496,6 +543,87 @@ function BatteryDetail({ device, onClose }) {
             </g>
           )}
         </svg>
+      </div>
+    </div>
+  );
+}
+
+// Explains why an enabled service setting may do nothing: the service only
+// wins when it has an opinion, and it always wins when it does. Returns ''
+// when there is nothing surprising to say. The two fields use DIFFERENT
+// encodings and must never be compared to each other: `local_log_upload`
+// comes from the schedule uplink (?lo=) as 0 none / 1 off / 2 on, while
+// `log_upload` is the service's own None / 0 / 1 opinion.
+function localOverrideNote(d) {
+  const local = d.local_log_upload;
+  const svc = d.log_upload;
+  if (local === null || local === undefined || local === 0) return '';
+  const localOn = local === 2;
+  if (svc === null || svc === undefined) {
+    return localOn ? '设备端已开' : '设备端已关';
+  }
+  if ((svc === 1) === localOn) return '';
+  return `服务端已覆盖：设备端${localOn ? '开' : '关'}`;
+}
+
+// Device-side log mirror viewer. Follows the BatteryDetail interaction
+// contract: a backdrop click on the backdrop itself and Escape close it, the
+// × button is the explicit close, and focus moves into the dialog on open.
+function DeviceLog({ device, onClose }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const dialogRef = useRef(null);
+
+  const load = async () => {
+    setLoading(true);
+    setErr('');
+    try {
+      setData(await api.deviceLogs(device.device_id, 500));
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, [device.device_id]);
+  useEffect(() => {
+    const onKey = e => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  useEffect(() => { dialogRef.current?.focus(); }, []);
+
+  const lines = (data && data.lines) || [];
+  return (
+    <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="modal" role="dialog" aria-modal="true" tabIndex={-1} ref={dialogRef}
+           aria-label={`${device.device_id} 设备日志`} style={{ maxWidth: 900 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <h2 className="modal-title" style={{ margin: 0 }}>设备日志 · {device.device_id}</h2>
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+            <BusyButton className="btn secondary" busy={loading} busyText="加载中…" onClick={load}>
+              刷新
+            </BusyButton>
+            <button type="button" className="spark-close" onClick={onClose} aria-label="关闭">×</button>
+          </div>
+        </div>
+        <Banner>{err}</Banner>
+        {data && !err && (
+          <>
+            <div className="muted" style={{ fontSize: 12, margin: '6px 0' }}>
+              {lines.length === 0
+                ? '暂无日志（设备尚未上报，或该设备的日志文件为空）。'
+                : `共 ${lines.length} 行${data.truncated ? '（已截断，仅显示尾部）' : ''}；行首为服务端接收时刻，正文里括号内的数字是设备 uptime 毫秒，不是墙钟。`}
+            </div>
+            {lines.length > 0 && (
+              <pre className="mono" style={{ maxHeight: 480, overflow: 'auto', fontSize: 12, whiteSpace: 'pre-wrap' }}>
+                {lines.join('\n')}
+              </pre>
+            )}
+          </>
+        )}
       </div>
     </div>
   );
