@@ -1079,7 +1079,11 @@ fn base() -> Inputs {
         server_set: OPINION_ON,
         has_pending: 1,
         wifi_ready: 1,
-        pending_bytes: 100,
+        // ABOVE MAX_UPLOAD_BYTES (1024) so the happy path actually exercises the
+        // cap; `max_bytes_is_capped_by_pending_bytes` pins the other bound of
+        // the min. (The first draft used 100, which cannot yield max_bytes ==
+        // MAX_UPLOAD_BYTES and made the happy-path assertion unsatisfiable.)
+        pending_bytes: 1500,
         pending_lines: 2,
         fail_streak: 0,
         _pad: [0; 4],
@@ -1427,6 +1431,7 @@ Expected: PASS（18 passed）
 Expected: `disabled_switch_skips`、`disabled_beats_everything`、`service_off_overrides_local_on`、`local_off_alone_disables`、`neither_side_speaking_leaves_it_off` FAIL，其余仍 PASS。改回。
 
 把 `resolve_enabled` 里的 `if server_set == OPINION_OFF { return false; }` 删掉，重跑：
+（注：直接删掉会让 `OPINION_OFF` 分支落到末尾的 `local_set == OPINION_ON` 上，而这在 Rust 里是**另一个分支**、删掉后 `server_set == OPINION_OFF` 只剩一个不可达的 match 臂 —— 用 if 形式时它会编译为 E0317「if may be missing an else clause」。等价且可编译的变异：把该 `if` 的 body 改成 `return true;`（即让 OFF 不再否决），效果相同。）
 Expected: 只有 `service_off_overrides_local_on` 与 `resolve_enabled_is_the_conflict_rule` FAIL——**这两个测试正是「冲突以服务端为准」这条规则的守卫**。改回。
 
 把 `if i.wifi_ready == 0` 改成 `if false`，重跑：
@@ -1579,6 +1584,18 @@ fn log_upload_try_once() -> bool {
     let mut dropped = 0u32;
     let mut used = 0u32;
     unsafe { shim::rf_logbuf_stats(&mut dropped, &mut used) };
+    // Read BEFORE building Inputs: `rf_logbuf_read` is the only source that
+    // knows how many whole frames the pending bytes contain, and that count
+    // (`lines`) is what the ack arithmetic later needs. Reading is a bounded
+    // byte copy under the ring lock — cheap, unlike the HTTP that `decide`
+    // gates. `seq_lo` is meaningful only when `lines > 0`.
+    let mut read_buf = CBuf::<1536>::new();
+    let mut seq_lo = 0u32;
+    let mut lines = 0u32;
+    unsafe {
+        shim::rf_logbuf_read(read_buf.as_mut_ptr(), 1536, &mut seq_lo, &mut lines);
+    }
+    read_buf.set_len_from_terminator();
     let (last_fail_s, fail_streak) = unsafe { shim::rf_log_upload_fail_state() };
     let inputs = log_upload_policy::Inputs {
         // Both opinions are three-state: the schedule policy is 0=none/1=off/
@@ -1588,7 +1605,7 @@ fn log_upload_try_once() -> bool {
         has_pending: if used > 0 { 1 } else { 0 },
         wifi_ready: 1,  // the caller only reaches here on a completed sync
         pending_bytes: used,
-        pending_lines: 0,
+        pending_lines: lines,
         fail_streak,
         _pad: [0; 4],
         last_fail_s,
@@ -1613,7 +1630,9 @@ fn log_upload_try_once() -> bool {
 
 上面代码里的 `log_upload_server_get()` 就是 `page_sync.rs` 对 `rf_log_upload_server_get()` 的薄包装（与既有的 `log_upload_enabled()` 同一手法）。**三态映射不能折平**：`policy.log_upload` 的 `null` 必须落成 `OPINION_NONE`，否则本地开关永远被覆盖。
 
-实现要点：`rf_logbuf_stats` 拿 `used`/`dropped`；`rf_logbuf_read` 取字节（缓冲用 `CBuf::<1536>`）；base64 照 `notify.rs` 用 `B64`；body 用 `CBuf::<2048>`；URL 用 `CBuf::<320>` + `rf_build_endpoint("/api/device-log", ...)`；HTTP 201 才 `rf_logbuf_ack(seq_lo + lines - 1)` 并清零 streak，否则 `fail_streak += 1`、`last_fail_s = now`。
+实现要点：`rf_logbuf_stats` 拿 `used`/`dropped`；`rf_logbuf_read` 取字节（缓冲用 `CBuf::<1536>`，同时拿 `out_seq_lo` 与 `out_lines`）；base64 照 `notify.rs` 用 `B64`；body 用 `CBuf::<2048>`；URL 用 `CBuf::<320>` + `rf_build_endpoint("/api/device-log", ...)`；HTTP 201 才 `rf_logbuf_ack(seq_lo + lines - 1)` 并清零 streak，否则 `fail_streak += 1`、`last_fail_s = now`。
+
+**顺序与零行约定**：先 `rf_logbuf_read` 拿 `(seq_lo, lines)`，再用它填 `Inputs.pending_lines`，然后才 `decide`；`lines == 0` 时**不要** ack（`seq_lo` 在零行时无意义，`seq_lo + 0 - 1` 会下溢成 `0xFFFFFFFF`，而 `ack` 的 `seq > seq_hi` 判断会因此 ack 掉全部）。`shim_log.h` 已声明该约定。
 
 在 `RunPowerCycle` 里、`page_sync_sync_once()` 返回成功之后调用一次 `log_upload_try_once()`（`application.cc` 已有该调用点）。
 
