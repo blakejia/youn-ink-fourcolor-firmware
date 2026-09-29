@@ -90,6 +90,7 @@ RTC_DATA_ATTR static rf_panel_record_t g_panel_rec;
 // an interrupted refresh cannot be recorded as done.
 static char g_pending_md5[33];
 static int g_pending_index = -1;
+static uint8_t g_pending_source = RF_PANEL_SRC_NONE;
 static bool g_pending_valid = false;
 // Guards g_panel_rec against g_pending_* on both writer sides (page-sync task
 // marks pending, the display refresh task commits) and the record reader. A
@@ -236,6 +237,7 @@ extern "C" void rf_panel_commit_hook_register(void) {
                 memcpy(g_panel_rec.displayed_md5, g_pending_md5,
                        sizeof(g_panel_rec.displayed_md5));
                 g_panel_rec.displayed_index = g_pending_index;
+                g_panel_rec.source = g_pending_source;
                 g_pending_valid = false;
             }
             portEXIT_CRITICAL(&g_panel_mux);
@@ -346,7 +348,7 @@ extern "C" void rf_panel_record_get(rf_panel_record_t *out) {
     portEXIT_CRITICAL(&g_panel_mux);
 }
 
-extern "C" void rf_panel_mark_pending(const char *md5, int index) {
+extern "C" void rf_panel_mark_pending_src(const char *md5, int index, uint8_t source) {
     if (md5 == nullptr) return;
     // Format outside the critical section; only the publish is locked.
     char staged[33];
@@ -354,14 +356,21 @@ extern "C" void rf_panel_mark_pending(const char *md5, int index) {
     portENTER_CRITICAL(&g_panel_mux);
     memcpy(g_pending_md5, staged, sizeof(g_pending_md5));
     g_pending_index = index;
+    g_pending_source = source;
     g_pending_valid = true;
     portEXIT_CRITICAL(&g_panel_mux);
+}
+
+extern "C" void rf_panel_mark_pending(const char *md5, int index) {
+    // 画板是既有的唯一调用者：默认记为画板来源，语义不变。
+    rf_panel_mark_pending_src(md5, index, RF_PANEL_SRC_CANVAS);
 }
 
 extern "C" void rf_panel_record_invalidate(void) {
     portENTER_CRITICAL(&g_panel_mux);
     g_panel_rec.valid = 0;
     g_panel_rec.magic = 0;
+    g_panel_rec.source = RF_PANEL_SRC_NONE;
     g_pending_valid = false;
     portEXIT_CRITICAL(&g_panel_mux);
 }

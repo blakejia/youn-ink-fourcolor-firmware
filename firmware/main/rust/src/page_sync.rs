@@ -35,26 +35,57 @@ const MD5_LEN: usize = 32;
 /// valid byte, so an all-zero record (power-on RTC memory) reads as unknown.
 const PANEL_MAGIC: u32 = 0x50414E31;
 
-/// 48-byte `rf_panel_record_t` with the alignment the device side assumes:
-/// shim.cpp publishes the record with a struct assignment (`*out = g_panel_rec`)
-/// whose members are 4-byte, so the buffer must be 4-aligned (`[u8; 48]` alone
-/// only guarantees 1-byte alignment).
+/// 与 `rust/include/shim_power.h` 的 `rf_panel_record_t` 逐字段对应。
+/// 用真结构体而非裸字节偏移：布局契约才有可断言的对象（见 tests）。
+/// `#[repr(C, align(4))]`：shim.cpp 用结构体赋值（`*out = g_panel_rec`）发布记录，
+/// 其成员为 4 字节对齐，缓冲区必须 4 对齐（裸 `[u8; 48]` 只保证 1 字节对齐）。
 #[repr(C, align(4))]
-struct PanelRecord([u8; 48]);
+pub struct PanelRecord {
+    pub magic: u32,              /* 0  */
+    pub valid: u8,               /* 4  */
+    pub source: u8,              /* 5  */
+    pub _pad: [u8; 2],           /* 6  */
+    pub displayed_md5: [u8; 33], /* 8  */
+    pub displayed_index: i32,    /* 44 */
+}
+
+/// 玻璃上的内容由谁绘制。数值与 shim_power.h 的 RF_PANEL_SRC_* 一致。
+pub const RF_PANEL_SRC_NONE: u8 = 0;
+pub const RF_PANEL_SRC_CANVAS: u8 = 1;
+pub const RF_PANEL_SRC_UI: u8 = 2;
+pub const RF_PANEL_SRC_SETTINGS: u8 = 3;
+pub const RF_PANEL_SRC_NOTIFICATION: u8 = 4;
+
+impl PanelRecord {
+    const ZERO: PanelRecord = PanelRecord {
+        magic: 0,
+        valid: 0,
+        source: RF_PANEL_SRC_NONE,
+        _pad: [0; 2],
+        displayed_md5: [0; 33],
+        displayed_index: 0,
+    };
+    /// 前 32 字节是服务端下发的 md5；第 33 字节是 NUL 终止位。
+    fn md5(&self) -> &[u8] {
+        &self.displayed_md5[..32]
+    }
+}
 
 fn read_panel_record() -> PanelRecord {
-    let mut rec = PanelRecord([0u8; 48]);
-    unsafe { shim::rf_panel_record_get(rec.0.as_mut_ptr()) };
+    let mut rec = PanelRecord::ZERO;
+    unsafe {
+        shim::rf_panel_record_get(&mut rec as *mut PanelRecord as *mut u8);
+    }
     rec
 }
 
-fn record_magic_ok(rec: &[u8; 48]) -> bool {
-    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) == PANEL_MAGIC
+fn record_magic_ok(rec: &PanelRecord) -> bool {
+    rec.magic == PANEL_MAGIC
 }
 
 /// Index the record says is on the glass (-1 = the empty hint).
-fn record_index(rec: &[u8; 48]) -> i32 {
-    i32::from_le_bytes([rec[44], rec[45], rec[46], rec[47]])
+fn record_index(rec: &PanelRecord) -> i32 {
+    rec.displayed_index
 }
 /// Fallbacks when the server sends no policy: the old hardcoded 10 s poll was
 /// 60x the server's intent and kept the radio up all day.
@@ -705,16 +736,16 @@ fn blit_and_refresh(idx: usize, slot: *mut u8) -> bool {
 // `prepare_paint` (the target must be the recorded one), while
 // `paint_if_changed` keys Content on the md5 alone — matching today's
 // exact behaviour.
-fn record_trusted(rec: &[u8; 48]) -> bool {
-    record_magic_ok(rec) && rec[4] != 0
+fn record_trusted(rec: &PanelRecord) -> bool {
+    record_magic_ok(rec) && rec.valid != 0
 }
 
 /// Page decision for the `prepare_paint` path (index-scoped).
-fn prepare_decision(idx: usize, md5: &[u8; MD5_LEN], resident: bool, rec: &[u8; 48]) -> page_compare_policy::PageDecision {
+fn prepare_decision(idx: usize, md5: &[u8; MD5_LEN], resident: bool, rec: &PanelRecord) -> page_compare_policy::PageDecision {
     page_compare_policy::decide_page(&page_compare_policy::PageInputs {
         bitmap_resident: resident as u8,
         record_trusted: record_trusted(rec) as u8,
-        glass_matches: (record_index(rec) == idx as i32 && rec[8..40] == md5[..]) as u8,
+        glass_matches: (record_index(rec) == idx as i32 && rec.md5() == &md5[..]) as u8,
         sync_ok: 1,
         has_target: 1,
         _pad: [0; 3],
@@ -722,12 +753,12 @@ fn prepare_decision(idx: usize, md5: &[u8; MD5_LEN], resident: bool, rec: &[u8; 
 }
 
 /// Page decision for the `paint_if_changed` path (md5-scoped, index-free).
-fn paint_decision(md5: &[u8; MD5_LEN], rec: &[u8; 48]) -> page_compare_policy::PageDecision {
+fn paint_decision(md5: &[u8; MD5_LEN], rec: &PanelRecord) -> page_compare_policy::PageDecision {
     let resident = false; // decided by the caller via ensure_bitmap below
     page_compare_policy::decide_page(&page_compare_policy::PageInputs {
         bitmap_resident: resident as u8,
         record_trusted: record_trusted(rec) as u8,
-        glass_matches: (rec[8..40] == md5[..]) as u8,
+        glass_matches: (rec.md5() == &md5[..]) as u8,
         sync_ok: LAST_SYNC_OK.load(Ordering::Acquire) as u8,
         has_target: 1,
         _pad: [0; 3],
@@ -754,7 +785,7 @@ pub fn prepare_paint() -> bool {
     // SkipSame (trusted record matches index+md5) and UseCache (bitmap
     // already resident) both mean "nothing to download"; Fetch and
     // InvalidateCache fall through to the on-demand download.
-    let decision = prepare_decision(idx, &md5, resident, &rec.0);
+    let decision = prepare_decision(idx, &md5, resident, &rec);
     match decision.action {
         page_compare_policy::COMPARE_SKIP_SAME
         | page_compare_policy::COMPARE_USE_CACHE => true,
@@ -780,8 +811,8 @@ pub fn paint_if_changed() -> bool {
         let rec = read_panel_record();
         let decision = page_compare_policy::decide_page(&page_compare_policy::PageInputs {
             bitmap_resident: 0,
-            record_trusted: record_trusted(&rec.0) as u8,
-            glass_matches: (record_index(&rec.0) == -1) as u8,
+            record_trusted: record_trusted(&rec) as u8,
+            glass_matches: (record_index(&rec) == -1) as u8,
             sync_ok: LAST_SYNC_OK.load(Ordering::Acquire) as u8,
             has_target: 0,
             _pad: [0; 3],
@@ -798,7 +829,7 @@ pub fn paint_if_changed() -> bool {
     // Task 5 (design §6): the same-glass short-circuit is the policy's
     // decision — magic AND valid gate trust, md5 equality gates the match.
     // The log line stays at the call site (mechanism, not policy).
-    if paint_decision(&md5, &rec.0).action == page_compare_policy::COMPARE_SKIP_SAME {
+    if paint_decision(&md5, &rec).action == page_compare_policy::COMPARE_SKIP_SAME {
         log_i!("PageSync", "glass already shows {:?}, skipping repaint",
             core::str::from_utf8(&md5[..8]).unwrap_or("?"));
         return false;
@@ -1514,6 +1545,20 @@ mod tests {
         format!("{tag:02x}").repeat(16)
     }
 
+    /// 布局契约：断言**真实**的 PanelRecord（reader 实际用的那个类型），
+    /// 不是镜像体——镜像体只能证明测试自己写对了，证明不了 reader 的读法。
+    /// source 占用原 _pad[3] 的首字节，故既有偏移与总长全部不变。
+    #[test]
+    fn panel_record_layout_keeps_every_offset_and_size() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(size_of::<PanelRecord>(), 48);
+        assert_eq!(offset_of!(PanelRecord, magic), 0);
+        assert_eq!(offset_of!(PanelRecord, valid), 4);
+        assert_eq!(offset_of!(PanelRecord, source), 5);
+        assert_eq!(offset_of!(PanelRecord, displayed_md5), 8);
+        assert_eq!(offset_of!(PanelRecord, displayed_index), 44);
+    }
+
     fn schedule_json_with_md5(sched_tag: u8, entries: &[(u8, u32)]) -> Vec<u8> {
         let pages: Vec<String> = entries
             .iter()
@@ -2223,7 +2268,7 @@ mod tests {
         // one this test must pin.
         let rec = read_panel_record();
         assert_ne!(
-            &rec.0[8..40],
+            rec.md5(),
             md5hex(0xa1).as_bytes(),
             "a failed fetch must not be recorded as displayed"
         );
@@ -2232,7 +2277,7 @@ mod tests {
         sync_once();
         assert!(paint_if_changed(), "the retry paints once the bitmap arrives");
         let rec = read_panel_record();
-        assert_eq!(&rec.0[8..40], md5hex(0xa1).as_bytes(), "and only then is it recorded");
+        assert_eq!(rec.md5(), md5hex(0xa1).as_bytes(), "and only then is it recorded");
     }
 
     #[test]

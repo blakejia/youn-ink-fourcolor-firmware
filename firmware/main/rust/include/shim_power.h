@@ -10,6 +10,7 @@
 #define SHIM_POWER_H
 
 #include <stdint.h>
+#include <stddef.h>   /* offsetof */
 
 #define RF_PANEL_MAGIC 0x50414E31u
 
@@ -17,18 +18,34 @@
 extern "C" {
 #endif
 
-/* Layout is relied on by the host stub and the Rust reader: valid at offset
- * 4, md5 at offset 8, index at 44, sizeof == 48. Keep them in sync. */
+/* Layout is relied on by the host stub and the Rust reader: valid at offset 4,
+ * source at offset 5, md5 at offset 8, index at offset 44, sizeof == 48.
+ * Keep them in sync. */
 typedef struct {
     uint32_t magic;              /* 0  */
     uint8_t  valid;              /* 4  */
-    uint8_t  _pad[3];            /* 5  */
+    uint8_t  source;             /* 5  */
+    uint8_t  _pad[2];            /* 6  */
     char     displayed_md5[33];  /* 8  */
     int32_t  displayed_index;    /* 44 */
 } rf_panel_record_t;             /* sizeof == 48 */
 
+/* 玻璃上的内容由谁绘制。粒度按「谁把玻璃整个拿走」，不按 renderer 穷举。 */
+#define RF_PANEL_SRC_NONE         0
+#define RF_PANEL_SRC_CANVAS       1
+#define RF_PANEL_SRC_UI           2
+#define RF_PANEL_SRC_SETTINGS     3
+#define RF_PANEL_SRC_NOTIFICATION 4
+
+_Static_assert(sizeof(rf_panel_record_t) == 48, "rf_panel_record_t must stay 48 bytes");
+_Static_assert(offsetof(rf_panel_record_t, valid) == 4, "valid at 4");
+_Static_assert(offsetof(rf_panel_record_t, source) == 5, "source at 5");
+_Static_assert(offsetof(rf_panel_record_t, displayed_md5) == 8, "md5 at 8");
+_Static_assert(offsetof(rf_panel_record_t, displayed_index) == 44, "index at 44");
+
 void rf_panel_record_get(rf_panel_record_t* out);
 void rf_panel_mark_pending(const char* md5, int index);
+void rf_panel_mark_pending_src(const char* md5, int index, uint8_t source);
 void rf_panel_record_invalidate(void);
 /* Re-chain the commit-on-idle hook (shim.cpp) after RawDrawUiManager::Init
  * replaced the refresh-idle slot on the promotion path. One call chains
