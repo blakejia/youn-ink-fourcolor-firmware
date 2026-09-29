@@ -399,7 +399,7 @@ a_record_written_by_the_ui_makes_the_canvas_repaint_the_same_md5 red."
 
 ---
 
-### Task 3: 三个交权点写入来源
+### Task 3: 四个交权点写入来源
 
 **Files:**
 - Modify: `firmware/main/rust/src/page_sync.rs`（`stop_display` → `stop_display_src` + `extern "C" page_sync_stop_display_src`）
@@ -493,7 +493,7 @@ pub extern "C" fn page_sync_stop_display_src(source: u8) {
 }
 ```
 
-- [ ] **Step 4: 接线三个调用点**
+- [ ] **Step 4: 接线四个调用点**
 
 `rust/include/page_sync.h` 在 `:80` 旁加：
 
@@ -516,12 +516,28 @@ void page_sync_stop_display_src(uint8_t source);
     page_sync::stop_display_src(RF_PANEL_SRC_NOTIFICATION);
 ```
 
-`application.cc:862` **不改**：promotion 此刻玻璃上还没有任何 UI 内容，
+**第四个调用点（Task 3 复审时补）** `application.cc` 的 `RF_INPUT_ACTION_STOP_CANVAS`
+分支（约 :1083，`EnterSettingsFromInput` 之前）：
+
+```cpp
+        case RF_INPUT_ACTION_STOP_CANVAS:
+            page_sync_stop_display_src(RF_PANEL_SRC_SETTINGS);
+            EnterSettingsFromInput(d.enter_settings != 0, d.drop_orphan_notification != 0);
+            return;
+```
+
+它必须写来源：这条路径之后 `EnterSettingsFromInput` 在
+`enter==false`（配网中）或 `rawdraw_ui_manager_==nullptr` 时会**直接返回**，
+`SwitchPage` 根本不执行 —— 即「拿走了玻璃，但没人记账」。原实现留下的 CANVAS
+记录会让下一次唤醒的 md5 命中并跳过重绘。
+
+`application.cc:862`（ServicePromotion）**不改**：此刻玻璃上还没有任何 UI 内容，
 「谁在玻璃上」尚不可知，`rf_panel_record_invalidate()`（`NONE`）是诚实取值，
 且对 `record_trusted` 与 `UI` 同效。在提交信息里记下这个决定。
 
-`RF_PANEL_SRC_SETTINGS` / `RF_PANEL_SRC_UI` 由 `rawdraw_ui_manager.cc` 经
-`shim_power.h` 取用（该文件已 include）；`notify.rs` 用 Task 1 定义的 Rust 常量。
+`RF_PANEL_SRC_SETTINGS` / `RF_PANEL_SRC_UI` 由 C++ 侧经 `shim_power.h` 取用
+（`rawdraw_ui_manager.cc` 需自行 include 它——它**没有**被间接带入）；
+`notify.rs` 用 Task 1 定义的 Rust 常量。
 
 - [ ] **Step 5: 跑测试 + 两个门禁**
 
