@@ -418,43 +418,48 @@ a_record_written_by_the_ui_makes_the_canvas_repaint_the_same_md5 red."
 - [ ] **Step 1: 写失败测试**
 
 ```rust
+    /// Task 3 的值不在策略层（source 的判别已由 Task 2 覆盖），而在**机制**：
+    /// 交权点真的把「谁拿走玻璃」写进了记录。断言字面值，不做两路一致性断言。
     #[test]
-    fn a_notification_taking_the_panel_invalidates_the_records_claim() {
+    fn taking_the_panel_records_who_took_it() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        stop_display_src(RF_PANEL_SRC_NOTIFICATION);
+        let rec = read_panel_record();
+        assert_eq!(rec.source, RF_PANEL_SRC_NOTIFICATION, "the taker is recorded");
+        assert_eq!(rec.valid, 1, "the takeover is a claim about the glass");
+        assert_eq!(
+            rec.displayed_index, -1,
+            "no canvas page is on the glass while the notification owns it"
+        );
+        assert!(
+            !record_trusted(&rec),
+            "a record the canvas did not paint must not be trusted"
+        );
+        // 默认路径（UI 切页/设置页）同样只经 source 区分。
+        stop_display_src(RF_PANEL_SRC_SETTINGS);
+        assert_eq!(read_panel_record().source, RF_PANEL_SRC_SETTINGS);
+        assert!(!record_trusted(&read_panel_record()));
+    }
+
+    /// 交权不等于撤销挂起：stop_display_src 必须仍然置 SUSPENDED。
+    #[test]
+    fn taking_the_panel_still_suspends_the_canvas() {
         let _g = shim::host::lock();
         reset_for_test();
         shim::host::set_fb();
-        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
-        shim::host::script_ok(
-            &format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)),
-            &bitmap_body(0xa1),
-        );
-        // 画板先把页画上去（record 记 CANVAS）。
-        assert!(sync_once());
-        assert!(paint_if_changed());
-        // 通知拿走玻璃。stop_display_src 会置 SUSPENDED，故必须先 allow_display()
-        // 才能让画板重新接手；allow_display 自己也会 show_current() 重绘一次。
-        stop_display_src(RF_PANEL_SRC_NOTIFICATION);
-        allow_display();
-        assert!(
-            __omp_shell("shim::host::fb().is_empty(),")
-            "the canvas is on the glass again"
-        );
-        // 关键判据：刚交出过屏幕，record 不再可信，下一次 paint 必须真重绘而不是跳过。
-        with_table(|t| t.override_index = None);
-        let before = shim::host::refreshes();
-        assert!(
-            __omp_shell("paint_if_changed() || shim::host::refreshes() > before,")
-            "a skipped repaint is exactly the divergence this fixes"
-        );
+        stop_display_src(RF_PANEL_SRC_UI);
+        assert!(!is_displaying(), "the UI holds the glass now");
+        assert!(!paint_if_changed(), "the canvas must not draw while suspended");
+        start();
+        assert!(is_displaying(), "the next wake hands it back");
     }
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test a_notification_taking_the_panel`
-Expected: 编译失败（`stop_display_src` 未定义）。**但不要只看「编译失败就对了」**：
-先确认你在 Step 1 写下的那段测试**本身**在 `stop_display_src` 存在后能过——
-Task 3 的测试断言的是 record 不可信后 `paint_if_changed` 会重绘，而不是它返回什么。
+Run: `cargo test taking_the_panel`
+Expected: 编译失败（`stop_display_src` 未定义）。编译失败即本步的红。
 
 - [ ] **Step 3: 实现 `stop_display_src`**
 
