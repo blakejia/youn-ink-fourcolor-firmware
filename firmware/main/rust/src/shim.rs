@@ -311,6 +311,7 @@ pub(crate) mod host {
         FB.lock().unwrap_or_else(|e| e.into_inner()).take();
         ALLOCS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *PANEL_PENDING.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *FAIL_STREAK.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         *NOTIFY_GATE.lock().unwrap_or_else(|e| e.into_inner()) = (-1, -1, 0);
         *TIME_NOW.lock().unwrap_or_else(|e| e.into_inner()) = 1_700_000_000;
@@ -326,11 +327,21 @@ pub(crate) mod host {
         guard
     }
 
-    /// The staged RTC panel record: (magic, valid, source, md5 bytes, displayed index).
+    /// One RTC panel record: (magic, valid, source, md5 bytes, displayed index).
     /// A zero-length md5 stages as an empty string — exactly what the device
     /// stores when the empty hint is recorded (32 zero bytes start with NUL) —
     /// so readers must key the hint on the index (-1) only, never on the md5.
-    static PANEL_REC: Mutex<Option<(u32, u8, u8, Vec<u8>, i32)>> = Mutex::new(None);
+    type PanelRec = Option<(u32, u8, u8, Vec<u8>, i32)>;
+
+    /// The COMMITTED record: what `rf_panel_record_get` publishes, i.e. the
+    /// device's `g_panel_rec` in RTC memory.
+    static PANEL_REC: Mutex<PanelRec> = Mutex::new(None);
+    /// The STAGED record: the device's `g_pending_*` set, published into
+    /// `g_panel_rec` only by the refresh-idle hook in
+    /// `rf_panel_commit_hook_register()`. Mirrored here so a test can observe
+    /// the two phases separately — publishing on `mark_pending` would let a
+    /// takeover test pass on a value the device would not have yet.
+    static PANEL_PENDING: Mutex<PanelRec> = Mutex::new(None);
     // rf_panel_record_get writes 48 bytes; see rf_panel_record_t.
     /// Consecutive schedule-sync failures (mirrors the device RTC word).
     static FAIL_STREAK: Mutex<u32> = Mutex::new(0);
@@ -363,9 +374,8 @@ pub(crate) mod host {
 
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_panel_mark_pending(md5: *const c_char, index: c_int) {
-        let md5 = cstr(md5).into_bytes();
-        *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((RF_PANEL_MAGIC, 1, crate::page_sync::RF_PANEL_SRC_CANVAS, md5, index));
+        // The canvas is the only mark_pending caller: the source is CANVAS.
+        mark_pending(md5, index, crate::page_sync::RF_PANEL_SRC_CANVAS);
     }
 
     #[unsafe(no_mangle)]
@@ -374,23 +384,51 @@ pub(crate) mod host {
         index: c_int,
         source: u8,
     ) {
+        mark_pending(md5, index, source);
+    }
+
+    /// Stage into the pending slot, never into the committed one (device:
+    /// `g_pending_valid = true` under `g_panel_mux`).
+    fn mark_pending(md5: *const c_char, index: c_int, source: u8) {
         let md5 = cstr(md5).into_bytes();
-        *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) =
+        *PANEL_PENDING.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((RF_PANEL_MAGIC, 1, source, md5, index));
     }
 
-    /// Stage an arbitrary panel record (tests only): writes the record directly
-    /// instead of going through `rf_panel_mark_pending`, so a test can stage
-    /// states the firmware never produces (wrong magic, cleared valid bit,
-    /// another owner on the glass).
+    /// Stage an arbitrary panel record (tests only): writes the COMMITTED
+    /// record directly instead of going through `rf_panel_mark_pending`, so a
+    /// test can pose states the firmware never produces (wrong magic, cleared
+    /// valid bit, another owner on the glass) as what a previous wake left in
+    /// RTC memory.
     pub fn stage_panel_record(magic: u32, valid: u8, source: u8, md5: &[u8], index: i32) {
         *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((magic, valid, source, md5.to_vec(), index));
     }
 
+    /// The device's refresh-idle hook, as a host seam: promote the staged
+    /// record into the committed one and clear the staging slot (device:
+    /// `if (g_pending_valid) { ... g_panel_rec.source = g_pending_source;
+    /// g_pending_valid = false; }`). Tests call this where a refresh would go
+    /// idle. The promotion — the `g_panel_rec.source = g_pending_source` line
+    /// under review — is what this seam exists to make reachable from Rust.
+    pub fn commit_panel_record() {
+        let pending = PANEL_PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(rec) = pending {
+            *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = Some(rec);
+        }
+    }
+
+    /// Whether a record is currently staged (tests only).
+    pub fn panel_record_pending() -> bool {
+        PANEL_PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_panel_record_invalidate() {
+        // Device clears both halves: `g_panel_rec.valid = 0; g_panel_rec.magic = 0;
+        // g_panel_rec.source = RF_PANEL_SRC_NONE; g_pending_valid = false;`
         *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *PANEL_PENDING.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     #[unsafe(no_mangle)]
