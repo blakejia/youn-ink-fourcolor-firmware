@@ -239,10 +239,13 @@ Expected: 布局测试 PASS（`source@5`、`sizeof 48`、`md5@8`、`index@44`）
 
 - [ ] **Step 6: 哨兵验证（证明布局断言不空转）**
 
-临时把 `PanelRecord` 的 `_pad: [u8; 2]` 改成 `[u8; 3]`，重跑：
+临时把 `PanelRecord` 的 `_pad: [u8; 2]` 改成 `[u8; 3]`，**同时**把 `PanelRecord::ZERO`
+里的 `_pad: [0; 2]` 改成 `[0; 3]`（否则先死在 `ZERO` 的 E0308 类型不匹配上，到不了布局断言
+——那不是你要的证据），重跑：
 Run: `cargo test panel_record_layout`
-Expected: **变红**（`size_of` 48→49，`displayed_md5` 偏移 8→9）。
-**然后改回 `[u8; 2]`**，重跑确认绿。
+Expected: **变红**，且失败在 `assert_eq!(offset_of!(PanelRecord, displayed_md5), 8)`，
+报告 `left: 9, right: 8`。**然后两处都改回 `[u8; 2]`/`[0; 2]`**，重跑确认绿。
+（若你看到的红是编译错误而非该断言失败，说明哨兵没到位，不算证据。）
 
 - [ ] **Step 7: 证明新符号进产物**
 
