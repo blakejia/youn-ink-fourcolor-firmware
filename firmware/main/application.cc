@@ -666,6 +666,22 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
             // the panel refresh is skipped.
             return;
         }
+        // A UI frame is about to reach the glass while the canvas does NOT hold
+        // it. If the RTC record still claims a canvas page is displayed, that
+        // claim is now false: the next wake's md5 compare would match and skip
+        // the repaint, leaving UI pixels up as if they were the canvas's page
+        // (the interactive-boot window, where BuildRawDrawUi runs before
+        // page_sync_start()). Cleared only when the record actually claims the
+        // canvas, so a legitimate canvas record is never touched, and this is a
+        // strict no-op whenever the state cannot arise.
+        if (!page_sync_is_displaying()) {
+            rf_panel_record_t rec;
+            rf_panel_record_get(&rec);
+            if (rec.magic == RF_PANEL_MAGIC && rec.valid != 0 &&
+                rec.source == RF_PANEL_SRC_CANVAS) {
+                rf_panel_record_invalidate();
+            }
+        }
         if (urgent) {
             lcd->RequestUrgentFullRefresh("ui");
         } else {
