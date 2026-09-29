@@ -169,6 +169,9 @@ const SYSTEM_ITEMS: &[Item] = &[
 ];
 
 const NETWORK_ITEMS: &[Item] = &[
+    // The log-upload switch leads the section: the holder's own consent is the
+    // first thing they come to, ahead of the radio's own controls.
+    I { id: ITEM_LOG_UPLOAD, label: c"日志上报", kind: Kind::Toggle },
     I { id: ITEM_WIFI_TOGGLE, label: c"Wi-Fi", kind: Kind::Toggle },
     I { id: ITEM_WIFI_STATE, label: c"连接状态", kind: Kind::Info },
     I { id: ITEM_WIFI_SSID, label: c"Wi-Fi 名称", kind: Kind::Info },
@@ -176,7 +179,6 @@ const NETWORK_ITEMS: &[Item] = &[
     I { id: ITEM_WIFI_IP, label: c"IP 地址", kind: Kind::Info },
     I { id: ITEM_WIFI_SIGNAL, label: c"信号强度", kind: Kind::Info },
     I { id: ITEM_WIFI_ERROR, label: c"失败原因", kind: Kind::Info },
-    I { id: ITEM_LOG_UPLOAD, label: c"日志上报", kind: Kind::Toggle },
     I { id: ITEM_SERVER, label: c"服务端", kind: Kind::Info },
 ];
 
@@ -653,19 +655,22 @@ mod tests {
         let labels: Vec<String> = NETWORK_ITEMS.iter().map(|i| i.label.to_str().unwrap().to_string()).collect();
         assert_eq!(
             labels,
-            vec!["Wi-Fi", "连接状态", "Wi-Fi 名称", "Wi-Fi 密码", "IP 地址", "信号强度", "失败原因", "日志上报", "服务端"]
+            vec!["日志上报", "Wi-Fi", "连接状态", "Wi-Fi 名称", "Wi-Fi 密码", "IP 地址", "信号强度", "失败原因", "服务端"]
         );
-        // Three rows can be acted on: the Wi-Fi switch, the password reveal and
-        // the device's own log-upload consent. Every other row is a read-out
+        // Three rows can be acted on: the device's own log-upload consent, the
+        // Wi-Fi switch and the password reveal. Every other row is a read-out
         // the cursor never rests on.
         let actionable: Vec<u8> = NETWORK_ITEMS
             .iter()
             .filter(|i| i.kind != Kind::Info)
             .map(|i| i.id)
             .collect();
-        assert_eq!(actionable, vec![ITEM_WIFI_TOGGLE, ITEM_WIFI_PASSWORD, ITEM_LOG_UPLOAD]);
+        assert_eq!(actionable, vec![ITEM_LOG_UPLOAD, ITEM_WIFI_TOGGLE, ITEM_WIFI_PASSWORD]);
+        // The log-upload switch leads the section, so the first thing a press
+        // can act on is the holder's own consent.
+        assert_eq!(NETWORK_ITEMS[0].id, ITEM_LOG_UPLOAD);
         assert_eq!(NETWORK_ITEMS[0].kind, Kind::Toggle);
-        assert_eq!(NETWORK_ITEMS[3].kind, Kind::Action);
+        assert_eq!(NETWORK_ITEMS[4].kind, Kind::Action);
     }
 
     // ── what the 网络 rows show ─────────────────────────────────────────
@@ -725,16 +730,16 @@ mod tests {
 
     #[test]
     fn boot_on_the_password_row_asks_to_reveal_it() {
-        let (c, e) = step(opts(1, 3), Button::Boot);
+        let (c, e) = step(opts(1, 4), Button::Boot);
         assert_eq!(e, Effect::Activate(ITEM_WIFI_PASSWORD));
-        assert_eq!(c, opts(1, 3), "revealing does not move the cursor");
+        assert_eq!(c, opts(1, 4), "revealing does not move the cursor");
     }
 
     #[test]
     fn the_cursor_walks_from_the_switch_straight_to_the_password_row() {
-        // Index 1 and 2 are read-outs, so DOWN must skip them.
-        let (c, e) = step(opts(1, 0), Button::Down);
-        assert_eq!(c, opts(1, 3));
+        // Index 2 and 3 are read-outs, so DOWN must skip them.
+        let (c, e) = step(opts(1, 1), Button::Down);
+        assert_eq!(c, opts(1, 4));
         assert_eq!(e, Effect::None);
     }
 
@@ -825,17 +830,17 @@ mod tests {
 
     #[test]
     fn the_cursor_skips_info_rows_and_stops_at_the_last_option() {
-        // 网络: 0 is the Wi-Fi toggle, 1–2 are read-outs, 3 is the password
-        // reveal, 4–6 are read-outs and 7 is the log-upload switch — the last
-        // option, with 服务端 read-only past it.
+        // 网络: 0 is the log-upload switch, 1 is the Wi-Fi toggle, 2–3 are
+        // read-outs, 4 is the password reveal and 5–7 are read-outs, with
+        // 服务端 read-only past the last option.
         let (c, _) = step(opts(1, 0), Button::Down);
-        assert_eq!(c.option, 3, "the read-outs between the two options are skipped");
-        let (c, _) = step(opts(1, 3), Button::Down);
-        assert_eq!(c.option, 7, "the read-outs between password and log upload are skipped too");
+        assert_eq!(c.option, 1, "the log-upload switch leads; the Wi-Fi switch is next");
+        let (c, _) = step(opts(1, 1), Button::Down);
+        assert_eq!(c.option, 4, "the read-outs between the two switches are skipped");
         assert_eq!(first_selectable(&SECTIONS[1]), Some(0));
-        assert_eq!(next_selectable(&SECTIONS[1], 0), Some(3));
-        assert_eq!(next_selectable(&SECTIONS[1], 3), Some(7));
-        assert_eq!(next_selectable(&SECTIONS[1], 7), None, "the log-upload switch is the last option");
+        assert_eq!(next_selectable(&SECTIONS[1], 0), Some(1));
+        assert_eq!(next_selectable(&SECTIONS[1], 1), Some(4));
+        assert_eq!(next_selectable(&SECTIONS[1], 4), None, "the password reveal is the last option");
     }
 
     #[test]
@@ -847,7 +852,7 @@ mod tests {
 
     #[test]
     fn boot_on_a_toggle_asks_for_a_toggle() {
-        let (_, e) = step(opts(1, 0), Button::Boot);
+        let (_, e) = step(opts(1, 1), Button::Boot);
         assert_eq!(e, Effect::Toggle(ITEM_WIFI_TOGGLE));
     }
 
@@ -939,11 +944,11 @@ mod tests {
 
     #[test]
     fn a_section_with_only_info_rows_never_takes_the_cursor() {
-        // The read-out past the last option (服务端) is no more reachable than
-        // the ones between: DOWN from the log-upload switch stays where it is,
-        // and the row it stays on is not an Info row.
-        let (c, _) = step(opts(1, 7), Button::Down);
-        assert_eq!(c.option, 7);
+        // The read-outs past the last option (失败原因/服务端) are no more
+        // reachable than the ones between: DOWN from the last option stays where
+        // it is, and the row it stays on is not an Info row.
+        let (c, _) = step(opts(1, 4), Button::Down);
+        assert_eq!(c.option, 4);
         assert!(NETWORK_ITEMS[c.option as usize].kind != Kind::Info);
     }
 
