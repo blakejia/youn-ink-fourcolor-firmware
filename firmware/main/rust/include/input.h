@@ -40,8 +40,10 @@ typedef struct {
     uint8_t provisioning;           /* lifecycle is ApProvision */
 } rf_input_inputs_t;
 
-/* Keep in step with the RF_INPUT_ACTION_* constants in input.rs; a Rust test
- * asserts the numbering. */
+/* Keep in step with the RF_INPUT_ACTION_* constants in input.rs. Rust asserts
+ * its own numbering (input.rs ffi_tests); nothing in the cargo build reads this
+ * header, so a value edited here alone is caught only by the C++ switch that
+ * consumes it. The header and input.rs are a matched pair. */
 typedef enum {
     RF_INPUT_ACTION_IGNORE = 0,
     RF_INPUT_ACTION_UI_INPUT = 1,

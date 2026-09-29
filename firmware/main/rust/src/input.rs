@@ -172,14 +172,21 @@ pub fn decide(i: &Inputs) -> Action {
         }
         (Button::Boot, Gesture::DoubleClick) => {
             // Force a schedule sync without waiting out the poll interval.
-            // A popup answers before the canvas (see the guard order above) and
-            // its own /next fetch may be in flight, so this is not its gesture.
-            if i.notify_active {
-                Action::Ignore
-            } else if i.canvas_displaying {
+            // Deliberately NOT Action::UiInput in the fall-through: RouteInput's
+            // UI_INPUT case has no BOOT+DOUBLE_CLICK arm, so it would fall to
+            // kBootClick — a confirm key the Settings menu never had (it can
+            // activate a row and arm the destructive resets) and a volume
+            // dialog on Chat. This gesture is the canvas's alone.
+            //
+            // `notify_active` is NOTIFYING only, so while a popup's own /next is
+            // FETCHING this still routes ForceSync; that is acceptable because
+            // RunPowerCycle waits the fetch out before the pre-paint radio cut
+            // and the policy holds the radio while is_fetching(). The guard that
+            // matters — a popup VISIBLE on the panel — is the one above.
+            if i.canvas_displaying && !i.notify_active {
                 Action::ForceSync
             } else {
-                Action::UiInput
+                Action::Ignore
             }
         }
         // Gestures the board never reports: there is no DOWN double-click and
@@ -303,22 +310,26 @@ mod tests {
     }
 
     #[test]
-    fn boot_double_click_leaves_settings_alone() {
-        // Settings answers its own keys; a network action from a menu would be
-        // the only gesture that does something off-screen.
+    fn boot_double_click_does_nothing_on_settings() {
+        // Settings must not gain a key through this gesture: arriving as
+        // kBootClick would activate/toggle the focused row and can arm the
+        // destructive resets.
         let i = Inputs {
             button: Button::Boot,
             gesture: Gesture::DoubleClick,
             on_settings: true,
             ..base()
         };
-        assert_eq!(decide(&i), Action::UiInput);
+        assert_eq!(decide(&i), Action::Ignore);
     }
 
     #[test]
-    fn boot_double_click_reaches_the_ui_when_nothing_owns_the_screen() {
+    fn boot_double_click_is_ignored_when_no_screen_owns_it() {
+        // Base behaviour for this gesture outside the canvas is Ignore; routing
+        // it to the UI would arrive as kBootClick (a confirm key) because
+        // RouteInput's UI_INPUT case has no BOOT+DOUBLE_CLICK arm.
         let i = Inputs { button: Button::Boot, gesture: Gesture::DoubleClick, ..base() };
-        assert_eq!(decide(&i), Action::UiInput);
+        assert_eq!(decide(&i), Action::Ignore);
     }
 
     // ── long press ──────────────────────────────────────────────────────

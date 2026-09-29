@@ -1184,11 +1184,10 @@ void Application::ForceScheduleSync() {
     // skips the repaint ("glass already shows ..."), so nothing would move.
     Board::GetInstance().FlashActivityLed();
     // Counts as user activity, so the policy cannot sleep the moment the cycle
-    // ends and make the key look dead. Deliberately NOT NoteButtonActivity():
-    // its else-branch calls RequestPromotion() when no UI exists, and promoting
-    // repaints the panel into the UI shell over the page the user is looking at
-    // (the ownership trap the screen-ownership notes warn about). Only the idle
-    // clock has to move here.
+    // ends and make the key look dead. Only the idle clock is stamped, not
+    // NoteButtonActivity(): that also requests an active-page refresh (a no-op
+    // while the canvas displays, and nothing here changes the UI) and skips the
+    // LED, which this path re-issues itself above.
     last_activity_ms_ = esp_timer_get_time() / 1000;
     // Re-evaluate almost immediately; force_cycle_ makes that tick run a cycle
     // rather than a bare policy check.
