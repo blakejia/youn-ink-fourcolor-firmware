@@ -1080,7 +1080,9 @@ void Application::RouteInput(uint8_t button, uint8_t gesture) {
             return;
 
         case RF_INPUT_ACTION_STOP_CANVAS:
-            page_sync_stop_display();
+            // 该分支的下一步恒为设置页入口（EnterSettingsFromInput 在 provisioning
+            // /UI 未就绪时早退，SwitchPage 不会跑，所以这里必须自己记录交权）。
+            page_sync_stop_display_src(RF_PANEL_SRC_SETTINGS);
             EnterSettingsFromInput(d.enter_settings != 0, d.drop_orphan_notification != 0);
             return;
 
