@@ -70,8 +70,13 @@ UI 已经/将要覆盖玻璃时误判跳过。
 - 不改变任何刷新行为（不做 C-2 的「物理关闭局部刷新」）。
 - 不解释 `rr=4` 的成因（独立主线，靠串口 backtrace）。
 - 不改动 `RefreshRect` 的局部刷新语义与性能特征。
-- **不修 promotion 竞态的上屏时机**（§1.1(a) 的 framebuffer 内容问题）——
-  本设计只保证「外壳上屏后 record 不再说谎」，不改变「外壳会先上屏一次」这个既有行为。
+- **不修启动外壳的「上屏时机」**（§1.1(a) 的 framebuffer 内容问题）——不抑制那次绘制、
+  不改启动顺序、不挂起画板。但**记账**必须关掉：终审发现 `BuildRawDrawUi`（`application.cc:521`）
+  跑在 `page_sync_start()`（`:413`，由 WiFi 连上后的配对任务触发）之前，`DISPLAYING=false`
+  的窗口是**秒级**（不是微秒），期间 UI 帧可以上玻璃而没有 `stop_display*`。
+  修法：在 `Init` 的刷新回调里、越过 deferred 返回之后加一处条件清除——当画板未持屏且记录仍
+  声称画板时调 `rf_panel_record_invalidate()`。必须用 invalidate（同步清已提交记录）而非
+  `stop_display_src`：`paint_if_changed` 读的是已提交记录。见 §3.8。
 
 ---
 
@@ -187,7 +192,7 @@ pub fn stop_display_src(source: u8) {
 
 | 行 | 函数 | 说明 |
 |---|---|---|
-| 356 | `Init` | 启动外壳；其「画进 framebuffer 但未刷新」是 §1.1(a) 竞态的成因，本设计不修 |
+| 356 | `Init` | 启动外壳。绘制本身不修；其刷新回调是 §3.8 缝隙守卫的落点（越过后才清除记录） |
 | 431 | `SwitchPage` | 其上的 `:404 stop_display()` 已负责（本设计改这里） |
 | 514 | `RefreshActivePage` | `Clear+RenderAll` 先经 `page_sync_is_displaying()` 守卫 |
 | 533 | `RefreshActivePageRect` | 同上 |
@@ -209,6 +214,47 @@ pub fn stop_display_src(source: u8) {
 - `shim.rs`：`rf_panel_mark_pending_src` 声明；主机 stub 的 `PANEL_REC` 元组
   加 `source` 字段，`stage_panel_record` 加参（4 个既有调用点同步更新）。
 - `shim_power.h`：结构体与 `RF_PANEL_SRC_*` 常量。
+
+### 3.8 启动外壳缝隙的记账（终审后补，2026-09-30）
+
+**缝隙**：`BuildRawDrawUi`（`application.cc:521`）在 `page_sync_start()`（`:413`）之前跑。
+后者在 `ServerPairingTaskTrampoline` 里，由 WiFi-Connected 事件触发（`StartServerPairingOnce`，
+`:559`，`s_pairing_started` 一次性去重），故 `page_sync_start()` 是**全仓唯一**的调用点，
+而 `DISPLAYING=false` 的窗口长度 = 「构建 UI 到 WiFi 连上」，**秒级**。
+
+**为什么它不是「Init 那一次绘制」**：配对启动时 `ui_boot_paint_deferred_=true`（`:519`），
+`Init` 的 `TriggerRefresh(true)` 被回调整体早退拦下；而清掉 deferred 之后的
+`RefreshActivePage` 会在 `DISPLAYING` 为真时早退。故 `Init` 自身大概率上不了玻璃。
+**真正能带 UI 帧上屏的是窗口内 flusher**（`NoteButtonActivity` / promotion 的
+`RequestActivePageRefresh`），它们不碰记录。
+
+**修法**（`application.cc` 的 `Init` 刷新回调，越过 deferred 返回之后）：
+
+```cpp
+        if (!page_sync_is_displaying()) {
+            rf_panel_record_t rec;
+            rf_panel_record_get(&rec);
+            if (rec.magic == RF_PANEL_MAGIC && rec.valid != 0 &&
+                rec.source == RF_PANEL_SRC_CANVAS) {
+                rf_panel_record_invalidate();
+            }
+        }
+```
+
+**为什么是 invalidate 而不是 `stop_display_src`/`mark_pending_src`**：`paint_if_changed`
+读的是**已提交**的 `g_panel_rec`，而 `mark_pending_src` 只写 `g_pending_*`，要等刷新 idle
+才提交。普通唤醒时提交方是 `RunPowerCycle` 的 `page_sync_paint_if_changed()`——正是这条要用
+修复判定的路径，循环依赖。`rf_panel_record_invalidate()` 同步清 `g_panel_rec`，无此问题。
+
+**为什么条件式清除而不是无条件**：只在「记录声称画板」时清，故**合法画板记录永不被碰**
+（深睡红线）。条件不成立时是严格空操作——不依赖「缝隙是否真的可达」这个未定问题。
+
+**反过来不能做**：不能在这里中止 UI 刷新（那会把一次既有绘制变成白屏或推迟上屏），
+那是改机制，超出本设计的边界。
+
+**待证**：缝隙是否真的可达，由真机串口日志判定——看
+`RawDraw UI Manager initialized`、`PageSync: started` 与紧随的 `skipping repaint`
+之间的先后，以及这处 invalidate 是否真的触发过。若日志证明不可达，这处守卫保持为惰性防御。
 
 ---
 
@@ -243,7 +289,7 @@ pub fn stop_display_src(source: u8) {
 |---|---|
 | 收紧后重绘次数增加 | 设计意图。**仅「交权之后」的首轮多一次全刷**；交权是用户驱动的低频事件（进设置页、收通知、promotion），**非每分钟**。§3.3 的选择正是为守住这条。 |
 | 深睡省电回归 | 深睡唤醒后画板正常重绘 → 记 `CANVAS` → 下次唤醒仍可跳过。**红线，必须守住**。 |
-| promotion 竞态仍在（外壳先上屏一次） | 明确列为非目标。本设计保证的是「上屏后 record 不再说谎」，下次周期会重绘回画板页。 |
+| 启动外壳仍可能先上屏一次 | 明确非目标（不改上屏时机）。但 record 不再说谎：§3.8 的缝隙守卫在 UI 帧上玻璃时清掉画板记录，故画板会重绘回来。 |
 | 未守卫的两处 `Clear+RenderAll` | 当前不可达（§3.6），登记为观察项；若将来可达，同属「UI 越权覆盖画板」，应加守卫而非本条记账。 |
 | `stage_panel_record` 签名变更 | 4 个既有调用点同步更新（`page_sync.rs:1382/1431/2085/2150`）。 |
 

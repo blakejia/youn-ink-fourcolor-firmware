@@ -57,8 +57,8 @@ schedule 查询串计数器（`w`=wakes, `a`=awake_ms, `r`=radio_ms, `g`=http_ge
 | 2 | 复位前 record 记着「某页在玻璃上」且 `valid=1` | `shim.cpp` commit 钩子 |
 | 3 | 重启后 `record_trusted()` 只查 `magic && valid`，record 仍可信 | `page_sync.rs:708-710` |
 | 4 | 目标页与 record 相同 → md5 相等 → `COMPARE_SKIP_SAME` | `page_sync.rs:799-803` |
-| 5 | 玻璃上是 UI 内容，因为 `ui_boot_paint_deferred_` 只跳过**面板刷新**，UI 内容照样渲染进 framebuffer | `application.cc:663-666` |
-| 6 | `rawdraw_ui_manager.cc` 有 **7 处** `Clear + RenderAll` 全屏重画，**全都不更新 record** | `:356/431/514/533/706/1437/1477` |
+| 5 | 玻璃上是 UI 内容：`ui_boot_paint_deferred_` 只跳过**面板刷新**，UI 内容照样渲染进 framebuffer。**但读代码无法判定这一帧如何在画板持屏时上玻璃**——`RenderAll` 在 `page_sync_is_displaying()` 时早退（`rawdraw_ui_manager.cc:729`），且 `Init` 自身那次刷新被 deferred 拦掉。 | `application.cc:663-666` |
+| 6 | `rawdraw_ui_manager.cc` 有 **7 处** `Clear + RenderAll` 全屏重画，**全都不更新 record**。不过其中 5 处受 `page_sync_is_displaying()` 早退保护，画板持屏时画不进玻璃 | `:356/431/514/533/706/1437/1477` |
 
 **结论**：record 说「画板某页在屏上」，玻璃上却是 UI 内容 → 分叉。
 
@@ -95,3 +95,31 @@ schedule 查询串计数器（`w`=wakes, `a`=awake_ms, `r`=radio_ms, `g`=http_ge
 
 - **未**解释 `rr=4` 的成因。`rr` 只说明"发生过 panic"，永远给不出"在哪崩"；需串口 backtrace（`Guru Meditation Error` 后的调用栈）。
 - **未**证明此分叉会导致除"显示陈旧"以外的后果（例如是否会影响后续唤醒的省电判定）。设计文档 §3.6 的路径清单是为此核对用。
+
+## 8. 更正（2026-09-29 复审时）与仍未定的一项
+
+**更正一**：本文件第 1 节把玻璃上出现 UI 内容写成「因为 render 落进了 framebuffer」，
+暗示它随后被刷上屏。核实后这个机制**不成立**：`RenderAll` 在
+`page_sync_is_displaying()` 时直接 return（`rawdraw_ui_manager.cc:729-730`），画板持屏时
+UI 根本画不进玻璃；且配对启动时 `Init` 的那次 `TriggerRefresh` 被
+`ui_boot_paint_deferred_`（`application.cc:519/663-666`）整体早退拦下。
+
+**更正二**：`invalidate` 的缺口不止「冷启动没有」。真正的窗口是
+`BuildRawDrawUi`（`application.cc:521`）到 `page_sync_start()`（`:413`）之间——
+后者由 WiFi 连上后的配对任务触发（`:559` → `:413`，`s_pairing_started` 一次性去重，
+`page_sync_start` 全仓仅此一个调用点），所以窗口是**秒级**而非微秒级。
+窗口内 `DISPLAYING=false`，UI 帧可通过 flusher
+（`NoteButtonActivity` / promotion 的 `RequestActivePageRefresh`）上玻璃，而它们不碰记录。
+
+**仍未定 / 待真机判定**：上面那个「UI 帧在画板持屏时上玻璃」的实际机制**尚未被正向证明**。
+可判定它的证据全在下一次串口日志里：
+
+```text
+RawDraw UI Manager initialized      <- UI 已构建（此时 DISPLAYING 仍为 false）
+PageSync: started                   <- page_sync_start() 真正跑的时刻
+glass already shows ..., skipping repaint   <- 出现在哪一个之后？
+```
+
+若 `skipping repaint` 出现在 `PageSync: started` 之后且期间玻璃上是 UI 帧，则缝隙可达，
+`application.cc` 刷新回调里那处条件 invalidate 会被触发（修复生效）；若不出现，该守卫
+保持为惰性防御，无副作用。**在此之前不要声称本缺陷已完全关闭。**
