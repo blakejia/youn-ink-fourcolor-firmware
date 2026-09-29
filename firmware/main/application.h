@@ -57,6 +57,7 @@ public:
     void OnDownLongPress();
     void OnWifiConfigComboLongPress();
     void OnBootClick();
+    void OnBootDoubleClick();
     void OnBootLongPress();
     // Button routing: gather the facts, let input.rs decide who owns the
     // gesture, perform the answer. The handlers above are thin wrappers.
@@ -128,6 +129,11 @@ private:
     std::atomic<bool> ui_boot_paint_deferred_{false};
     // (The sync-failure backoff streak is NOT here: it lives in RTC memory
     // via rf_fail_streak_*, because RAM is cleared on every deep-sleep wake.)
+    // One-shot: a tick arriving with this set runs a cycle even though the
+    // poll interval has not elapsed. Set by ForceScheduleSync (BOOT double
+    // click), cleared by the dispatcher. Written and read in the esp_timer
+    // task only (the button callbacks also run there), so no atomic is needed.
+    bool force_cycle_ = false;
     // Set by RunPowerCycle immediately before page_sync_sync_once(); consumed
     // (cleared) by ServicePowerPolicy. The streak advances at most once per
     // real sync attempt — timer re-arms (mains/grace/busy) must not ratchet
@@ -144,6 +150,12 @@ private:
     // stopped STA. Per-boot RAM by design: deep sleep reboots clear it, and
     // the sleep path never returns.
     bool radio_cut_for_paint_ = false;
+
+    // BOOT double click on the canvas: run the schedule cycle now instead of
+    // waiting out the poll interval. Re-arms the power timer short so the
+    // dispatcher re-evaluates immediately; the one-shot flag below is what
+    // makes that tick run a cycle rather than a bare policy check.
+    void ForceScheduleSync();
 
     void RearmPowerTimer(uint32_t delay_ms);
     // esp_timer callback: run the one-shot cycle when one is due, else just

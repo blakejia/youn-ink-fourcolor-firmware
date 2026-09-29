@@ -937,6 +937,11 @@ void Application::OnBootClick() {
     RouteInput(RF_INPUT_BOOT, RF_INPUT_CLICK);
 }
 
+void Application::OnBootDoubleClick() {
+    ESP_LOGI(kTag, "BOOT double click");
+    RouteInput(RF_INPUT_BOOT, RF_INPUT_DOUBLE_CLICK);
+}
+
 void Application::OnBootLongPress() {
     ESP_LOGI(kTag, "BOOT long press");
     RouteInput(RF_INPUT_BOOT, RF_INPUT_LONG_PRESS);
@@ -1061,6 +1066,10 @@ void Application::RouteInput(uint8_t button, uint8_t gesture) {
             page_sync_allow_display();
             return;
 
+        case RF_INPUT_ACTION_FORCE_SYNC:
+            ForceScheduleSync();
+            return;
+
         case RF_INPUT_ACTION_ENTER_WIFI_CONFIG:
             EnterWifiConfigMode();
             return;
@@ -1161,6 +1170,32 @@ void Application::NoteQuietWake() {
     last_activity_ms_ = -1;
 }
 
+void Application::ForceScheduleSync() {
+    // Already running a cycle: ignore. That cycle's terminal policy call
+    // re-arms the timer, and a request landing mid-cycle could otherwise
+    // evaluate against stale sync state (the same reason the dispatcher
+    // defers). Pressing again once it finishes works.
+    if (cycle_in_progress_.load(std::memory_order_acquire)) {
+        ESP_LOGI(kTag, "force sync ignored (cycle in progress)");
+        return;
+    }
+    ESP_LOGI(kTag, "force sync requested");
+    // The only immediate feedback: when the schedule is unchanged the canvas
+    // skips the repaint ("glass already shows ..."), so nothing would move.
+    Board::GetInstance().FlashActivityLed();
+    // Counts as user activity, so the policy cannot sleep the moment the cycle
+    // ends and make the key look dead. Deliberately NOT NoteButtonActivity():
+    // its else-branch calls RequestPromotion() when no UI exists, and promoting
+    // repaints the panel into the UI shell over the page the user is looking at
+    // (the ownership trap the screen-ownership notes warn about). Only the idle
+    // clock has to move here.
+    last_activity_ms_ = esp_timer_get_time() / 1000;
+    // Re-evaluate almost immediately; force_cycle_ makes that tick run a cycle
+    // rather than a bare policy check.
+    force_cycle_ = true;
+    RearmPowerTimer(250);
+}
+
 void Application::OnPowerTimer() {
     // The timer fires for two reasons: (a) the first evaluation after WiFi
     // comes up, which must run the one-shot sync/paint cycle — until this
@@ -1184,7 +1219,12 @@ void Application::OnPowerTimer() {
     const bool interval_elapsed =
         !never_ran && poll_s > 0 &&
         (uint64_t)(now_ms - last_cycle_ms_) >= (uint64_t)poll_s * 1000u;
-    if (never_ran || interval_elapsed) {
+    // A BOOT double click asked for a cycle now: consume the request here so
+    // exactly one tick honours it. last_cycle_ms_ is left alone — it is also
+    // the duration ledger's baseline, and backdating it would corrupt radio_ms.
+    const bool forced = force_cycle_;
+    force_cycle_ = false;
+    if (never_ran || interval_elapsed || forced) {
         RunPowerCycle();
     } else {
         ServicePowerPolicy();

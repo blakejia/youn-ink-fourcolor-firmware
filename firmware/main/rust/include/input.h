@@ -24,7 +24,7 @@ typedef enum {
 
 typedef enum {
     RF_INPUT_CLICK = 0,
-    RF_INPUT_DOUBLE_CLICK = 1,
+    RF_INPUT_DOUBLE_CLICK = 1, /* UP: quick switch; BOOT: force a sync */
     RF_INPUT_LONG_PRESS = 2,
     RF_INPUT_COMBO_LONG_PRESS = 3, /* UP and DOWN held together */
 } rf_input_gesture_t;
@@ -55,6 +55,7 @@ typedef enum {
     RF_INPUT_ACTION_ENTER_WIFI_CONFIG = 9,
     RF_INPUT_ACTION_EXIT_WIFI_CONFIG = 10,
     RF_INPUT_ACTION_STOP_CANVAS = 11,
+    RF_INPUT_ACTION_FORCE_SYNC = 12, /* run the schedule cycle now */
 } rf_input_action_t;
 
 typedef struct {

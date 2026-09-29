@@ -559,6 +559,17 @@ private:
             FactoryTestService::Instance().HandleButton(FactoryTestButton::kConfirmClick);
         });
 
+        // CONFIRM (BOOT) double click → force a schedule sync now.
+        // The component reports DOUBLE_CLICK only on the second release
+        // (iot_button.c: repeat == 2), so this cannot also fire the single-click
+        // handler and pull a notification.
+        confirm_button_.OnDoubleClick([]() {
+            auto& app = Application::GetInstance();
+            if (app.GetRawDrawUiManager()) {
+                app.OnBootDoubleClick();
+            }
+        });
+
         // CONFIRM (BOOT) long press → voice PTT or factory test
         confirm_button_.OnLongPress([]() {
             auto& app = Application::GetInstance();

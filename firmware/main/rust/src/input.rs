@@ -65,6 +65,11 @@ pub enum Action {
     ExitWifiConfig(SettingsEntry),
     /// Give the panel back, then take the Settings entry below.
     StopCanvas(SettingsEntry),
+    /// Run the schedule cycle now instead of waiting for the poll interval.
+    /// Only the canvas answers it: a popup owns the panel and a forced cycle
+    /// would tear the radio down under its in-flight fetch; Settings answers
+    /// its own keys and a network action from a menu is off-screen surprise.
+    ForceSync,
 }
 
 /// How to enter Settings. All three ways in share it, because the old code
@@ -165,11 +170,22 @@ pub fn decide(i: &Inputs) -> Action {
                 Action::UiInput
             }
         }
+        (Button::Boot, Gesture::DoubleClick) => {
+            // Force a schedule sync without waiting out the poll interval.
+            // A popup answers before the canvas (see the guard order above) and
+            // its own /next fetch may be in flight, so this is not its gesture.
+            if i.notify_active {
+                Action::Ignore
+            } else if i.canvas_displaying {
+                Action::ForceSync
+            } else {
+                Action::UiInput
+            }
+        }
         // Gestures the board never reports: there is no DOWN double-click and
-        // no BOOT double-click or combo. Listing them keeps the match total, so
-        // a new gesture cannot slip through unmatched.
+        // no BOOT combo. Listing them keeps the match total, so a new gesture
+        // cannot slip through unmatched.
         (Button::Down, Gesture::DoubleClick)
-        | (Button::Boot, Gesture::DoubleClick)
         | (Button::Boot, Gesture::ComboLongPress) => Action::Ignore,
     }
 }
@@ -267,6 +283,41 @@ mod tests {
     #[test]
     fn double_click_reaches_the_ui_otherwise() {
         let i = Inputs { gesture: Gesture::DoubleClick, ..base() };
+        assert_eq!(decide(&i), Action::UiInput);
+    }
+
+    // ── BOOT double click: force a schedule sync ────────────────────────
+    #[test]
+    fn boot_double_click_forces_a_sync_on_the_canvas() {
+        let i = Inputs { button: Button::Boot, gesture: Gesture::DoubleClick, canvas_displaying: true, ..base() };
+        assert_eq!(decide(&i), Action::ForceSync);
+    }
+
+    #[test]
+    fn boot_double_click_does_not_answer_a_popup() {
+        // A popup owns the panel and BOOT's other gestures say "not now"; a
+        // forced sync would also tear the radio down under the popup's own
+        // in-flight fetch.
+        let i = Inputs { button: Button::Boot, gesture: Gesture::DoubleClick, notify_active: true, ..base() };
+        assert_eq!(decide(&i), Action::Ignore);
+    }
+
+    #[test]
+    fn boot_double_click_leaves_settings_alone() {
+        // Settings answers its own keys; a network action from a menu would be
+        // the only gesture that does something off-screen.
+        let i = Inputs {
+            button: Button::Boot,
+            gesture: Gesture::DoubleClick,
+            on_settings: true,
+            ..base()
+        };
+        assert_eq!(decide(&i), Action::UiInput);
+    }
+
+    #[test]
+    fn boot_double_click_reaches_the_ui_when_nothing_owns_the_screen() {
+        let i = Inputs { button: Button::Boot, gesture: Gesture::DoubleClick, ..base() };
         assert_eq!(decide(&i), Action::UiInput);
     }
 
@@ -434,6 +485,7 @@ pub const RF_INPUT_ACTION_LEAVE_SETTINGS: u8 = 8;
 pub const RF_INPUT_ACTION_ENTER_WIFI_CONFIG: u8 = 9;
 pub const RF_INPUT_ACTION_EXIT_WIFI_CONFIG: u8 = 10;
 pub const RF_INPUT_ACTION_STOP_CANVAS: u8 = 11;
+pub const RF_INPUT_ACTION_FORCE_SYNC: u8 = 12;
 
 #[repr(C)]
 pub struct CInputs {
@@ -531,6 +583,7 @@ pub unsafe extern "C" fn rf_input_decide(inp: *const CInputs, out: *mut CDecisio
             d.enter_settings = e.enter as u8;
             RF_INPUT_ACTION_STOP_CANVAS
         }
+        Action::ForceSync => RF_INPUT_ACTION_FORCE_SYNC,
     };
     unsafe { *out = d };
 }
@@ -598,6 +651,17 @@ mod ffi_tests {
         let d = call(&i);
         assert_eq!(d.action, RF_INPUT_ACTION_STOP_CANVAS);
         assert_eq!(d.enter_settings, 0);
+    }
+
+    #[test]
+    fn the_c_side_sees_boot_double_click_as_force_sync() {
+        // Absolute: the C enum in rust/include/input.h must carry this number.
+        assert_eq!(RF_INPUT_ACTION_FORCE_SYNC, 12);
+        let i = CInputs { button: 2, gesture: 1, canvas_displaying: 1, ..base() };
+        assert_eq!(call(&i).action, 12);
+        // And BOOT double click on a popup still comes back as IGNORE.
+        let i = CInputs { button: 2, gesture: 1, notify_active: 1, ..base() };
+        assert_eq!(call(&i).action, RF_INPUT_ACTION_IGNORE);
     }
 
     #[test]
