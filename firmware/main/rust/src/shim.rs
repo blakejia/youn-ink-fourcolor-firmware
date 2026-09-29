@@ -81,6 +81,10 @@ unsafe extern "C" {
     /// Copies the RTC panel record into `out` (a 48-byte `rf_panel_record_t`).
     pub fn rf_panel_record_get(out: *mut u8);
     pub fn rf_panel_mark_pending(md5: *const c_char, index: c_int);
+    /// Same as `rf_panel_mark_pending`, but records WHO painted the glass
+    /// (one of the RF_PANEL_SRC_* values from shim_power.h); `mark_pending`
+    /// is the canvas path and always writes CANVAS.
+    pub fn rf_panel_mark_pending_src(md5: *const c_char, index: c_int, source: u8);
     pub fn rf_panel_record_invalidate();
     /// Consecutive sync failures, persisted in RTC memory on device.
     pub fn rf_fail_streak_get() -> u32;
@@ -322,17 +326,17 @@ pub(crate) mod host {
         guard
     }
 
-    /// The staged RTC panel record: (magic, valid, md5 bytes, displayed index).
+    /// The staged RTC panel record: (magic, valid, source, md5 bytes, displayed index).
     /// A zero-length md5 stages as an empty string — exactly what the device
     /// stores when the empty hint is recorded (32 zero bytes start with NUL) —
     /// so readers must key the hint on the index (-1) only, never on the md5.
-    static PANEL_REC: Mutex<Option<(u32, u8, Vec<u8>, i32)>> = Mutex::new(None);
+    static PANEL_REC: Mutex<Option<(u32, u8, u8, Vec<u8>, i32)>> = Mutex::new(None);
     // rf_panel_record_get writes 48 bytes; see rf_panel_record_t.
     /// Consecutive schedule-sync failures (mirrors the device RTC word).
     static FAIL_STREAK: Mutex<u32> = Mutex::new(0);
     static AUDIO_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     /// Same value as RF_PANEL_MAGIC in shim_power.h; the stub must mirror the
-    /// device record exactly (magic@0, valid@4, md5@8, index@44).
+    /// device record exactly (magic@0, valid@4, source@5, md5@8, index@44).
     const RF_PANEL_MAGIC: u32 = 0x50414E31;
 
     #[unsafe(no_mangle)]
@@ -347,9 +351,10 @@ pub(crate) mod host {
             // sizeof(rf_panel_record_t) == 48; the caller's buffer is the struct,
             // and zeroing only the md5 slot would leave index/pad bytes stale.
             core::ptr::write_bytes(out, 0, 48);
-            if let Some((magic, valid, md5, index)) = g.as_ref() {
+            if let Some((magic, valid, source, md5, index)) = g.as_ref() {
                 core::ptr::write_unaligned(out as *mut u32, *magic);
                 *out.add(4) = *valid;
+                *out.add(5) = *source;
                 core::ptr::copy_nonoverlapping(md5.as_ptr(), out.add(8), md5.len().min(32));
                 core::ptr::write_unaligned(out.add(44) as *mut i32, *index);
             }
@@ -360,15 +365,27 @@ pub(crate) mod host {
     pub extern "C" fn rf_panel_mark_pending(md5: *const c_char, index: c_int) {
         let md5 = cstr(md5).into_bytes();
         *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((RF_PANEL_MAGIC, 1, md5, index));
+            Some((RF_PANEL_MAGIC, 1, crate::page_sync::RF_PANEL_SRC_CANVAS, md5, index));
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rf_panel_mark_pending_src(
+        md5: *const c_char,
+        index: c_int,
+        source: u8,
+    ) {
+        let md5 = cstr(md5).into_bytes();
+        *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((RF_PANEL_MAGIC, 1, source, md5, index));
     }
 
     /// Stage an arbitrary panel record (tests only): writes the record directly
     /// instead of going through `rf_panel_mark_pending`, so a test can stage
-    /// states the firmware never produces (wrong magic, cleared valid bit).
-    pub fn stage_panel_record(magic: u32, valid: u8, md5: &[u8], index: i32) {
+    /// states the firmware never produces (wrong magic, cleared valid bit,
+    /// another owner on the glass).
+    pub fn stage_panel_record(magic: u32, valid: u8, source: u8, md5: &[u8], index: i32) {
         *PANEL_REC.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((magic, valid, md5.to_vec(), index));
+            Some((magic, valid, source, md5.to_vec(), index));
     }
 
     #[unsafe(no_mangle)]

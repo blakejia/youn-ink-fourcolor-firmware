@@ -736,8 +736,10 @@ fn blit_and_refresh(idx: usize, slot: *mut u8) -> bool {
 // `prepare_paint` (the target must be the recorded one), while
 // `paint_if_changed` keys Content on the md5 alone — matching today's
 // exact behaviour.
+/// 玻璃上的说法只有在「确实是画板画上去的」时才可信。UI/设置/通知占过屏后，
+/// record 记的那页已经不在玻璃上了，md5 命中也不再意味着可以跳过重绘。
 fn record_trusted(rec: &PanelRecord) -> bool {
-    record_magic_ok(rec) && rec.valid != 0
+    record_magic_ok(rec) && rec.valid != 0 && rec.source == RF_PANEL_SRC_CANVAS
 }
 
 /// Page decision for the `prepare_paint` path (index-scoped).
@@ -1410,10 +1412,47 @@ mod tests {
         assert!(sync_once());
         // Garbage RTC: valid bit set and md5 matching, but the magic is wrong
         // (cold boot / corruption). Only the magic makes this safe to distrust.
-        shim::host::stage_panel_record(0xDEAD_BEEF, 1, md5hex(0xa1).as_bytes(), 0);
+        shim::host::stage_panel_record(0xDEAD_BEEF, 1, RF_PANEL_SRC_CANVAS, md5hex(0xa1).as_bytes(), 0);
         assert!(paint_if_changed(), "wrong magic -> repaint even though valid and md5 match");
         assert_eq!(shim::host::fb()[0], 0xa1);
         assert_eq!(shim::host::refreshes(), 1);
+    }
+
+    #[test]
+    fn a_record_written_by_the_ui_makes_the_canvas_repaint_the_same_md5() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
+        shim::host::script_ok(
+            &format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)),
+            &bitmap_body(0xa1),
+        );
+        // 玻璃上确实是 0xa1 那个 md5，但它是 UI 画的（来源不是画板）。
+        shim::host::stage_panel_record(
+            PANEL_MAGIC, 1, RF_PANEL_SRC_UI, md5hex(0xa1).as_bytes(), 0,
+        );
+        assert!(sync_once());
+        assert!(
+            paint_if_changed(),
+            "same md5 but the UI painted it -> the canvas must repaint"
+        );
+        assert_eq!(shim::host::fb()[0], 0xa1);
+        assert_eq!(shim::host::refreshes(), 1);
+    }
+
+    #[test]
+    fn a_record_written_by_the_canvas_still_skips_the_repaint() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
+        shim::host::stage_panel_record(
+            PANEL_MAGIC, 1, RF_PANEL_SRC_CANVAS, md5hex(0xa1).as_bytes(), 0,
+        );
+        assert!(sync_once());
+        assert!(!paint_if_changed(), "the canvas already shows page 0");
+        assert_eq!(shim::host::refreshes(), 0);
     }
 
     #[test]
@@ -1459,7 +1498,7 @@ mod tests {
         reset_for_test();
         shim::host::set_fb();
         // The RTC record says page 0 is on the glass (a previous boot's page).
-        shim::host::stage_panel_record(0x50414E31, 1, md5hex(0xa1).as_bytes(), 0);
+        shim::host::stage_panel_record(0x50414E31, 1, RF_PANEL_SRC_CANVAS, md5hex(0xa1).as_bytes(), 0);
         // This wake never reaches the server: the table stays empty.
         shim::host::script_get("/api/pages/schedule", 500, b"");
         assert!(!sync_once());
@@ -2127,7 +2166,7 @@ mod tests {
         let _g = shim::host::lock();
         reset_for_test();
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10), (0xb2, 5)]));
-        shim::host::stage_panel_record(0x50414E31, 1, md5hex(0xa1).as_bytes(), 0);
+        shim::host::stage_panel_record(0x50414E31, 1, RF_PANEL_SRC_CANVAS, md5hex(0xa1).as_bytes(), 0);
 
         sync_once();
         assert!(!paint_if_changed(), "the glass already shows page 0");
@@ -2192,7 +2231,7 @@ mod tests {
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
         // No bitmap is scripted on purpose: the glass already shows the target
         // page, so prepare must not issue a bitmap GET at all.
-        shim::host::stage_panel_record(0x50414E31, 1, md5hex(0xa1).as_bytes(), 0);
+        shim::host::stage_panel_record(0x50414E31, 1, RF_PANEL_SRC_CANVAS, md5hex(0xa1).as_bytes(), 0);
         sync_once();
         assert!(
             prepare_paint(),
