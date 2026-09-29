@@ -402,8 +402,8 @@ void RawDrawUiManager::SwitchPage(RawDrawPageId page) {
     // UI 显式切页 = UI 接管屏幕。必须先挂起画板绘制：
     // 否则 (a) 本函数下面的 Clear 之后 RenderAll 会因画板仍在显示而早退，
     // 把白屏刷进 EPD；(b) 画板下一轮轮换会把 UI 页面盖回去。
-    // UI 显式切页 = UI 接管屏幕。来源随目标页：设置页单列，便于日志分辨
-    // 屏上是哪一类 UI（对 record_trusted 而言两者同效，都让画板的说法失效）。
+    // 来源随目标页：设置页单列，便于日志分辨屏上是哪一类 UI
+    // （对 record_trusted 而言两者同效，都让画板的说法失效）。
     page_sync_stop_display_src(
         (page == RawDrawPageId::Settings) ? RF_PANEL_SRC_SETTINGS : RF_PANEL_SRC_UI);
 
