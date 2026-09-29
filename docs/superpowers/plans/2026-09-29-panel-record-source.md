@@ -146,7 +146,7 @@ fn read_panel_record() -> PanelRecord {
 
 ```rust
 fn record_magic_ok(rec: &PanelRecord) -> bool {
-    rec.magic == RF_PANEL_MAGIC
+    rec.magic == PANEL_MAGIC
 }
 
 fn record_index(rec: &PanelRecord) -> i32 {
@@ -154,8 +154,8 @@ fn record_index(rec: &PanelRecord) -> i32 {
 }
 ```
 
-（`RF_PANEL_MAGIC` 若无 Rust 常量则新增 `const RF_PANEL_MAGIC: u32 = 0x50414E31;`，
-值取自 `shim_power.h` 的 `#define RF_PANEL_MAGIC 0x50414E31u`。）
+（Rust 侧**已有** `const PANEL_MAGIC: u32 = 0x50414E31;`（`page_sync.rs:36`）——
+用它，**不要**新建 `RF_PANEL_MAGIC`。测试里也用 `PANEL_MAGIC`。）
 
 其余读点同步改成字段访问：`glass_matches` 的 `rec[8..40] == md5[..]` 改为
 `rec.md5() == &md5[..]`；测试 @2224-2235 的 `rec.0[8..40]` 改为 `rec.md5()`。
@@ -304,7 +304,7 @@ rf_panel_mark_pending_src as T."
         );
         // 玻璃上确实是 0xa1 那个 md5，但它是 UI 画的（来源不是画板）。
         shim::host::stage_panel_record(
-            RF_PANEL_MAGIC, 1, RF_PANEL_SRC_UI, md5hex(0xa1).as_bytes(), 0,
+            PANEL_MAGIC, 1, RF_PANEL_SRC_UI, md5hex(0xa1).as_bytes(), 0,
         );
         assert!(sync_once());
         assert!(
@@ -322,7 +322,7 @@ rf_panel_mark_pending_src as T."
         shim::host::set_fb();
         shim::host::script_ok("/api/pages/schedule", &schedule_json(&[(0xa1, 10)]));
         shim::host::stage_panel_record(
-            RF_PANEL_MAGIC, 1, RF_PANEL_SRC_CANVAS, md5hex(0xa1).as_bytes(), 0,
+            PANEL_MAGIC, 1, RF_PANEL_SRC_CANVAS, md5hex(0xa1).as_bytes(), 0,
         );
         assert!(sync_once());
         assert!(!paint_if_changed(), "the canvas already shows page 0");
@@ -361,7 +361,7 @@ fn record_trusted(rec: &PanelRecord) -> bool {
 
 4 处 `stage_panel_record` 调用补来源：
 - `:1382` → `stage_panel_record(0xDEAD_BEEF, 1, RF_PANEL_SRC_CANVAS, md5hex(0xa1).as_bytes(), 0)`
-- `:1431 / :2085 / :2150` → `stage_panel_record(RF_PANEL_MAGIC, 1, RF_PANEL_SRC_CANVAS, md5hex(0xa1).as_bytes(), 0)`
+- `:1431 / :2085 / :2150` → `stage_panel_record(PANEL_MAGIC, 1, RF_PANEL_SRC_CANVAS, md5hex(0xa1).as_bytes(), 0)`
 
 - [ ] **Step 5: 跑测试确认通过 + 全量回归**
 
@@ -425,20 +425,33 @@ a_record_written_by_the_ui_makes_the_canvas_repaint_the_same_md5 red."
             &format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)),
             &bitmap_body(0xa1),
         );
-        // 画板先把页画上去（record 记 CANVAS），随后通知拿走玻璃。
+        // 画板先把页画上去（record 记 CANVAS）。
         assert!(sync_once());
         assert!(paint_if_changed());
+        // 通知拿走玻璃。stop_display_src 会置 SUSPENDED，故必须先 allow_display()
+        // 才能让画板重新接手；allow_display 自己也会 show_current() 重绘一次。
         stop_display_src(RF_PANEL_SRC_NOTIFICATION);
-        // 玻璃现在是通知：画板必须重画，不能凭 md5 相同就跳过。
-        assert!(paint_if_changed(), "the notification owns the glass now");
-        assert_eq!(shim::host::refreshes(), 2);
+        allow_display();
+        assert!(
+            __omp_shell("shim::host::fb().is_empty(),")
+            "the canvas is on the glass again"
+        );
+        // 关键判据：刚交出过屏幕，record 不再可信，下一次 paint 必须真重绘而不是跳过。
+        with_table(|t| t.override_index = None);
+        let before = shim::host::refreshes();
+        assert!(
+            __omp_shell("paint_if_changed() || shim::host::refreshes() > before,")
+            "a skipped repaint is exactly the divergence this fixes"
+        );
     }
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `cargo test a_notification_taking_the_panel`
-Expected: 编译失败（`stop_display_src` 未定义）。
+Expected: 编译失败（`stop_display_src` 未定义）。**但不要只看「编译失败就对了」**：
+先确认你在 Step 1 写下的那段测试**本身**在 `stop_display_src` 存在后能过——
+Task 3 的测试断言的是 record 不可信后 `paint_if_changed` 会重绘，而不是它返回什么。
 
 - [ ] **Step 3: 实现 `stop_display_src`**
 
