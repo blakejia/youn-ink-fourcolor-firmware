@@ -1267,9 +1267,6 @@ pub extern "C" fn page_sync_is_displaying() -> bool {
 pub extern "C" fn page_sync_stop_display_src(source: u8) {
     stop_display_src(source);
 }
-
-
-
 /// True when the last schedule poll reached the server (status bar indicator).
 #[unsafe(no_mangle)]
 pub extern "C" fn page_sync_server_reachable() -> bool {
@@ -1414,7 +1411,9 @@ mod tests {
         sync_once();
         assert!(paint_if_changed());
         assert_eq!(shim::host::refreshes(), 1);
-
+        // The record only becomes true when the refresh goes idle (device:
+        // the commit hook), so the next wake may only skip on a COMMITTED one.
+        shim::host::commit_panel_record();
         // Simulate the wake that follows: same page, same glass.
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
         sync_once();
@@ -1480,7 +1479,27 @@ mod tests {
     fn taking_the_panel_records_who_took_it() {
         let _g = shim::host::lock();
         reset_for_test();
+        // 上一个 wake 留在 RTC 里的记录：画板刚画过第 0 页。
+        shim::host::stage_panel_record(
+            PANEL_MAGIC, 1, RF_PANEL_SRC_CANVAS, md5hex(0xa1).as_bytes(), 0,
+        );
+
         stop_display_src(RF_PANEL_SRC_NOTIFICATION);
+        // 设备端走 pending→commit：只有刷新真正 idle 后才提交。
+        // 此刻提交的还是上一条记录，source 仍是 CANVAS。
+        let staged = read_panel_record();
+        assert_eq!(
+            staged.source, RF_PANEL_SRC_CANVAS,
+            "a takeover that has not gone idle must not be published yet"
+        );
+        assert_eq!(staged.displayed_index, 0, "the committed record is still the canvas's page");
+        assert!(
+            shim::host::panel_record_pending(),
+            "the takeover is staged, waiting for the refresh to go idle"
+        );
+
+        // 刷新 idle：commit hook 发布 g_pending_*。
+        shim::host::commit_panel_record();
         let rec = read_panel_record();
         assert_eq!(rec.source, RF_PANEL_SRC_NOTIFICATION, "the taker is recorded");
         assert_eq!(rec.valid, 1, "the takeover is a claim about the glass");
@@ -1492,10 +1511,40 @@ mod tests {
             !record_trusted(&rec),
             "a record the canvas did not paint must not be trusted"
         );
+        assert!(
+            !shim::host::panel_record_pending(),
+            "the commit consumes the staging slot"
+        );
+
         // 默认路径（UI 切页/设置页）同样只经 source 区分。
         stop_display_src(RF_PANEL_SRC_SETTINGS);
+        shim::host::commit_panel_record();
         assert_eq!(read_panel_record().source, RF_PANEL_SRC_SETTINGS);
         assert!(!record_trusted(&read_panel_record()));
+    }
+
+    /// commit seam 是承重的：删掉 commit_panel_record 里的提升动作，交权
+    /// 就永远进不了 RTC 记录，通知/设置页占过屏后画板仍会相信旧的那页。
+    /// 没有这条，下面的两阶段断言就是空转。
+    #[test]
+    fn a_staged_takeover_only_lands_on_the_glass_when_the_refresh_goes_idle() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::stage_panel_record(
+            PANEL_MAGIC, 1, RF_PANEL_SRC_CANVAS, md5hex(0xa1).as_bytes(), 0,
+        );
+
+        stop_display_src(RF_PANEL_SRC_NOTIFICATION);
+        assert_eq!(
+            read_panel_record().source, RF_PANEL_SRC_CANVAS,
+            "before the commit the glass still carries the canvas's own record"
+        );
+
+        shim::host::commit_panel_record();
+        assert_eq!(
+            read_panel_record().source, RF_PANEL_SRC_NOTIFICATION,
+            "the commit is what publishes the staged takeover"
+        );
     }
 
     /// 交权不等于撤销挂起：stop_display_src 必须仍然置 SUSPENDED。
@@ -1522,6 +1571,9 @@ mod tests {
         assert!(paint_if_changed(), "empty schedule still shows the hint");
         assert_eq!(shim::host::hint_draws(), 1);
         assert_eq!(shim::host::refreshes(), 1);
+        // The hint's record lands only when the refresh goes idle (device: the
+        // commit hook); the next wake may only skip on a COMMITTED one.
+        shim::host::commit_panel_record();
         // Second wake: the hint recorded as index -1 means the glass already
         // shows it — keyed on the index only, never the (empty) md5.
         assert!(!paint_if_changed(), "hint recorded as index -1 -> no panel cycle");
@@ -1583,6 +1635,9 @@ mod tests {
         assert!(paint_if_changed(), "successful empty sync shows the hint");
         assert_eq!(shim::host::hint_draws(), 1);
         assert_eq!(shim::host::refreshes(), 1);
+        // The hint's record lands only when the refresh goes idle (device: the
+        // commit hook); the next wake may only skip on a COMMITTED one.
+        shim::host::commit_panel_record();
         assert!(!paint_if_changed(), "hint recorded as index -1 -> no panel cycle");
         assert_eq!(shim::host::refreshes(), 1);
     }
@@ -2372,6 +2427,9 @@ mod tests {
         shim::host::script_ok(&format!("/api/pages/bitmap/{}.bin", md5hex(0xa1)), &bitmap_body(0xa1));
         sync_once();
         assert!(paint_if_changed(), "the retry paints once the bitmap arrives");
+        // The record lands only when the refresh goes idle (device: the commit
+        // hook) — "recorded" here must mean COMMITTED, not merely staged.
+        shim::host::commit_panel_record();
         let rec = read_panel_record();
         assert_eq!(rec.md5(), md5hex(0xa1).as_bytes(), "and only then is it recorded");
     }
