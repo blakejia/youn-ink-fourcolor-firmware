@@ -1,38 +1,77 @@
 # 面板记录来源（panel record source）设计
 
-**日期**：2026-09-29
+**日期**：2026-09-29（初稿）／2026-09-29 修订（机制更正 + 钩子收敛）
 **状态**：待用户复审
-**前置证据**：`docs/superpowers/progress/2026-09-29-screen-stale-after-panic.md`（本次排查记录）
+**前置证据**：`docs/superpowers/progress/2026-09-29-screen-stale-after-panic.md`
+
+> **修订说明**：初稿把「UI 内容照样渲染进 framebuffer」当成常态，据此列了 7 处
+> `Clear + RenderAll` 需要写来源。复核 `RenderAll` 后发现相反：**画板持屏时
+> `RenderAll` 直接早退，UI 根本画不上去**——UI 能上屏的前提是画板已交权。据此本稿
+> 改用**单一交权钩子**（3 处）而非 7 处绘制点。两处错误及更正见 §1.1、§3.6。
 
 ---
 
 ## 1. 问题
 
-设备出现「屏幕停在陈旧帧、且系统认为无需重绘」的情形。2026-09-29 17:51 与 17:56 两次 `rr=4`（`ESP_RST_PANIC`）复位后，屏幕停在 `title='对话'` + `wifi=0` 的一帧上，而链路实际正常（`dns ok` / `tcp ok` / `schedule 200` / `device-log 201`）。
+设备出现「屏幕停在陈旧帧、且系统认为无需重绘」。2026-09-29 17:51 与 17:56 两次
+`rr=4`（`ESP_RST_PANIC`）复位后，屏幕停在 `title='对话'` + `wifi=0` 的一帧上，
+而链路实际正常（`dns ok` / `tcp ok` / `schedule 200` / `device-log 201`）。
 
 ### 1.1 因果链（每一环均有代码依据）
 
-1. `g_panel_rec` 是 `RTC_DATA_ATTR`（`shim.cpp:88`），**跨 panic/USB 复位不清** —— 这是为深睡省电有意选的（`shim_power.h` 头注释：没有它「每次唤醒都要付一次 ≥15 s 全刷」）。
+1. `g_panel_rec` 是 `RTC_DATA_ATTR`（`shim.cpp:88`），**跨 panic/USB 复位不清**——
+   为深睡省电有意选的（`shim_power.h` 头注释：没有它「每次唤醒都要付一次 ≥15 s 全刷」）。
 2. 复位前 record 记着「某页已在玻璃上」且 `valid=1`。
-3. panic 重启后，`record_trusted()` 只查 `magic` 与 `valid`（`page_sync.rs:708`），record 仍读作可信。
-4. 本次开机目标页恰好与 record 记录的相同 → md5 相等 → `paint_if_changed` 判定 `COMPARE_SKIP_SAME`（`page_sync.rs:800-803`），**跳过重绘**。
-5. 而玻璃上实际是 **UI 画的整屏外壳**：`BuildRawDrawUi` 的 `ui_boot_paint_deferred_` 只跳过**面板刷新**，UI 内容照样渲染进 framebuffer（`application.cc:663-666`）；且 `rawdraw_ui_manager.cc` 有 7 处 `Clear + RenderAll` 全屏重画，**全都不更新 record**。
-6. 结果：**record 说「画板某页在屏上」，玻璃上却是 UI 内容** —— 分叉。
+3. 重启后 `record_trusted()` 只查 `magic && valid`（`page_sync.rs:708-710`），record 仍可信。
+4. 本次开机目标页与 record 相同 → md5 相等 → `paint_if_changed` 得 `COMPARE_SKIP_SAME`
+   （`page_sync.rs:801-805`），**跳过重绘**。
+5. **玻璃上却是 UI 画的整屏外壳**——而 UI 要能上屏，必须先有一个**画板未持屏的时间窗**：
+   `RenderAll` 在 `page_sync_is_displaying()` 时直接 `return`（`rawdraw_ui_manager.cc:729-730`），
+   所以 UI 无法在画板持屏时覆盖玻璃。两个真实窗口：
+   - **（a）promotion 启动竞态**（本次现象的最可能来源）：`Initialize()` 在
+     `page_sync_start()` 之前就 `BuildRawDrawUi()`（`application.cc:521`），此刻
+     `DISPLAYING=false`，`Init` 的 `RefreshActivePage` **真的画进了 framebuffer**；
+     冷启动配对设备 `ui_boot_paint_deferred_=true`（`:519`），于是这次绘制**没有伴随面板刷新**。
+     约 1 秒后第一次 `NoteButtonActivity()` 把 deferred 置回 false 并
+     `RequestActivePageRefresh()`（`:1113-1118`），**把那个已在 framebuffer 里的外壳刷上屏**
+     ——而画板此刻已持屏（`page_sync_start()` 已把 `DISPLAYING=true`，但因 md5 命中而从未重绘）。
+   - **（b）交权后画板没重画**：`SwitchPage` → `stop_display()` → 退出时
+     `allow_display()`，若画板下一轮 `paint_if_changed` 恰好跳过，record 仍称画板在屏。
+6. 结果：**record 称「画板某页在屏上」，玻璃上却是 UI 内容**——分叉。
 
-### 1.2 这不是冷启动独有的
+**对本设计的含义**：要修的不是「7 处绘制点都记账」，而是
+**「谁把玻璃从画板手里拿走」这一件事必须记账**。
 
-`invalidate` 只在三处调用（`application.cc:863` promotion、`:1508` 策略睡眠、`:1602` 手动睡眠），**没有**覆盖冷启动/panic。但更普遍的问题是：**任何 UI 全屏重画之后，record 都不再描述玻璃实际内容**。复位只是最容易观察到的一次。
+### 1.2 交权只有三个入口
+
+`page_sync_stop_display()` / Rust `page_sync::stop_display()` 是**唯一的「UI 拿走玻璃」转换点**，
+调用者只有 3 处：
+
+| 位置 | 场景 |
+|---|---|
+| `ui/rawdraw_ui_manager.cc:404` | `SwitchPage()` —— UI 显式切页（含设置页） |
+| `application.cc:862` | `ServicePromotion()` —— promotion 冷启动 |
+| `rust/src/notify.rs:132` | 通知上屏（`show_bitmap`） |
+
+`ServicePromotion()` 目前紧跟一行 `rf_panel_record_invalidate()`（`application.cc:863`），
+其注释已把本设计的道理写了一半：「the glass is about to show a UI page instead
+（the §4.3.5 divergence … without it the next wake's md5 compare matches and skips,
+leaving the blank frame up）」。**本设计就是把这个临时补丁泛化为 record 的常态属性**，
+并补上另外两个入口。
 
 ---
 
 ## 2. 目标与非目标
 
-**目标**：让 record 能正确表达「玻璃上是谁画的」，从而 `paint_if_changed` 不再在 UI 占屏后误判跳过。
+**目标**：让 record 能表达「玻璃上是谁画的」，从而 `paint_if_changed` 不再在
+UI 已经/将要覆盖玻璃时误判跳过。
 
 **非目标**：
 - 不改变任何刷新行为（不做 C-2 的「物理关闭局部刷新」）。
-- 不解释 `rr=4` 的成因（那是独立主线，靠串口 backtrace）。
+- 不解释 `rr=4` 的成因（独立主线，靠串口 backtrace）。
 - 不改动 `RefreshRect` 的局部刷新语义与性能特征。
+- **不修 promotion 竞态的上屏时机**（§1.1(a) 的 framebuffer 内容问题）——
+  本设计只保证「外壳上屏后 record 不再说谎」，不改变「外壳会先上屏一次」这个既有行为。
 
 ---
 
@@ -41,8 +80,9 @@
 ### 3.1 ABI：在既有 padding 里加 `source`，偏移与总长不变
 
 ```c
-/* Layout is relied on by the host stub and the Rust reader: source at offset 5,
- * valid at 4, md5 at 8, index at 44, sizeof == 48. Keep them in sync. */
+/* Layout is relied on by the host stub and the Rust reader: valid at offset 4,
+ * source at offset 5, md5 at offset 8, index at offset 44, sizeof == 48.
+ * Keep them in sync. */
 typedef struct {
     uint32_t magic;              /* 0  */
     uint8_t  valid;              /* 4  */
@@ -53,35 +93,44 @@ typedef struct {
 } rf_panel_record_t;             /* sizeof == 48 —— 所有偏移不变 */
 ```
 
-**为什么这样切**：`_pad[3]` 本来就为对齐而存在，取出 1 字节做 `source`，**magic/valid/md5/index 的偏移与结构总长全部不变**，主机端 stub 与 Rust reader 的既有布局断言无需修改，只新增一条 `source@5` 的断言。
+**为什么这样切**：`_pad[3]` 本就为对齐存在，取出 1 字节，**magic/valid/md5/index 的
+偏移与结构总长全部不变**；主机 stub（`shim.rs`）与 Rust reader 的既有布局断言无需修改，
+只新增 `source@5` 一条。
 
 ### 3.2 `source` 取值
 
 ```c
 /* rf_panel_source_t：玻璃上的内容由谁绘制 */
-#define RF_PANEL_SRC_NONE         0  /* 未知/未记录（invalid 之后的默认） */
-#define RF_PANEL_SRC_CANVAS       1  /* 画板页（page_sync blit_and_refresh） */
+#define RF_PANEL_SRC_NONE         0  /* 未知/未记录（invalidate 之后的默认） */
+#define RF_PANEL_SRC_CANVAS       1  /* 画板页 */
 #define RF_PANEL_SRC_UI           2  /* UI 整屏（对话/天气/新闻/相册等） */
-#define RF_PANEL_SRC_SETTINGS     3  /* 设置页（独立的全屏页，有自己的所有权语义） */
-#define RF_PANEL_SRC_NOTIFICATION 4  /* 通知弹窗（独立全屏来源） */
+#define RF_PANEL_SRC_SETTINGS     3  /* 设置页 */
+#define RF_PANEL_SRC_NOTIFICATION 4  /* 通知（全屏位图弹窗） */
 ```
 
-用户要求「更细」，故 UI 与 settings、notification 分开。**关键判据是"谁能整屏覆盖玻璃"**，而不是"哪个 renderer"——所以粒度按**全屏绘制者**划分，不按 renderer 穷举（否则 20+ 个 renderer 各占一个值，且新增 renderer 就漏一个）。
+用户要求「更细」，故 UI 与 settings、notification 分开。粒度判据是
+**「谁把玻璃整个拿走」**，不按 renderer 穷举（否则 20+ 个 renderer 各占一值，
+且新增 renderer 就漏一个）。
 
-**设置页为何单列**：它有自己的进入/退出与屏幕交还语义（`page_sync_allow_display()`，见 `note4c-screen-ownership`），与普通 UI 页的所有权不同。**通知单列**同理（`notify_dismiss` → `resume_display` 会主动取回屏幕）。
+**设置页单列**：它有独立的进入/退出与交还语义（`page_sync_allow_display()`）。
+**通知单列**：`notify_dismiss()` → `resume_display()` 会主动取回屏幕。
 
-### 3.3 判定规则（本设计的核心）
+### 3.3 判定规则（核心）：只在交权点写来源
 
-`source` 只在**整屏覆盖玻璃**时更新：
+| 事件 | `source` |
+|---|---|
+| 画板成功上屏（`blit_and_refresh` / 空页提示） | `CANVAS` |
+| **`stop_display()`**（= UI/设置/通知拿走玻璃） | 由调用者指定（见 §3.5） |
+| `rf_panel_record_invalidate()` | `NONE`（且 `valid=0`） |
+| 其余一切绘制（`RenderAll`、`RefreshRect`、时钟 tick、局部/浮层） | **不碰** |
 
-| 路径 | 是否改 `source` | 依据 |
-|---|---|---|
-| 画板 `blit_and_refresh` 成功 | 设为 `CANVAS` | 它是全屏 2bpp 位图 |
-| `RefreshActivePage` / `RefreshActivePageRect` / `SwitchPage` / `Init` / `HandleInput` / `UpdateWifiStatus` / `SetLifeBarVisible` 的 **`Clear + RenderAll`** | 设为 `UI`（设置页设 `SETTINGS`，通知设 `NOTIFICATION`） | 先 `Clear` 再整屏重画 = 玻璃被整体替换 |
-| `RefreshRect`（浮层、局部上屏） | **不碰** | 只在既有画面上叠加一小块，来源不变 |
-| `PumpClockRefresh` 的 `RenderAll`（**无 `Clear`**） | **不碰** | `rawdraw_ui_manager.cc:1305` 注释明示：故意不清屏，让 diff 小以走局部刷新；来源仍是原内容 |
-
-**第三、四条排除了性能陷阱**：若把"无 Clear 的时钟重画"也算作来源变更，则**每分钟的状态栏 tick 都会让画板判定需要重绘 → 10–25 s 全刷**。
+**为什么用交权点而不是绘制点**：
+1. **正确性**：`RenderAll` 在画板持屏时早退，所以「UI 真的上屏」与「画板已交权」
+   是同一件事的两个说法；挂在交权点不会漏记。
+2. **少而集中**：3 处 vs 7 处，且不与「哪个 renderer 在画」耦合。
+3. **零性能风险**：时钟 tick 的 `RenderAll`（`rawdraw_ui_manager.cc:1305`，注释明示
+   *"Do NOT Clear() the whole buffer"*，为让 diff 小走局部刷新）**不在交权点**，
+   天然不写来源。若按初稿挂在 7 处绘制点，则需要额外规则才能排除它——那正是初稿的风险所在。
 
 ### 3.4 record 可信判据收紧
 
@@ -91,54 +140,100 @@ fn record_trusted(rec: &[u8; 48]) -> bool {
 }
 ```
 
-原来只查 `magic && valid`；现在追加「来源必须是画板」。UI/设置/通知占过屏后，record 读作不可信 → `paint_if_changed` 不再跳过 → **下一个周期必然重绘**，分叉消除。
+原来只查 `magic && valid`；现追加「来源必须是画板」。UI/设置/通知拿走玻璃后，
+record 读作不可信 → `paint_if_changed` 不再跳过 → **下一轮周期必然重绘**，分叉消除。
 
-### 3.5 写入点
+### 3.5 写入路径（复用既有 pending→commit，不新增同步原语）
 
-`source` 与 md5/index 走**同一条 pending→commit 通道**，不新增同步原语：
+`source` 与 md5/index 走同一条通道：
 
-- `rf_panel_mark_pending(const char* md5, int index)` 追加声明 `void rf_panel_mark_pending_src(const char* md5, int index, uint8_t source);`，原函数保留并转调 `..., RF_PANEL_SRC_CANVAS`（画板是既有唯一调用者，语义不变）；
-- UI 侧新增调用点，传 `RF_PANEL_SRC_UI` / `SETTINGS` / `NOTIFICATION`；
-- commit 钩子（`AddOnRefreshIdle` 回调）把 `source` 一并提交 —— 保持「刷新真正 idle 后才记账」的既有语义，中断的刷新不会被记成完成；
-- `rf_panel_record_invalidate()` 置 `source = NONE`（与 `valid = 0` 一致）。
+- `shim_power.h` / `shim.cpp`：新增
+  `void rf_panel_mark_pending_src(const char* md5, int index, uint8_t source);`
+  原 `rf_panel_mark_pending(md5, index)` 保留并转调 `..., RF_PANEL_SRC_CANVAS`
+  （画板是既有唯一调用者，语义不变）；
+- commit 钩子（`AddOnRefreshIdle` 回调）把 `source` 一并提交——保持
+  「刷新真正 idle 后才记账」的既有语义，中断的刷新不会被记成完成；
+- `rf_panel_record_invalidate()` 置 `source = NONE` 并清 `valid`。
 
-### 3.6 全屏路径清单（请重点复核）
+**三个交权点各自的动作**（Rust `page_sync::stop_display()` 增加带参变体）：
 
-`rawdraw_ui_manager.cc` 现有 **7 处** `Clear + RenderAll`，**每处都需按上表设置来源**：
+```rust
+// page_sync.rs
+pub fn stop_display() { stop_display_src(RF_PANEL_SRC_UI); }
+pub fn stop_display_src(source: u8) {
+    SUSPENDED.store(true, Ordering::Release);
+    DISPLAYING.store(false, Ordering::Release);
+    // record 关于玻璃的说法此刻起不再成立：staged，刷新 idle 后提交。
+    unsafe { shim::rf_panel_mark_pending_src(EMPTY_PAGE.md5.as_ptr(), -1, source) };
+}
+```
 
-| 行 | 函数 | 来源 |
+| 调用点 | 传入 |
+|---|---|
+| `rawdraw_ui_manager.cc:404`（`SwitchPage`） | 目标是 Settings → `SETTINGS`；否则 `UI` |
+| `rust/src/notify.rs:132` | `NOTIFICATION` |
+| `application.cc:862`（`ServicePromotion`） | 维持 `rf_panel_record_invalidate()`（`NONE`）**不变** |
+
+**为何 promotion 仍用 invalidate**：promotion 发生时屏上通常还没有任何 UI 内容
+（`BringUpPanel` 紧随其后），「谁在玻璃上」此刻**尚不可知**，`NONE` 是诚实的取值；
+等 `Init` 真正画完再写会更准，但那要求盯绘制点，与 §3.3 的收敛相悖。`NONE` 与
+`UI` 在 `record_trusted` 下同效（都不可信），差别只在日志可读性。
+
+### 3.6 全屏绘制路径清单（**信息性，不需改动**）
+
+初稿要求这 7 处都写来源；复核后确认**都不需要**，因为：
+- 画板持屏时 `RenderAll` 早退（`:729-730`），这 7 处画不进玻璃；
+- 画板不持屏时，玻璃的守卫转换（`stop_display`）**已经**写过来源。
+
+| 行 | 函数 | 说明 |
 |---|---|---|
-| 356 | `Init` | UI（启动外壳） |
-| 431 | `SwitchPage` | UI / SETTINGS（按目标页判定） |
-| 514 | `RefreshActivePage` | 按当前页判定 |
-| 533 | `RefreshActivePageRect` | 按当前页判定（虽只推 rect，但已整屏重画） |
-| 706 | `HandleInput` | 按当前页判定 |
-| 1437 | `UpdateWifiStatus` | 按当前页判定 |
-| 1477 | `SetLifeBarVisible` | 按当前页判定 |
+| 356 | `Init` | 启动外壳；其「画进 framebuffer 但未刷新」是 §1.1(a) 竞态的成因，本设计不修 |
+| 431 | `SwitchPage` | 其上的 `:404 stop_display()` 已负责（本设计改这里） |
+| 514 | `RefreshActivePage` | `Clear+RenderAll` 先经 `page_sync_is_displaying()` 守卫 |
+| 533 | `RefreshActivePageRect` | 同上 |
+| 706 | `HandleInput` | 同上 |
+| 1437 | `UpdateWifiStatus` | 额外门 `current_page_ == Wifi` |
+| 1477 | `SetLifeBarVisible` | 额外门 `current_page_ == LifeBar` |
 
-**「按当前页判定」的判据**：`GetCurrentPage() == RawDrawPageId::Settings` → `SETTINGS`；`notify_is_active()` → `NOTIFICATION`；否则 `UI`。集中到一个 C++ 辅助函数（如 `CurrentPanelSource()`），**不散落到 7 处**。
+后两处（`UpdateWifiStatus` / `SetLifeBarVisible`）**没有** `page_sync_is_displaying()`
+守卫，理论上可在画板持屏时执行 `Clear+RenderAll`。但两者都要求 `current_page_`
+恰为 Wifi/LifeBar，而进入这些页必经 `SwitchPage` → `stop_display()`，故**当前不可达**。
+按「只修有证据支持的问题」的既有纪律，**本设计不改它们**，仅在此登记为观察项。
 
 ### 3.7 Rust 侧改动
 
-- `page_sync.rs`：`record_trusted()` 追加 `source == CANVAS`；新增 `fn record_source(rec: &[u8;48]) -> u8`（读 `rec[5]`，与 `record_index` 同手法）。
-- `page_compare_policy.rs`：`PageInputs` 的 `record_trusted` 语义不变（仍是布尔），**不需要**新增字段 —— 收紧发生在上游的 `record_trusted()`，策略层不感知来源。
-- 主机 stub（`shim.rs` 的 `rf_panel_record_*`）：补齐 `source` 字段的读写与测试辅助。
+- `page_sync.rs`：`record_trusted()` 追加 `rec[5] == RF_PANEL_SRC_CANVAS`；
+  新增 `stop_display_src(u8)` 与 `page_sync_stop_display_src` 的 `extern "C"` 导出；
+  `stop_display()` 转调默认 `UI`。
+- `page_compare_policy.rs`：**不改**。`record_trusted` 仍是布尔输入，收紧发生在上游。
+- `shim.rs`：`rf_panel_mark_pending_src` 声明；主机 stub 的 `PANEL_REC` 元组
+  加 `source` 字段，`stage_panel_record` 加参（4 个既有调用点同步更新）。
+- `shim_power.h`：结构体与 `RF_PANEL_SRC_*` 常量。
 
 ---
 
 ## 4. 测试
 
 **布局契约（Rust，每模块自带）**
-- `offset_of!(rf_panel_record_t, source) == 5`、`size_of == 48`、`displayed_md5` 仍在 8、`displayed_index` 仍在 44 —— 证明加字段未移动任何既有偏移。
+- `offset_of!(rf_panel_record_t, source) == 5`、`size_of == 48`、
+  `valid == 4`、`displayed_md5 == 8`、`displayed_index == 44` —— 证明加字段未移动任何既有偏移。
 
 **行为测试（Rust 纯逻辑，主机可跑）**
-- `record_trusted()`：`source=CANVAS` → true；`source=UI/SETTINGS/NOTIFICATION/NONE` → false；`magic` 错 → false；`valid=0` → false。
-- `paint_if_changed`：record 说 `CANVAS` 且 md5 相同 → 跳过（保持既有行为）；record 说 `UI` 且 md5 相同 → **重绘**（本设计要修的分叉）。
-- 哨兵：把 `source == CANVAS` 这一项从 `record_trusted` 去掉，上述「UI→重绘」测试必须变红。
+- `record_trusted()`：`source=CANVAS` → true；`UI`/`SETTINGS`/`NOTIFICATION`/`NONE` → false；
+  `magic` 错 → false；`valid=0` → false。
+- `paint_if_changed`：record `CANVAS` 且 md5 相同 → 跳过（既有行为）；
+  record `UI` 且 md5 相同 → **重绘**（本设计要修的分叉）。
+- `stop_display_src(NOTIFICATION)` 后再 `sync_once()` + `paint_if_changed()` →
+  必须重绘且日志不出现 `skipping repaint`。
+- **哨兵**：把 `rec[5] == RF_PANEL_SRC_CANVAS` 从 `record_trusted` 删除，
+  「UI→重绘」测试必须变红。
 
 **回归**
-- 既有 `glass already shows ... skipping repaint` 相关测试必须仍绿（画板连续两周期画同一页 → 第二次仍跳过）。
-- 既有布局断言全部保持（48/8/44）。
+- 既有 `glass already shows … skipping repaint` 测试仍绿（画板连续两轮同页 → 第二轮仍跳过）。
+- 既有布局断言（48/8/44）全部保持。
+
+**真机验收（用户串口已接）**
+- BOOT 双击强制同步后 `show page …`，确认 record 来源在日志中可读。
 
 ---
 
@@ -146,15 +241,19 @@ fn record_trusted(rec: &[u8; 48]) -> bool {
 
 | 风险 | 评估与缓解 |
 |---|---|
-| **收紧后可重绘次数增加** | 这是**设计意图**（消除分叉），但需量化：只有「UI 全屏占屏后」的首次周期会多一次全刷。**若发现高频路径**（例如每次状态栏变化都走 `Clear+RenderAll`），须改走 `PumpClockRefresh` 的无 Clear 路径。§3.6 清单即为此核对用。 |
-| `PumpClockRefresh` 若被误判成来源变更 | 已在 §3.3 明确排除（无 `Clear`）。这是最需要守住的一条。 |
-| 7 处调用点漏设来源 | 集中到 `CurrentPanelSource()` 一处；测试覆盖「设置页占屏后 record 读作不可信」。 |
-| 深睡省电回归 | 深睡唤醒后画板正常重绘 → 记 `CANVAS` → 下一次唤醒仍可跳过。**省电路径不受影响**（这是本设计必须守住的红线）。 |
+| 收紧后重绘次数增加 | 设计意图。**仅「交权之后」的首轮多一次全刷**；交权是用户驱动的低频事件（进设置页、收通知、promotion），**非每分钟**。§3.3 的选择正是为守住这条。 |
+| 深睡省电回归 | 深睡唤醒后画板正常重绘 → 记 `CANVAS` → 下次唤醒仍可跳过。**红线，必须守住**。 |
+| promotion 竞态仍在（外壳先上屏一次） | 明确列为非目标。本设计保证的是「上屏后 record 不再说谎」，下次周期会重绘回画板页。 |
+| 未守卫的两处 `Clear+RenderAll` | 当前不可达（§3.6），登记为观察项；若将来可达，同属「UI 越权覆盖画板」，应加守卫而非本条记账。 |
+| `stage_panel_record` 签名变更 | 4 个既有调用点同步更新（`page_sync.rs:1382/1431/2085/2150`）。 |
 
 ---
 
 ## 6. 明确不做
 
-- **不做 C-2**（物理关闭局部刷新）：`RefreshRect` 的浮层用途仍在（`rawdraw_ui_manager.cc:659/679` 快速切换），且四色屏上局部刷新的可靠性**缺乏真机证据**。若要推进，需先有证据再单独设计。
-- 不改 `RefreshRect` 的语义。
-- 不引入新的锁或同步原语（复用 `g_panel_mux` 与既有 pending→commit 通道）。
+- **不做 C-2**（物理关闭局部刷新）：`RefreshRect` 的浮层用途仍在
+  （`rawdraw_ui_manager.cc:659/679` 快速切换），且四色屏上局部刷新的可靠性**缺乏真机证据**。
+- 不改 `RefreshRect` 语义；不改 `PumpClockRefresh`。
+- 不给 `UpdateWifiStatus` / `SetLifeBarVisible` 加守卫（无证据表明可达）。
+- 不引入新锁或同步原语（复用 `g_panel_mux` 与既有 pending→commit 通道）。
+- 不解释、不修 `rr=4`。
