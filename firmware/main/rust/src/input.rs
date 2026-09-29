@@ -302,10 +302,29 @@ mod tests {
 
     #[test]
     fn boot_double_click_does_not_answer_a_popup() {
-        // A popup owns the panel and BOOT's other gestures say "not now"; a
-        // forced sync would also tear the radio down under the popup's own
+        // Popup up, canvas not drawing (the usual state: a popup suspends the
+        // canvas). A popup owns the panel and BOOT's other gestures say "not
+        // now"; a forced sync would tear the radio down under the popup's own
         // in-flight fetch.
         let i = Inputs { button: Button::Boot, gesture: Gesture::DoubleClick, notify_active: true, ..base() };
+        assert_eq!(decide(&i), Action::Ignore);
+    }
+
+    #[test]
+    fn boot_double_click_is_refused_while_a_popup_is_over_the_canvas() {
+        // Reachable in the live system: a popup arriving while the user is in
+        // Settings is followed by LEAVE_SETTINGS -> page_sync_allow_display(),
+        // which repaints and sets DISPLAYING true again without clearing the
+        // NOTIFYING state. So both flags true is a real state, and the popup
+        // must win: a forced cycle would tear the radio down under its own
+        // in-flight /next fetch.
+        let i = Inputs {
+            button: Button::Boot,
+            gesture: Gesture::DoubleClick,
+            canvas_displaying: true,
+            notify_active: true,
+            ..base()
+        };
         assert_eq!(decide(&i), Action::Ignore);
     }
 

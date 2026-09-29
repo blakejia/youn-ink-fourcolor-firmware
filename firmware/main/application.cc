@@ -1185,9 +1185,10 @@ void Application::ForceScheduleSync() {
     Board::GetInstance().FlashActivityLed();
     // Counts as user activity, so the policy cannot sleep the moment the cycle
     // ends and make the key look dead. Only the idle clock is stamped, not
-    // NoteButtonActivity(): that also requests an active-page refresh (a no-op
-    // while the canvas displays, and nothing here changes the UI) and skips the
-    // LED, which this path re-issues itself above.
+    // NoteButtonActivity(): nothing here changes the UI, so its
+    // RequestActivePageRefresh() would be wasted work (it early-returns while
+    // the canvas displays anyway), and its FlashActivityLed() would be a second
+    // flash on top of the one above.
     last_activity_ms_ = esp_timer_get_time() / 1000;
     // Re-evaluate almost immediately; force_cycle_ makes that tick run a cycle
     // rather than a bare policy check.
