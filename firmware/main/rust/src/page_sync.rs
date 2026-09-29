@@ -1267,6 +1267,7 @@ pub extern "C" fn page_sync_is_displaying() -> bool {
 pub extern "C" fn page_sync_stop_display_src(source: u8) {
     stop_display_src(source);
 }
+
 /// True when the last schedule poll reached the server (status bar indicator).
 #[unsafe(no_mangle)]
 pub extern "C" fn page_sync_server_reachable() -> bool {

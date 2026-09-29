@@ -80,6 +80,7 @@ bool page_sync_server_reachable(void);
 void page_sync_stop_display(void);
 /** Like `page_sync_stop_display`, but records who took the glass (RF_PANEL_SRC_*) */
 void page_sync_stop_display_src(uint8_t source);
+
 /** Let the canvas take the panel again (leaving Settings); repaints at once. */
 void page_sync_allow_display(void);
 
