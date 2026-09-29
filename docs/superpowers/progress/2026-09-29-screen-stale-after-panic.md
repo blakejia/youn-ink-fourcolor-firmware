@@ -1,0 +1,97 @@
+# 复位后屏幕陈旧帧：证据记录 — 2026-09-29
+
+## 现象（用户报告）
+
+设备复位后屏幕停在「对话」页（状态栏 Wi-Fi 图标显示断开），随后又刷回「重点任务」。
+17:51 一次，17:56 一次。用户观察到「现在看到的仍未恢复」，且手机可正常连上同一 AP。
+
+## 观察窗口与证据来源
+
+- `journalctl --user -u youn-ink-server`（覆盖起点 2026-09-13T21:56，见 `youn-ink-server-log-forensics`）
+- `server/data/devicelogs/NOTE4C-3400FC.log`（设备上报通道）
+- 用户提供的串口日志（17:56:21–17:59:34）
+- 源码静态核对（本文件所有"依据"均为实读，非推断）
+
+## 1. 复位确实发生（非深睡唤醒、非刷写）
+
+schedule 查询串计数器（`w`=wakes, `a`=awake_ms, `r`=radio_ms, `g`=http_gets, `rr`=cached reset reason）：
+
+```text
+17:40:42  w=7&a=304169&r=304169&g=11&rr=4&lo=2     ← 正常轮询
+17:51:30  w=1&a=0&r=0&g=0&rr=4&v=4096&p=96&c=4     ← 计数器全归零 = 真复位
+17:56:22  w=2&a=185483&r=185483&g=2&rr=4&lo=2      ← 复位后第 2 轮
+```
+
+判据：`w` 回落到 1 且 `a`/`r`/`g` 同时归零 = RAM 已被清空 = 真复位（深睡唤醒不会这样，`a`/`r` 会在睡眠 teardown 时记账后保留）。
+
+`rr=4` = `ESP_RST_PANIC`（异常/panic 导致的复位）。枚举权威定义见 ESP-IDF v6.0 `components/esp_system/include/esp_system.h`。
+
+**注意 `rr` 的陈旧语义**：`shim.cpp:455` 的 `g_last_reset_reason` 是 `RTC_DATA_ATTR` 且仅在为 0 时写入 —— 同一上电周期内后续复位的 `rr` 都报第一次那个值。因此 **`rr` 不能用来计数崩溃**，判次数必须配合"计数器归零"。
+
+## 2. 网络正常（三条独立证据）
+
+1. 用户手机可连上同一 AP（排除 AP 侧故障）；
+2. 设备自己探测成功：`17:56:34.318 dns ok` → `17:56:34.334 tcp ok`（目标 `note-device.1024.center:31443`）；
+3. 服务端侧：`17:56:22` schedule `200 OK`、`17:56:25` `POST /api/device-log 201 Created`。
+
+所以屏上「断开」图标**不是真实链路状态**。
+
+## 3. 屏幕停在陈旧帧的机制
+
+串口日志关键两行：
+
+```text
+17:56:25.448  PageSync: schedule updated: 3 pages (0 carried from cache)
+17:56:25.448  PageSync: glass already shows "55290bc0", skipping repaint
+```
+
+`55290bc0` = 「重点任务」。即画板判定"玻璃已是目标页" → 跳过重绘。
+
+而玻璃上实际是 **UI 整屏外壳**（`title='对话'` + `wifi=0`，`17:56:34.011` 那一帧；`0.16 s` 后 `17:56:34.172` 已修正为 `wifi=1`，但那帧未上屏）。
+
+因果链，每环均有代码依据：
+
+| # | 环 | 依据 |
+|---|---|---|
+| 1 | `g_panel_rec` 为 `RTC_DATA_ATTR`，跨 panic/USB 复位**不清** | `shim.cpp:88`；`shim_power.h` 头注释说明这是为深睡省电有意选的 |
+| 2 | 复位前 record 记着「某页在玻璃上」且 `valid=1` | `shim.cpp` commit 钩子 |
+| 3 | 重启后 `record_trusted()` 只查 `magic && valid`，record 仍可信 | `page_sync.rs:708-710` |
+| 4 | 目标页与 record 相同 → md5 相等 → `COMPARE_SKIP_SAME` | `page_sync.rs:799-803` |
+| 5 | 玻璃上是 UI 内容，因为 `ui_boot_paint_deferred_` 只跳过**面板刷新**，UI 内容照样渲染进 framebuffer | `application.cc:663-666` |
+| 6 | `rawdraw_ui_manager.cc` 有 **7 处** `Clear + RenderAll` 全屏重画，**全都不更新 record** | `:356/431/514/533/706/1437/1477` |
+
+**结论**：record 说「画板某页在屏上」，玻璃上却是 UI 内容 → 分叉。
+
+## 4. `invalidate` 的覆盖缺口
+
+`rf_panel_record_invalidate()` 仅三处调用，**无一处覆盖冷启动/panic 路径**：
+
+- `application.cc:863` — promotion（quiet boot 转交互）
+- `application.cc:1508` — 策略睡眠（`d.invalidate_panel`）
+- `application.cc:1602` — 手动睡眠
+
+## 5. 17:56 之后的恢复过程（反证 `rr` 与重绘判据）
+
+用户按 BOOT 双击（强制同步）后：
+
+```text
+18:03:06.487  Application: BOOT double click / force sync requested
+18:03:09.842  PageSync: schedule updated: 3 pages
+18:03:15.919  PageSync: show page 3/3 md5="bd52ed10"      ← 走了重绘，未跳过
+18:03:47.928  RawDrawUiManager: Display refresh idle; input unlocked
+```
+
+`bd52ed10` ≠ 玻璃现状（`55290bc0`）→ 正常重绘 → 屏幕恢复。**这证明"跳过"只在目标页与玻璃现状相同时发生**，也证明强制同步链路工作正常。
+
+## 6. 与既有文档的关系
+
+这印证了 `note4c-screen-ownership` 记的陷阱第 4 条：
+
+> `DISPLAYING == false` 的四种真实含义：本 boot 还没画 / 被 `stop_display()` 挂起 / 同步失败什么都没画 / **玻璃已是该页而跳过**
+
+本次是第 4 种，且叠加了「record 不知道玻璃上是 UI 画的」这一层。
+
+## 7. 本记录**未**证明的事
+
+- **未**解释 `rr=4` 的成因。`rr` 只说明"发生过 panic"，永远给不出"在哪崩"；需串口 backtrace（`Guru Meditation Error` 后的调用栈）。
+- **未**证明此分叉会导致除"显示陈旧"以外的后果（例如是否会影响后续唤醒的省电判定）。设计文档 §3.6 的路径清单是为此核对用。
