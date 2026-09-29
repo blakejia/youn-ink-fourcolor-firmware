@@ -129,7 +129,7 @@ fn show_bitmap(bitmap: *const u8) {
     unsafe { core::ptr::copy_nonoverlapping(bitmap, fb, page_sync::PAGE_BITMAP_SIZE) };
     unsafe { shim::rf_fb_end() };
     unsafe { shim::rf_request_full_refresh() };
-    page_sync::stop_display(); // the notification owns the panel while it is up
+    page_sync::stop_display_src(page_sync::RF_PANEL_SRC_NOTIFICATION); // the notification owns the panel while it is up
 }
 
 // ── state transitions ──────────────────────────────────────────────────────

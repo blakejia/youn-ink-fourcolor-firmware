@@ -922,10 +922,23 @@ pub fn server_reachable() -> bool {
 }
 
 /// Hand the screen to the UI/notification: the canvas stops drawing until
-/// [`resume_display`] or [`allow_display`].
-pub fn stop_display() {
+/// [`resume_display`] or [`allow_display`]. `source` records who took the glass.
+pub fn stop_display_src(source: u8) {
     SUSPENDED.store(true, Ordering::Release);
     DISPLAYING.store(false, Ordering::Release);
+    // record 关于玻璃的说法此刻起不再成立。走 pending→commit：只有刷新真正
+    // idle 后才提交，中断的刷新不会被记成完成。
+    unsafe {
+        shim::rf_panel_mark_pending_src(
+            EMPTY_PAGE.md5.as_ptr() as *const core::ffi::c_char,
+            -1,
+            source,
+        )
+    };
+}
+
+pub fn stop_display() {
+    stop_display_src(RF_PANEL_SRC_UI);
 }
 
 /// Take the screen back and repaint the current page (notification dismissed).
@@ -1250,6 +1263,13 @@ pub extern "C" fn page_sync_is_displaying() -> bool {
     is_displaying()
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn page_sync_stop_display_src(source: u8) {
+    stop_display_src(source);
+}
+
+
+
 /// True when the last schedule poll reached the server (status bar indicator).
 #[unsafe(no_mangle)]
 pub extern "C" fn page_sync_server_reachable() -> bool {
@@ -1454,6 +1474,43 @@ mod tests {
         assert!(!paint_if_changed(), "the canvas already shows page 0");
         assert_eq!(shim::host::refreshes(), 0);
     }
+    /// Task 3 的值不在策略层（source 的判别已由 Task 2 覆盖），而在**机制**：
+    /// 交权点真的把「谁拿走玻璃」写进了记录。断言字面值，不做两路一致性断言。
+    #[test]
+    fn taking_the_panel_records_who_took_it() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        stop_display_src(RF_PANEL_SRC_NOTIFICATION);
+        let rec = read_panel_record();
+        assert_eq!(rec.source, RF_PANEL_SRC_NOTIFICATION, "the taker is recorded");
+        assert_eq!(rec.valid, 1, "the takeover is a claim about the glass");
+        assert_eq!(
+            rec.displayed_index, -1,
+            "no canvas page is on the glass while the notification owns it"
+        );
+        assert!(
+            !record_trusted(&rec),
+            "a record the canvas did not paint must not be trusted"
+        );
+        // 默认路径（UI 切页/设置页）同样只经 source 区分。
+        stop_display_src(RF_PANEL_SRC_SETTINGS);
+        assert_eq!(read_panel_record().source, RF_PANEL_SRC_SETTINGS);
+        assert!(!record_trusted(&read_panel_record()));
+    }
+
+    /// 交权不等于撤销挂起：stop_display_src 必须仍然置 SUSPENDED。
+    #[test]
+    fn taking_the_panel_still_suspends_the_canvas() {
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_fb();
+        stop_display_src(RF_PANEL_SRC_UI);
+        assert!(!is_displaying(), "the UI holds the glass now");
+        assert!(!paint_if_changed(), "the canvas must not draw while suspended");
+        start();
+        assert!(is_displaying(), "the next wake hands it back");
+    }
+
 
     #[test]
     fn an_empty_schedule_paints_the_hint_once_and_records_it() {
