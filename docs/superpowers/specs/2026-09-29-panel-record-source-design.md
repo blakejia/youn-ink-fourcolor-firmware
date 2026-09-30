@@ -228,34 +228,37 @@ pub fn stop_display_src(source: u8) {
 **真正能带 UI 帧上屏的是窗口内 flusher**（`NoteButtonActivity` / promotion 的
 `RequestActivePageRefresh`），它们不碰记录。
 
-**修法**（`application.cc` 的 `BuildRawDrawUi`，`Init()` 返回之后）：
+**修法**（`application.cc` 的 `Init` 刷新回调，越过 `ui_boot_paint_deferred_` 早退之后）：
 
 ```cpp
-    if (ui_boot_paint_deferred_.load(std::memory_order_acquire) &&
-        __omp_shell("page_sync_is_displaying() && !rf_panel_record_pending()) {")
-        rf_panel_record_t rec;
-        rf_panel_record_get(&rec);
-        if (rec.magic == RF_PANEL_MAGIC && rec.valid != 0 &&
-            rec.source == RF_PANEL_SRC_CANVAS) {
-            rf_panel_record_invalidate();
+        if (!page_sync_is_displaying() && !rf_panel_record_pending()) {
+            rf_panel_record_t rec;
+            rf_panel_record_get(&rec);
+            if (rec.magic == RF_PANEL_MAGIC && rec.valid != 0 &&
+                rec.source == RF_PANEL_SRC_CANVAS) {
+                rf_panel_record_invalidate();
+            }
         }
-    }
 ```
 
-**为什么挂在「进入 framebuffer」而不是「刷新入口」**（2026-09-30 修正，前一版挂错了位置）：
-`ui_boot_paint_deferred_` 抑制的是**刷新请求**，不是渲染——外壳像素已经进了 framebuffer，
-之后**任何**一次 flush 都会把它带上玻璃。挂在刷新入口等于赌「那一次 flush 恰好走这个回调」，
-而那正是未定问题；落在 `Init()` 返回之后则与「谁请求了那次 flush」无关。
-7.5 小时串口日志支持这一点：58 次 `skipping repaint` 里只有 **1** 次后面跟了刷新事务
-（启动那次，`up=10040`，其 20 s `EPD busy wait` 起于 skip 后 1.2 s，且发生在
-`page_sync_start()` 仍在等 WiFi 期间——WiFi 于 `up=18750` 才连上）。
+**为什么挂在这里（而不是「进入 framebuffer」那一刻）**：两者都试过，取舍是实测出来的。
+若挂在 `Init()` 返回之后（即「外壳像素已进 framebuffer」），三个合取项在**每次配对交互启动**都
+平凡成立（deferred 仍为真、`page_sync_start()` 还在等 WiFi 故 `DISPLAYING` 为假、`g_pending_*`
+是普通 RAM 故为假），于是**即使画板随后赢得了竞速并跳过重绘**，记录也已被清掉——下一次周期
+变成 `COMPARE_INVALIDATE_CACHE` → 多一次 HTTP GET 与一次 15–25 s 全刷。本文件证据记录的
+`up=10040` 那次 `skipping repaint` 正是这个优化在工作，会被这一版破坏。
+挂在刷新回调里，则只在**确实要把 UI 帧交给面板**时触发；画板赢得竞速时没有任何 UI 帧被提交，
+守卫不运行，优化保留。
 
-**三个合取项**：
-- `ui_boot_paint_deferred_`：只在「配对启动、外壳刷新被推迟」的这一次动手。
-- `!page_sync_is_displaying()`：画板持屏时记录说的就是画板，不能动。
+**两个合取项各自的作用**（缺一个就错）：
+- `!page_sync_is_displaying()`：画板持屏时记录说的就是画板，是对的，不能动。
 - `!rf_panel_record_pending()`：`SwitchPage` 已把交权 staged 进 `g_pending_*`（合法、只等提交），
   而 `rf_panel_record_invalidate()` 会连 `g_pending_valid` 一起清掉——那会把一次合法交权抹成
   `NONE`。虽然 `NONE` 与 `UI/SETTINGS` 在 `record_trusted` 下同效，但记录会失真。
+
+**曾短暂引入又删除的东西**：一个「deferred 是否曾被置起」的闭锁
+（`ui_boot_paint_deferred_was_set_`）。它只是为了补偿「挂在回调」这一位置判断失误，位置定下来后
+不再需要，已连同成员一起删除。**不要**为了「更早清除」把它加回来：见本节第一段的取舍。
 
 **为什么是 invalidate 而不是 `stop_display_src`/`mark_pending_src`**：`paint_if_changed`
 读的是**已提交**的 `g_panel_rec`，而 `mark_pending_src` 只写 `g_pending_*`，要等刷新 idle

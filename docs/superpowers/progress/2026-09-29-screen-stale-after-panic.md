@@ -148,14 +148,23 @@ ESP_ERR_HTTP_CONNECT`），分别打掉一次 `schedule` 和一次 `notification
 ②唯一一次「skip 之后还有刷新」就是启动那次，其 `EPD busy wait` 20 s 序列从 skip 后
 1.2 s 开始，而 WiFi 要到 `up=18750` 才连上——**刷新发生在 `page_sync_start()` 之前**。
 
-**这份日志无法回答的那一问**：17:56 那次刷新是否经由 UI 刷新回调（`RequestUrgent*`）请求。
-`CustomLcdDisplay` 的 `[REFRESH] request` 是 `ESP_LOGI`，而全局日志级别为 INFO
-（`sdkconfig: CONFIG_LOG_DEFAULT_LEVEL_INFO=y`，全仓无 `esp_log_level_set`），凡经该入口
-必留记录；但整份抓包里 `[REFRESH]` 出现 **0 次**。首条 `[REFRESH] request` 本应在启动后
-约 3 s 出现（`Init` 的 `TriggerRefresh(true)`），而日志首行已是 uptime 750 ms 之后的
-`State 1 -> 3`——**说明抓包没有覆盖启动最初几秒**（`PageSync: started`（`up=19050`）同样缺失，
-是同一原因，因为它由 WiFi 连上触发，必然晚于抓包起点）。
+**这份日志**不能**回答的那一问**：17:56 那次刷新是否经由 UI 刷新回调（`RequestUrgent*`）
+请求。判据本该是 `CustomLcdDisplay` 的 `[REFRESH] request` 行——它是 `ESP_LOGI`，而全局级别为
+INFO（`sdkconfig: CONFIG_LOG_DEFAULT_LEVEL_INFO=y`），本该必留记录。
 
-**因此**：那次刷新走的是哪条路径**未定**。既然 UI 渲染发生在**进入 framebuffer**时
-（`ui_boot_paint_deferred_` 只抑制刷新请求，不抑制渲染），守卫就改挂在那一刻——
-见设计 §3.8。这样不论哪条生产者请求了那次 flush，外壳上玻璃时记录都已被清掉。
+**但这条判据在复核中被否证，必须撤回**：本文件**逐串复算**过 `[REFRESH]`、
+`request (urgent`、`Performing FULL`、`Performing PART`、`display_urgent`、`canvas`
+**六个串，全部 0 命中**。若 `[REFRESH]` 真的被级别压掉，那 30 次 `show page` 也不可能被记录
+（它们必然经由 `blit_and_refresh` → `rf_request_full_refresh` → `RequestUrgentFullRefresh("canvas")`
+→ `[REFRESH] request`）。两者不可能同时成立。因此**零命中不能用「级别」解释**，
+真实原因未定（候选：该档固件的 `custom_lcd_display.cc` 与当前树不同，或抓包工具做了过滤）。
+`RING_LINE_CAP` 亦不可能是原因（导出 2393 行 < 上限）。
+
+**结论**：关于「那次刷新走哪条路径」，本记录**不主张任何结论**。相应地，缺陷是否真的经由
+启动外壳发生，仍是**待证**的——判据应改为不依赖 `[REFRESH]` 行的直接观测（例如
+刷写新固件后，看 `ui_boot_paint_deferred_` 为真期间是否真的出现一次面板刷新）。
+
+**由此撤回的改动**：曾据此把守卫改挂到「外壳像素进入 framebuffer」那一刻（`Init()` 返回之后），
+该位置经复审否决——三个合取项在每次配对交互启动都平凡成立，会破坏画板赢得竞速时的
+`skipping repaint` 优化（本文件表中的 `up=10040` 就是那次优化）。守卫已改回刷新回调，
+见设计 §3.8。

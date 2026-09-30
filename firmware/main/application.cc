@@ -666,6 +666,28 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
             // the panel refresh is skipped.
             return;
         }
+        // A UI frame is about to be submitted to the panel while the canvas does
+        // NOT hold the glass. If the RTC record still claims a canvas page is
+        // displayed, that claim is false: the next wake's md5 compare would
+        // match and skip the repaint, leaving UI pixels up as if they were the
+        // canvas's page. Clearing it here -- at the one point where a UI frame
+        // is actually going to the glass -- means the clear cannot happen when
+        // the canvas legitimately wins the race and skips its own repaint.
+        //
+        // Two gates, both load-bearing:
+        //   !page_sync_is_displaying(): the canvas holds the glass, so the record
+        //     correctly describes it; nothing to do.
+        //   !rf_panel_record_pending(): a takeover staged by SwitchPage (or by a
+        //     notification) is sanctioned and merely awaits its commit, and
+        //     rf_panel_record_invalidate() would discard that staged claim too.
+        if (!page_sync_is_displaying() && !rf_panel_record_pending()) {
+            rf_panel_record_t rec;
+            rf_panel_record_get(&rec);
+            if (rec.magic == RF_PANEL_MAGIC && rec.valid != 0 &&
+                rec.source == RF_PANEL_SRC_CANVAS) {
+                rf_panel_record_invalidate();
+            }
+        }
         if (urgent) {
             lcd->RequestUrgentFullRefresh("ui");
         } else {
@@ -808,36 +830,6 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
     }
 
     ESP_LOGI(kTag, "Rawdraw gallery UI initialized");
-    // Init has just rendered the UI shell into the framebuffer. It did NOT
-    // necessarily request a panel refresh -- on a paired boot
-    // ui_boot_paint_deferred_ suppresses the request -- but the pixels are in
-    // the framebuffer either way, so whichever flush comes next carries the
-    // shell to the glass. Recording the fact here, rather than at a refresh
-    // entry point, means it does not matter which producer requests that flush.
-    //
-    // The canvas is not on the glass yet (page_sync_start() waits on WiFi), so a
-    // record that still claims a canvas page makes the next wake's md5 compare
-    // match and skip the repaint, leaving shell pixels up as if they were the
-    // canvas's page. Drop exactly that claim, and only that one: a takeover
-    // staged by SwitchPage is sanctioned and merely awaits its commit, and
-    // rf_panel_record_invalidate() would discard it too.
-    if (ui_boot_paint_deferred_.load(std::memory_order_acquire) &&
-        !page_sync_is_displaying() && !rf_panel_record_pending()) {
-        rf_panel_record_t rec;
-        rf_panel_record_get(&rec);
-        if (rec.magic == RF_PANEL_MAGIC && rec.valid != 0 &&
-            rec.source == RF_PANEL_SRC_CANVAS) {
-            rf_panel_record_invalidate();
-        }
-    }
-
-    if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
-        ESP_LOGI(kTag, "Wake from deep sleep: flash activity LED and refresh UI");
-        Board::GetInstance().FlashActivityLed();
-        if (rawdraw_ui_manager_) {
-            rawdraw_ui_manager_->RequestActivePageRefresh();
-        }
-    }
 }
 
 void Application::RequestPromotion() {
