@@ -231,7 +231,8 @@ pub fn stop_display_src(source: u8) {
 **修法**（`application.cc` 的 `Init` 刷新回调，越过 deferred 返回之后）：
 
 ```cpp
-        if (!page_sync_is_displaying()) {
+        if (ui_boot_paint_deferred_was_set_ && !page_sync_is_displaying() &&
+            !rf_panel_record_pending()) {
             rf_panel_record_t rec;
             rf_panel_record_get(&rec);
             if (rec.magic == RF_PANEL_MAGIC && rec.valid != 0 &&
@@ -241,13 +242,24 @@ pub fn stop_display_src(source: u8) {
         }
 ```
 
+**四个合取项各自的作用**（缺一个就错）：
+- `ui_boot_paint_deferred_was_set_`：只在「这确实是启动外壳那一次刷新」时动手。该闭锁在
+  `NoteButtonActivity` 丢弃 deferred 之前捕获（`application.cc`），并在
+  `RunPowerCycle` 的 `page_sync_paint_if_changed()` 之后清零（画板已获得过机会）。
+  没有它，每次用户翻页后的 UI 重绘都会进来做无用功。
+- `!page_sync_is_displaying()`：画板持屏时 UI 帧上不玻璃（`RenderAll` 在 `:734` 早退），
+  此时记录说的是画板，是对的，不能动。
+- `!rf_panel_record_pending()`：**收窄的关键**。`SwitchPage` 已把交权 `staged` 进
+  `g_pending_*`（合法、只等提交），而 `rf_panel_record_invalidate()` 会连 `g_pending_valid`
+  一起清掉（`shim.cpp`）——那会把一次合法交权抹成 `NONE`。虽然 `NONE` 与 `UI/SETTINGS`
+  在 `record_trusted` 下同效（都不可信），但记录会失真，且注释声称的「严格空操作」不成立。
+- `rec.source == RF_PANEL_SRC_CANVAS`：只在记录确实声称画板时才清，故**合法画板记录永不被碰**
+  （深睡红线）。
+
 **为什么是 invalidate 而不是 `stop_display_src`/`mark_pending_src`**：`paint_if_changed`
 读的是**已提交**的 `g_panel_rec`，而 `mark_pending_src` 只写 `g_pending_*`，要等刷新 idle
 才提交。普通唤醒时提交方是 `RunPowerCycle` 的 `page_sync_paint_if_changed()`——正是这条要用
 修复判定的路径，循环依赖。`rf_panel_record_invalidate()` 同步清 `g_panel_rec`，无此问题。
-
-**为什么条件式清除而不是无条件**：只在「记录声称画板」时清，故**合法画板记录永不被碰**
-（深睡红线）。条件不成立时是严格空操作——不依赖「缝隙是否真的可达」这个未定问题。
 
 **反过来不能做**：不能在这里中止 UI 刷新（那会把一次既有绘制变成白屏或推迟上屏），
 那是改机制，超出本设计的边界。

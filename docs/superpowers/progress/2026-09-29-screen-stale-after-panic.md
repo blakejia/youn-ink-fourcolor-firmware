@@ -57,7 +57,7 @@ schedule 查询串计数器（`w`=wakes, `a`=awake_ms, `r`=radio_ms, `g`=http_ge
 | 2 | 复位前 record 记着「某页在玻璃上」且 `valid=1` | `shim.cpp` commit 钩子 |
 | 3 | 重启后 `record_trusted()` 只查 `magic && valid`，record 仍可信 | `page_sync.rs:708-710` |
 | 4 | 目标页与 record 相同 → md5 相等 → `COMPARE_SKIP_SAME` | `page_sync.rs:799-803` |
-| 5 | 玻璃上是 UI 内容：`ui_boot_paint_deferred_` 只跳过**面板刷新**，UI 内容照样渲染进 framebuffer。**但读代码无法判定这一帧如何在画板持屏时上玻璃**——`RenderAll` 在 `page_sync_is_displaying()` 时早退（`rawdraw_ui_manager.cc:729`），且 `Init` 自身那次刷新被 deferred 拦掉。 | `application.cc:663-666` |
+| 5 | 玻璃上是 UI 内容：`ui_boot_paint_deferred_` 只跳过**面板刷新**，UI 内容照样渲染进 framebuffer。**但读代码无法判定这一帧如何在画板持屏时上玻璃**——`RenderAll` 在 `page_sync_is_displaying()` 时早退（`rawdraw_ui_manager.cc:734`），且 `Init` 自身那次刷新被 deferred 拦掉。 | `application.cc:663-666` |
 | 6 | `rawdraw_ui_manager.cc` 有 **7 处** `Clear + RenderAll` 全屏重画，**全都不更新 record**。不过其中 5 处受 `page_sync_is_displaying()` 早退保护，画板持屏时画不进玻璃 | `:356/431/514/533/706/1437/1477` |
 
 **结论**：record 说「画板某页在屏上」，玻璃上却是 UI 内容 → 分叉。
@@ -100,7 +100,7 @@ schedule 查询串计数器（`w`=wakes, `a`=awake_ms, `r`=radio_ms, `g`=http_ge
 
 **更正一**：本文件第 1 节把玻璃上出现 UI 内容写成「因为 render 落进了 framebuffer」，
 暗示它随后被刷上屏。核实后这个机制**不成立**：`RenderAll` 在
-`page_sync_is_displaying()` 时直接 return（`rawdraw_ui_manager.cc:729-730`），画板持屏时
+`page_sync_is_displaying()` 时直接 return（`rawdraw_ui_manager.cc:734-737`），画板持屏时
 UI 根本画不进玻璃；且配对启动时 `Init` 的那次 `TriggerRefresh` 被
 `ui_boot_paint_deferred_`（`application.cc:519/663-666`）整体早退拦下。
 

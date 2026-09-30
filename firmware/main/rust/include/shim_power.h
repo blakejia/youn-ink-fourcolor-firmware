@@ -10,6 +10,7 @@
 #define SHIM_POWER_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <stddef.h>   /* offsetof */
 
 #define RF_PANEL_MAGIC 0x50414E31u
@@ -47,6 +48,9 @@ void rf_panel_record_get(rf_panel_record_t* out);
 void rf_panel_mark_pending(const char* md5, int index);
 void rf_panel_mark_pending_src(const char* md5, int index, uint8_t source);
 void rf_panel_record_invalidate(void);
+/* True while a takeover is staged but not yet committed (refresh not idle).
+ * Callers that must not destroy a sanctioned takeover read this first. */
+bool rf_panel_record_pending(void);
 /* Re-chain the commit-on-idle hook (shim.cpp) after RawDrawUiManager::Init
  * replaced the refresh-idle slot on the promotion path. One call chains
  * exactly one trampoline; promotion is one-shot and Init wiped the previous

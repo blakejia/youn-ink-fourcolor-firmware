@@ -127,6 +127,10 @@ private:
     // to keep — spec §13 — not the shell. Cleared by the first cycle and by
     // any button activity, so the UI can never be left unpainted.
     std::atomic<bool> ui_boot_paint_deferred_{false};
+    // Latched when the deferral is cleared: the Init refresh callback uses
+    // it to tell a boot shell flush (record claim must be dropped) from an
+    // ordinary user-driven repaint (nothing to drop).
+    std::atomic<bool> ui_boot_paint_deferred_was_set_{false};
     // (The sync-failure backoff streak is NOT here: it lives in RTC memory
     // via rf_fail_streak_*, because RAM is cleared on every deep-sleep wake.)
     // One-shot: a tick arriving with this set runs a cycle even though the

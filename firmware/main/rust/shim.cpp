@@ -366,6 +366,13 @@ extern "C" void rf_panel_mark_pending(const char *md5, int index) {
     rf_panel_mark_pending_src(md5, index, RF_PANEL_SRC_CANVAS);
 }
 
+extern "C" bool rf_panel_record_pending(void) {
+    portENTER_CRITICAL(&g_panel_mux);
+    const bool pending = g_pending_valid;
+    portEXIT_CRITICAL(&g_panel_mux);
+    return pending;
+}
+
 extern "C" void rf_panel_record_invalidate(void) {
     portENTER_CRITICAL(&g_panel_mux);
     g_panel_rec.valid = 0;
