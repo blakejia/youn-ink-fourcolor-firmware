@@ -168,3 +168,48 @@ INFO（`sdkconfig: CONFIG_LOG_DEFAULT_LEVEL_INFO=y`），本该必留记录。
 该位置经复审否决——三个合取项在每次配对交互启动都平凡成立，会破坏画板赢得竞速时的
 `skipping repaint` 优化（本文件表中的 `up=10040` 就是那次优化）。守卫已改回刷新回调，
 见设计 §3.8。
+
+## 10. 刷写新固件后的启动日志核对（2026-09-30 13:32，102 行）——第二个推断也被否证
+
+**这份日志抓到了启动最初几秒**（首行 `ESP-ROM:esp32s3-20210327`，随后 `I (3102)`），
+所以 §9 那条「抓包未覆盖启动最初几秒」的推断**被直接证否**：覆盖是够的。
+
+**更强的否证**：`blit_and_refresh` 在拷贝完 framebuffer 后**无条件**调用
+`rf_request_full_refresh()`（`page_sync.rs:725`），后者无条件调
+`RequestUrgentFullRefresh("canvas")`（`shim.cpp:308`），而该函数第一件事就是
+`ESP_LOGI(TAG, "[REFRESH] request (urgent+full): reason=%s", ...)`（`custom_lcd_display.cc`）。
+所以**每一次 `show page` 必然伴随一条 `[REFRESH]` 行**。本次抓包里
+`show page` 出现 **1** 次、`[REFRESH]` / `request (urgent` / `Performing FULL` 全部 **0** 次。
+按 §9 自己用过的同一逻辑，这只能是**抓包会丢 `CustomLcdDisplay`/`Application` 的 INFO 行**，
+与级别、与覆盖范围都无关。**§9 的推断作废，且不得再用「串口有/无某行」当作证据。**
+（判据若要成立，必须用设备自身经 `rf_logbuf` 上报的那份日志。）
+
+**本次启动的关键时点（全部来自同一抓包，相对关系可靠）**：
+
+| 事件 | uptime |
+|---|---|
+| ROM 引导 | 0（首行 `ESP-ROM`） |
+| WiFi 拿到 IP | 4322 ms |
+| `ServerPairing: task started` | 4332 ms |
+| **`PageSync: started`**（`page_sync_start()` → `DISPLAYING=true`） | **4372 ms** |
+| `schedule updated` | 9122 ms |
+| `log upload ok` | 12122 ms |
+| **`show page 3/3 md5="78403d0d"`** | **15272 ms** |
+| 首个刷新事务起点（busy 5000 的前 5 s） | 16272 ms |
+| `Display refresh idle` | 65542 ms |
+
+**由此得出的两条**：
+
+1. **交互启动时 `DISPLAYING` 在整个启动窗口内为 false**——`page_sync_start()` 要到 WiFi 连上
+   （4322 ms）之后才跑，即这段窗口长约 4.3 s，而非微秒级。§1.1(a) 的机制窗口**因此是真实存在的**。
+2. **但画板随后立刻赢了竞速**：它在 15272 ms 就完成了同步并 `show page`（一次全刷），
+   也就是说刷新回调里那个守卫即使被调到，也只会在此前把记录清掉、**换来一次多余的重复全刷**——
+   与 §9 的 `up=10040` 那次 skip 是同一类代价（本次是 `show page` 而非 skip，但同样是画板自己
+   把这一轮画完了）。
+
+**因此本缺陷的最终状态**：
+- 记录收紧（只信 `source == CANVAS`）与四处交权点写来源：**已证部分，独立成立**。
+- 冷启动窗口本身：**已证存在**（4.3 s > 0）。
+- 该窗口是否真的会把外壳刷上玻璃：**仍未观测到**——本机是插着 USB 的交互启动，画板 11 s 内就
+  接管并画了页；唯一一次观测到的「skip 之后仍有刷新」是旧固件那次。故 §3.8 那个守卫
+  **实际是否触发，未知**。
