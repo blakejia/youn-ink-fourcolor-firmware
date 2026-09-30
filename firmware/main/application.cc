@@ -666,27 +666,6 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
             // the panel refresh is skipped.
             return;
         }
-        // A boot-time UI frame is about to reach the glass while the canvas does
-        // NOT hold it. If the RTC record still claims a canvas page is
-        // displayed, that claim is now false: the next wake's md5 compare would
-        // match and skip the repaint, leaving UI pixels up as if they were the
-        // canvas's page. This is the interactive-boot window -- BuildRawDrawUi
-        // runs before page_sync_start(), which waits on WiFi -- and the flusher
-        // that carries the shell here records nothing.
-        //
-        // Fixed condition, not "whenever the record says canvas": a takeover
-        // staged by SwitchPage is sanctioned and only awaits its commit, and
-        // both rf_panel_record_invalidate() and a staged claim make the record
-        // untrusted, so nothing is gained by discarding it.
-        if (ui_boot_paint_deferred_was_set_ && !page_sync_is_displaying() &&
-            !rf_panel_record_pending()) {
-            rf_panel_record_t rec;
-            rf_panel_record_get(&rec);
-            if (rec.magic == RF_PANEL_MAGIC && rec.valid != 0 &&
-                rec.source == RF_PANEL_SRC_CANVAS) {
-                rf_panel_record_invalidate();
-            }
-        }
         if (urgent) {
             lcd->RequestUrgentFullRefresh("ui");
         } else {
@@ -829,6 +808,29 @@ void Application::BuildRawDrawUi(CustomLcdDisplay* lcd) {
     }
 
     ESP_LOGI(kTag, "Rawdraw gallery UI initialized");
+    // Init has just rendered the UI shell into the framebuffer. It did NOT
+    // necessarily request a panel refresh -- on a paired boot
+    // ui_boot_paint_deferred_ suppresses the request -- but the pixels are in
+    // the framebuffer either way, so whichever flush comes next carries the
+    // shell to the glass. Recording the fact here, rather than at a refresh
+    // entry point, means it does not matter which producer requests that flush.
+    //
+    // The canvas is not on the glass yet (page_sync_start() waits on WiFi), so a
+    // record that still claims a canvas page makes the next wake's md5 compare
+    // match and skip the repaint, leaving shell pixels up as if they were the
+    // canvas's page. Drop exactly that claim, and only that one: a takeover
+    // staged by SwitchPage is sanctioned and merely awaits its commit, and
+    // rf_panel_record_invalidate() would discard it too.
+    if (ui_boot_paint_deferred_.load(std::memory_order_acquire) &&
+        !page_sync_is_displaying() && !rf_panel_record_pending()) {
+        rf_panel_record_t rec;
+        rf_panel_record_get(&rec);
+        if (rec.magic == RF_PANEL_MAGIC && rec.valid != 0 &&
+            rec.source == RF_PANEL_SRC_CANVAS) {
+            rf_panel_record_invalidate();
+        }
+    }
+
     if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
         ESP_LOGI(kTag, "Wake from deep sleep: flash activity LED and refresh UI");
         Board::GetInstance().FlashActivityLed();
@@ -1135,12 +1137,6 @@ void Application::NoteButtonActivity() {
     Board::GetInstance().FlashActivityLed();
     // Someone is in front of the device: whatever the boot held back, they are
     // waiting on a screen now and the canvas's frame is no longer the answer.
-    // Remember that this was a deferred boot before dropping the flag: the Init
-    // refresh callback uses it to decide whether the frame it is flushing is a
-    // boot shell whose record claim must be dropped (see the callback).
-    ui_boot_paint_deferred_was_set_.store(
-        ui_boot_paint_deferred_.load(std::memory_order_acquire),
-        std::memory_order_release);
     ui_boot_paint_deferred_.store(false, std::memory_order_release);
     if (rawdraw_ui_manager_) {
         rawdraw_ui_manager_->RequestActivePageRefresh();
@@ -1405,10 +1401,8 @@ void Application::RunPowerCycle() {
     page_sync_paint_if_changed();
     // The cold boot may have held the UI's first paint back for exactly this
     // frame; from here the UI paints normally (button activity would have
-    // cleared the flag before this point). The latch goes with it: the canvas
-    // has now had its chance, so a later UI repaint is not a boot shell.
+    // cleared the flag before this point).
     ui_boot_paint_deferred_.store(false, std::memory_order_release);
-    ui_boot_paint_deferred_was_set_.store(false, std::memory_order_release);
     ServicePowerPolicy();
     cycle_in_progress_.store(false, std::memory_order_release);
 }
