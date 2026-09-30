@@ -123,3 +123,39 @@ glass already shows ..., skipping repaint   <- 出现在哪一个之后？
 若 `skipping repaint` 出现在 `PageSync: started` 之后且期间玻璃上是 UI 帧，则缝隙可达，
 `application.cc` 刷新回调里那处条件 invalidate 会被触发（修复生效）；若不出现，该守卫
 保持为惰性防御，无副作用。**在此之前不要声称本缺陷已完全关闭。**
+
+## 9. 7.5 小时串口日志的核查（2026-09-30，`serial-1790728810247.log`，2393 行）
+
+**覆盖范围与结论前提**：17:56:21 → 次日 08:39:15（14.7 h）；uptime 从 750 ms 单调升到
+52 980 160 ms，**零倒退 = 期间一次复位都没有**；**零** `Guru Meditation` / backtrace /
+abort / assert。故这份日志**不能**用于 `rr=4` 归因（整段没有崩溃），但它完整覆盖了
+17:56 那次启动——而那次正是产生陈旧帧的那次。
+
+**级别分布**：I 2221 / W 146 / **E 24**。24 条 E 全是同两个时刻的网络失败
+（`05:51:09` 与 `06:11:31`，`esp-tls select() timeout` → `HttpWrap: HTTP GET … failed:
+ESP_ERR_HTTP_CONNECT`），分别打掉一次 `schedule` 和一次 `notifications/next.bin`。
+失败请求串里 `w=73→75`、`er=31→32`、`rr=4`，两个时刻相距 20 min 且 `a`/`r` 未变——
+符合重试回溯阶梯；设备随后自行恢复，**无持久故障**。
+
+**关键量化（启动那次刷新）**：
+
+| 事件 | 次数 | 其后 90 s 内出现刷新事务 |
+|---|---|---|
+| `skipping repaint` | 58 | **仅 1 次**（`up=10040`，即启动那次） |
+| `show page` | 30 | 30（100%） |
+
+这同时说明两件事：①画板日常的 skip 都是真的跳过（省电正常，**深睡红线未被违反**）；
+②唯一一次「skip 之后还有刷新」就是启动那次，其 `EPD busy wait` 20 s 序列从 skip 后
+1.2 s 开始，而 WiFi 要到 `up=18750` 才连上——**刷新发生在 `page_sync_start()` 之前**。
+
+**这份日志无法回答的那一问**：17:56 那次刷新是否经由 UI 刷新回调（`RequestUrgent*`）请求。
+`CustomLcdDisplay` 的 `[REFRESH] request` 是 `ESP_LOGI`，而全局日志级别为 INFO
+（`sdkconfig: CONFIG_LOG_DEFAULT_LEVEL_INFO=y`，全仓无 `esp_log_level_set`），凡经该入口
+必留记录；但整份抓包里 `[REFRESH]` 出现 **0 次**。首条 `[REFRESH] request` 本应在启动后
+约 3 s 出现（`Init` 的 `TriggerRefresh(true)`），而日志首行已是 uptime 750 ms 之后的
+`State 1 -> 3`——**说明抓包没有覆盖启动最初几秒**（`PageSync: started`（`up=19050`）同样缺失，
+是同一原因，因为它由 WiFi 连上触发，必然晚于抓包起点）。
+
+**因此**：那次刷新走的是哪条路径**未定**。既然 UI 渲染发生在**进入 framebuffer**时
+（`ui_boot_paint_deferred_` 只抑制刷新请求，不抑制渲染），守卫就改挂在那一刻——
+见设计 §3.8。这样不论哪条生产者请求了那次 flush，外壳上玻璃时记录都已被清掉。
