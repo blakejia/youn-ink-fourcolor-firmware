@@ -559,14 +559,29 @@ fn sync_schedule(body: &[u8]) -> bool {
     // "on" forever.
     log_upload_server_set(parsed.log_upload);
 
-    let policy_changed = with_table(|t| {
+    // Commit on every parsed body, both sync paths.
+    //
+    // The log line fires on any CHANGE, plus once per boot that lands back on
+    // the day value. Without the second half a wake that opens after the night
+    // window closed sees `true == Policy::DEFAULT.screen_active` and stays
+    // silent -- so the log only ever showed day -> night, and a reader could
+    // not tell "the window closed correctly" from "the service stopped saying
+    // anything". Log-budget cost is one line per boot at most.
+    let mut policy_changed = false;
+    let mut policy_is_new_boot = false;
+    with_table(|t| {
         let prev = t.policy;
+        policy_changed = prev != new_policy;
+        // `have_schedule_md5` is false only before this boot's first parse.
+        policy_is_new_boot = !t.have_schedule_md5;
         t.policy = new_policy;
-        prev != new_policy
     });
-    if policy_changed {
-        log_i!("PageSync", "policy: poll={}s sleep_poll={}s screen_active={}",
-            new_policy.poll_s, new_policy.sleep_poll_s, new_policy.screen_active);
+    if policy_changed
+        || (policy_is_new_boot && new_policy.screen_active == Policy::DEFAULT.screen_active)
+    {
+        log_i!("PageSync", "policy: poll={}s sleep_poll={}s screen_active={}{}",
+            new_policy.poll_s, new_policy.sleep_poll_s, new_policy.screen_active,
+            if policy_changed { "" } else { " (boot)" });
     }
 
     // 99% path (Task 5, design §6): the schedule comparison decision lives
