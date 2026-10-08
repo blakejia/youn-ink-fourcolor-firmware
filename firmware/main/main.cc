@@ -101,6 +101,32 @@ extern "C" void app_main(void)
         pm.light_sleep_enable = false;
         ESP_ERROR_CHECK(esp_pm_configure(&pm));
     }
+    // Duty-cycle log budget (2026-10-08). The RTC ring that carries logs across
+    // a deep-sleep wake holds 2048 B, but one wake produces 9-20 KB. The ring
+    // therefore overwrites its own oldest lines every cycle and the server sees
+    // "... [dropped N lines]" on essentially every batch.
+    //
+    // The largest removable block is the ESP-IDF Wi-Fi driver's INFO chatter,
+    // which this AP (`yi02`) makes pathological: it emits no TIM IE, so every
+    // association re-prints the same four-line complaint plus the beacon lines —
+    // byte-identical cycle after cycle. Measured on the real device log it is
+    // 34% of the bytes in the <15 s boot window (40% within the first 4 s,
+    // where the overflow actually happens).
+    //
+    // WARN, not OFF: `wifi`'s diagnostic value is in its warnings and errors.
+    // Note the cost — IDF prints "Set ps type: N" and the `pm start` banner at
+    // INFO, so the enum-reading rule in AGENTS.md §7 loses its log source (the
+    // level is still reported by our own `WifiStation: Setting WiFi power save
+    // level:` line, the one that made the type:1 misread possible to begin
+    // with). Raise this back to INFO when diagnosing Wi-Fi rather than trusting
+    // an absence of those lines.
+    //
+    // This is set BEFORE rf_logbuf_install_hook/the driver start so no boot line
+    // is captured at the old level. It can only lower a level, never raise one
+    // above CONFIG_LOG_MAXIMUM_LEVEL, and CONFIG_LOG_DYNAMIC_LEVEL_CONTROL=y is
+    // what makes it take effect at all (without it esp_log_level_set is a
+    // documented no-op).
+    esp_log_level_set("wifi", ESP_LOG_WARN);
     // Capture logs from the very first boot line: the install must precede
     // Application::Initialize and everything it touches, or the boot-path
     // lines that explain a crash are exactly the ones never recorded.
