@@ -115,12 +115,57 @@ UART0 抓到完整冷启动（187 行，从 `ESP-ROM` 到 `Display refresh idle`
 
 ## 9. 未验（需物理按键 / 更长观察）
 
-- **设备本地开关三态**（设置页 BOOT 单击循环 0/1/2 + 设置页/状态栏显示）需在设备旁实际按压——
-  本机无法注入按键。
+- **设备本地开关三态**（设置页 BOOT 单击循环 0/1/2 + 设置页/状态栏显示）——已用一次性探针
+  在真机上验过机制，见 §9b；肉眼观感（设置页/状态栏实际显示）仍需人工。
 - **崩溃前日志存活**：需制造一次非 USB 复位（USB 复位本身会复位 USB 外设）。
 - **`dropped` 清零**：属 §5 的后续改动，未做。
 - **服务端"跟随设备" + 本地各三态的完整六行矩阵**：本次只验了服务端覆盖关/跟随两行；
   本地三态需物理按键。
+
+## 9b. 按键探针：设备本地三态 + 两段确认（2026-10-09 00:00 前后）
+
+本地开关三态与两段确认需要物理按键，本机没有注入手段，所以用一次性探针把事件喂给
+**物理按键最终到达的同一函数** `SettingsRenderer::HandleInput`（`rawdraw_ui_manager.cc:616`
+在真实路径上也是先把它交给活动 renderer）。探针在 `Run()` 里跑一次，守卫是
+`esp_reset_reason() == ESP_RST_USB`（只在串口刷写后的那次启动生效）。
+
+**两个刻意的设计取舍**（都为了避免制造假象）：
+
+- **不走 UI 管理器的重绘/刷新路径**：只调 renderer 的 `HandleInput` + `Render`，且 `Render`
+  画进一块 400×300 的 scratch 字节数组，**不碰真实 framebuffer**。管理器的路径会在
+  `rawdraw::Clear(fb)` 之后 `TriggerRefresh`，而设置页让画板挂起后 `DISPLAYING=false`
+  （不早退）⇒ 会把**清空后的白 framebuffer** 刷上玻璃（AGENTS.md §7 明列的路径）。
+- **延后到启动爆发之后**（15 s）再跑：启动爆发 9–20 KB 对 2048 B 环，早跑会被开机日志冲掉。
+
+**实测（UART0，`/tmp/probe-capture.log`）**：
+
+```
+W (15689) PROBE: begin local_lo=2 section=0
+W (15839) PROBE: BOOT enter options (=日志上报)
+I (15999) Application: 日志上报: local opinion 2 -> 1
+W (16149) PROBE: local_lo 2 -> 1
+I (16159) Application: 日志上报: local opinion 1 -> 0
+W (16309) PROBE: local_lo 1 -> 0
+I (16319) Application: 日志上报: local opinion 0 -> 2
+W (16469) PROBE: local_lo 0 -> 2
+W (17219) PROBE: BOOT arm 重置设备 (must NOT confirm)
+W (17219) Application: Settings: 11 armed; press again within 5 s to confirm
+```
+
+- **本地三态 ✅**：`2→1→0→2`，与 `settings.rs::log_upload_toggle_target` 的单测一致
+  （ON→OFF→NONE→ON）；每步 app 的 handler 都落了一行，且 NVS 读回与写入一致。收尾停在
+  ON(2)，上传不中断。
+- **两段确认 ✅（负向）**：单次按下 `11`（重置设备）只 `armed`，**没有** `confirmed`、没有
+  重启、没有擦除 —— 写路径根本不执行。第二次按下的**正向前提**由 Rust 单测钉死
+  （`fresh = armed == Some(pressed) && now - armed_at <= 5000`），本探针刻意不制造。
+
+**撤探针与复核**：`git checkout` 还原 `application.cc`/`application.h`，重建（`0x2c9f30`，
+与 `65e675a` 提交信息同尺寸）刷回。干净启动抓包：**0** 条 `PROBE`、**0** 条 Settings
+`armed`/`confirmed`、**0** 条三态切换；设备 `app_elf_sha256` = `5ebe8fa3…50c1ea`（与本地
+HEAD 产物一致）；`git status firmware/` 为空。
+
+**仍未验**：本地三态与服务端三态的完整六行矩阵（§6 已验两行 + 本节验了本地三态的机制）。
+崩溃前日志存活（需非 USB 复位）亦未验。
 
 ## 10. 门禁
 
