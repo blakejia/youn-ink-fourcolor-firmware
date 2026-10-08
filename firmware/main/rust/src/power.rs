@@ -32,6 +32,21 @@ const BUSY_RETRY_MS: u32 = 15_000;
 const MAINS_RETRY_MS: u32 = 60_000;
 const GRACE_RETRY_MS: u32 = 30_000;
 const BACKOFF_BASE_S: u32 = 60;
+/// How long the device may sleep while the service has told it how long until
+/// the page rotation reaches it — the holder's accepted notification latency.
+///
+/// The service also sends `poll_interval_minutes` (10 min), and that used to
+/// be the cap on every wake, which made a 30-minute page wake the device three
+/// times per rotation: two of those wakes downloaded the bitmap and then
+/// skipped the repaint. Measured over 13:43-16:21 on battery, 15 wakes with 9
+/// repaints against a rotation that needs about 1.5.
+///
+/// `poll_s` is a poll cadence, not a sleep budget — it belongs to the "no idea
+/// when the next page is" case and to the day/night cadences, which is what
+/// [`poll_cap`] still owns. When the rotation IS known, this budget bounds the
+/// wait instead, so a push cannot go unnoticed for longer than the holder
+/// agreed to. It is a ceiling, not a licence: `max_sleep_min` still wins.
+pub const ROTATION_WAIT_BUDGET_S: u32 = 900;
 
 fn poll_cap(i: &Inputs) -> u32 {
     let cap = if i.screen_active { i.poll_s } else { i.sleep_poll_s };
@@ -73,14 +88,31 @@ pub fn decide(i: &Inputs) -> Action {
         return Action::StayAwake { retry_ms: MAINS_RETRY_MS, reason: "sleep_mode_off" };
     }
 
+    // Two different questions, two different ceilings:
+    //
+    //   * "I know when the page changes" — wait that long, bounded by the
+    //     holder's latency budget and by `max_sleep_min`.
+    //   * "I have no idea when the page changes" (no schedule, or a failed
+    //     sync) — the poll cadence answers, since a push can only be noticed
+    //     by polling.
+    //
+    // Both still pass through `MIN_SLEEP_S` so a bad service value cannot turn
+    // the duty cycle into a hot loop, and both still pass through
+    // `poll_cap` for the unknown case so the day/night cadences keep working.
     let cap = poll_cap(i);
+    // A known rotation is NOT clamped by `cap`: `cap` is the poll cadence, and
+    // letting it bound a rotation the service has already dated is what woke
+    // the device three times per 30-minute page. The ceiling is the latency
+    // budget (so a push is never unnoticed for longer than the holder agreed
+    // to) and `max_sleep_min` (so a stale NVS value cannot park the device).
+    let wait_cap = ROTATION_WAIT_BUDGET_S.clamp(MIN_SLEEP_S, i.max_sleep_s.max(MIN_SLEEP_S));
     let wake_s = if !i.sync_ok {
         // Nothing to paint until the server answers; back off instead of
         // hammering a server that is down.
         (BACKOFF_BASE_S << i.fail_streak.min(5)).min(cap)
     } else {
         match i.seconds_until_next_page {
-            Some(s) => s.clamp(MIN_SLEEP_S, cap),
+            Some(s) => s.clamp(MIN_SLEEP_S, wait_cap),
             None => cap,
         }
     };
@@ -164,10 +196,81 @@ mod tests {
         assert_eq!(decide(&i), Action::Sleep { wake_s: 240, invalidate_panel: false });
     }
 
+    /// Regression for the measured defect: the service's 10-minute poll
+    /// interval used to clamp every wake, so a 30-minute page still woke the
+    /// device three times per rotation. `poll_s` is a *poll* cadence, not a
+    /// sleep budget: when the service says the next page change is further
+    /// out than the budget allows, the device sleeps for the budget.
     #[test]
-    fn the_poll_cap_bounds_the_wake() {
+    fn the_poll_interval_no_longer_clamps_a_known_rotation() {
         let i = Inputs { seconds_until_next_page: Some(9000), poll_s: 600, ..base() };
+        assert_eq!(decide(&i), Action::Sleep { wake_s: ROTATION_WAIT_BUDGET_S, invalidate_panel: false });
+    }
+
+    /// The holder's accepted notification latency: the schedule GET that a
+    /// push waits on cannot be further out than this, however long the page
+    /// rotation is.
+    #[test]
+    fn the_latency_budget_bounds_the_wait() {
+        assert_eq!(ROTATION_WAIT_BUDGET_S, 900, "the budget is 15 minutes");
+        for page in [901, 1800, 1799, 86_400] {
+            let i = Inputs { seconds_until_next_page: Some(page), poll_s: 600, ..base() };
+            assert_eq!(decide(&i), Action::Sleep { wake_s: 900, invalidate_panel: false },
+                "page {page} s out must still wake within the 15 min budget");
+        }
+    }
+
+    /// The budget is a ceiling the holder controls, not a licence to exceed
+    /// `max_sleep_min`.
+    #[test]
+    fn the_latency_budget_does_not_override_max_sleep() {
+        let i = Inputs { max_sleep_s: 300, seconds_until_next_page: Some(9000), ..base() };
+        assert_eq!(decide(&i), Action::Sleep { wake_s: 300, invalidate_panel: false });
+    }
+
+    /// The night cadence (`sleep_poll_s`, 60 min) is the *poll* ceiling and
+    /// still owns the unknown-rotation case, but it must not shrink a known
+    /// rotation that lands inside the latency budget: at 1 a.m. a page that
+    /// changes in 5 minutes still has to be awake when it does.
+    #[test]
+    fn the_night_cadence_does_not_shrink_a_rotation_inside_the_budget() {
+        let i = Inputs { screen_active: false, sleep_poll_s: 3600, poll_s: 600,
+                         seconds_until_next_page: Some(300), ..base() };
+        assert_eq!(decide(&i), Action::Sleep { wake_s: 300, invalidate_panel: false });
+    }
+
+    /// Flip test for the ceiling arithmetic: the same inputs differing only in
+    /// `seconds_until_next_page`, so the budget -- and not `poll_s`, nor the
+    /// night cadence -- is what stops the wait.
+    #[test]
+    fn the_budget_and_not_the_poll_interval_is_what_bounds_a_known_rotation() {
+        let inside = Inputs { screen_active: false, sleep_poll_s: 3600, poll_s: 600,
+                              seconds_until_next_page: Some(899), ..base() };
+        assert_eq!(decide(&inside), Action::Sleep { wake_s: 899, invalidate_panel: false });
+        let far = Inputs { seconds_until_next_page: Some(3600), ..inside };
+        assert_eq!(decide(&far), Action::Sleep { wake_s: 900, invalidate_panel: false },
+            "a rotation a full night away must not hold the device for a full night");
+    }
+
+    /// A rotation closer than the budget is still honoured exactly: the device
+    /// must be awake when the page actually changes.
+    #[test]
+    fn a_rotation_inside_the_budget_is_slept_exactly() {
+        for page in [60, 240, 599, 900] {
+            let i = Inputs { seconds_until_next_page: Some(page), poll_s: 60, ..base() };
+            assert_eq!(decide(&i), Action::Sleep { wake_s: page, invalidate_panel: false },
+                "page {page} s out must be slept exactly, not stretched to the budget");
+        }
+    }
+
+    /// Without a rotation answer there is nothing to wait for, so the poll
+    /// cadence (day or night) still owns the wake — unchanged.
+    #[test]
+    fn an_unknown_rotation_keeps_the_poll_cadence() {
+        let i = Inputs { seconds_until_next_page: None, poll_s: 600, ..base() };
         assert_eq!(decide(&i), Action::Sleep { wake_s: 600, invalidate_panel: false });
+        let i = Inputs { screen_active: false, sleep_poll_s: 3600, poll_s: 600, ..i };
+        assert_eq!(decide(&i), Action::Sleep { wake_s: 3600, invalidate_panel: false });
     }
 
     #[test]
