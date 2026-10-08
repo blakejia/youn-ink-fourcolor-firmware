@@ -21,7 +21,12 @@
 namespace {
 
 constexpr uint32_t kMagic = 0x4c4f4731u;  // "LOG1"
-constexpr int kDataBytes = 2048;
+// Raised 2048 -> 4096 on 2026-10-09; see `MAX_UPLOAD_BYTES` in
+// `log_upload_policy.rs` for why (the canvas paint decision lands after the
+// upload and was then evicted by the next wake's boot burst). kDataBytes and
+// MAX_UPLOAD_BYTES MUST move together, or the ring cannot be drained in one
+// wake -- `one_upload_drains_a_full_ring_without_leaving_a_residue` pins that.
+constexpr int kDataBytes = 4096;
 constexpr int kMaxLine = 256;             // one line's cap incl. NUL
 
 // One byte is reserved (kCapBytes = kDataBytes - 1) so that head == tail

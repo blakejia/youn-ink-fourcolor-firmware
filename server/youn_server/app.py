@@ -578,7 +578,11 @@ def create_app() -> FastAPI:
             text = base64.b64decode(raw, validate=True)
         except Exception:
             raise HTTPException(400, "lines must be valid base64")
-        if len(text) > 4096:
+        # Above the device's single-upload cap (`log_upload_policy.rs`'s
+        # MAX_UPLOAD_BYTES, 4096) with headroom: a batch sitting exactly at the
+        # device cap must never 400 here. Raised 4096 -> 8192 on 2026-10-09
+        # together with the device cap.
+        if len(text) > 8192:
             raise HTTPException(400, "decoded body too large")
         stamped = datetime.now(ZoneInfo(settings.canvas_timezone)).isoformat()
         written = devicelog.append_lines(

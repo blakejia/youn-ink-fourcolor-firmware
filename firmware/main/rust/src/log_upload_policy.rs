@@ -14,7 +14,20 @@
 /// before the next one. `page_sync.rs`'s
 /// `one_upload_drains_a_full_ring_without_leaving_a_residue` pins the pairing;
 /// `shim_log.cpp` owns the other half of it.
-pub const MAX_UPLOAD_BYTES: u32 = 2048;
+///
+/// Raised 2048 -> 4096 on 2026-10-09. At 2048 the ring still dropped 36-83
+/// lines per wake because it holds exactly ONE wake's first ~5.5 s, while the
+/// canvas paint decision lands at 10-15 s: those lines were written, survived
+/// to the next wake, and were then evicted by that wake's boot burst before
+/// the upload that would have shipped them. The result was that every
+/// `show page` / `skipping repaint` line was unrecoverable, which is precisely
+/// the evidence the page-repaint investigation needs. 4096 holds the boot
+/// burst plus the decision tail. The RTC slow segment has room: `.rtc_noinit`
+/// used 2068 B of 8192 B.
+///
+/// The server's decoded-body limit MUST stay above this (`app.py`: 4096 ->
+/// 8192), or every batch is a 400.
+pub const MAX_UPLOAD_BYTES: u32 = 4096;
 
 /// Both switches are three-state. "No opinion" is not "off": it is precisely
 /// what lets the other side decide.

@@ -1074,10 +1074,19 @@ pub fn log_upload_server_set(v: u8) {
 // comment replaces: `seq_hi` came from the untruncated line count, so a
 // backlog over the cap acked lines that never left the device.)
 const LOG_READ_BUF: usize = log_upload_policy::MAX_UPLOAD_BYTES as usize;
-// base64(2048 B) = 2732 chars. Rounded up to the next multiple of 1024 so the
-// two buffers keep a fixed relationship to the cap when it moves again.
-const LOG_B64_BUF: usize = 3072;
-const LOG_BODY_BUF: usize = 3072;  // envelope + base64 + NUL
+// base64(4096 B) = 5464 chars. DERIVED from the cap, not written next to it:
+// the comment here used to promise a "fixed relationship to the cap when it
+// moves again" while the values stayed literals, and raising the cap
+// 2048 -> 4096 made base64 need 5464 B in a 3072 B buffer -- every batch
+// silently truncated. `const fn` arithmetic cannot drift.
+/// base64 of `n` bytes: ceil(n / 3) * 4, padding included.
+const fn b64_encoded_len(n: usize) -> usize {
+    n.div_ceil(3) * 4
+}
+const LOG_B64_BUF: usize = b64_encoded_len(LOG_READ_BUF);
+/// base64 + the JSON head (<= 64 B, bounded by `head`'s own buffer) + the
+/// closing quote, brace and NUL.
+const LOG_BODY_BUF: usize = LOG_B64_BUF + 64 + 8;
 const LOG_URL_BUF: usize = 320;
 const LOG_HTTP_TIMEOUT_MS: i32 = 10_000;
 
@@ -2083,11 +2092,11 @@ mod tests {
         // two uploads and the residue assertion caught it, but scaling the
         // fixture with the cap made it pass at BOTH values, so a sentinel that
         // reverted the cap stayed green.
-        const RING_BYTES: usize = 2048;   // shim_log.cpp's kDataBytes
+        const RING_BYTES: usize = 4096;   // shim_log.cpp's kDataBytes
         assert_eq!(RING_BYTES, LOG_READ_BUF,
                    "the cap must equal the ring, or one wake cannot drain it");
         let filler = "a".repeat(300);
-        let n = RING_BYTES / 301;         // 2048 -> 6 whole lines
+        let n = RING_BYTES / 301;         // 4096 -> 13 whole lines
         let lines: Vec<&str> = core::iter::repeat_n(filler.as_str(), n).collect();
         let staged_bytes: usize = lines.iter().map(|l| l.len() + 1).sum();
         assert!(staged_bytes <= LOG_READ_BUF, "fixture must fit one upload");

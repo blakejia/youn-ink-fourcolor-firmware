@@ -102,9 +102,10 @@ extern "C" void app_main(void)
         ESP_ERROR_CHECK(esp_pm_configure(&pm));
     }
     // Duty-cycle log budget (2026-10-08). The RTC ring that carries logs across
-    // a deep-sleep wake holds 2048 B, but one wake produces 9-20 KB. The ring
-    // therefore overwrites its own oldest lines every cycle and the server sees
-    // "... [dropped N lines]" on essentially every batch.
+    // a deep-sleep wake holds one wake's worth at best, while one wake produces
+    // 9-20 KB. The ring therefore overwrites its own oldest lines every cycle
+    // and the server sees "... [dropped N lines]" on essentially every batch.
+    // (Was 2048 B; raised to 4096 B on 2026-10-09 -- see MAX_UPLOAD_BYTES.)
     //
     // The largest removable block is the ESP-IDF Wi-Fi driver's INFO chatter,
     // which this AP (`yi02`) makes pathological: it emits no TIM IE, so every

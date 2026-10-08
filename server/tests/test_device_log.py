@@ -233,11 +233,36 @@ def test_device_log_writes_base64_lines(client, trusted_device):
 
 def test_device_log_rejects_oversize_body(client, trusted_device):
     device_id, token = trusted_device
-    big = base64.b64encode(b"x" * (4096 + 1)).decode()
+    big = base64.b64encode(b"x" * (8192 + 1)).decode()
     r = client.post("/api/device-log",
                     json={"seq_hi": 1, "dropped": 0, "lines": big},
                     headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 400
+
+
+def test_device_log_accepts_a_batch_at_the_device_cap(client, trusted_device):
+    """The device ships one ring per wake and the ring IS the upload cap.
+
+    A batch sitting exactly at that cap must be accepted: a 400 here would
+    discard a whole wake's log, and since the device acks only on 201 it would
+    re-send the same batch forever and never drain.
+
+    The two numbers live in different languages with no shared constant, so the
+    invariant is stated here explicitly rather than derived: raise the device
+    cap past the server's bound and every batch becomes a 400.
+    """
+    DEVICE_UPLOAD_CAP = 4096      # firmware/main/rust/src/log_upload_policy.rs
+    SERVER_DECODED_LIMIT = 8192   # app.py's device_log bound
+    assert DEVICE_UPLOAD_CAP < SERVER_DECODED_LIMIT, (
+        f"the server limit ({SERVER_DECODED_LIMIT}) must exceed the device cap "
+        f"({DEVICE_UPLOAD_CAP}), or every batch is a 400")
+
+    device_id, token = trusted_device
+    at_cap = base64.b64encode(b"x" * DEVICE_UPLOAD_CAP).decode()
+    r = client.post("/api/device-log",
+                    json={"seq_hi": 1, "dropped": 0, "lines": at_cap},
+                    headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 201
 
 
 def test_device_log_rejects_bad_base64(client, trusted_device):
