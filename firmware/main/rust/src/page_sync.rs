@@ -2092,11 +2092,11 @@ mod tests {
         // two uploads and the residue assertion caught it, but scaling the
         // fixture with the cap made it pass at BOTH values, so a sentinel that
         // reverted the cap stayed green.
-        const RING_BYTES: usize = 4096;   // shim_log.cpp's kDataBytes
+        const RING_BYTES: usize = 6144;   // shim_log.cpp's kDataBytes
         assert_eq!(RING_BYTES, LOG_READ_BUF,
                    "the cap must equal the ring, or one wake cannot drain it");
         let filler = "a".repeat(300);
-        let n = RING_BYTES / 301;         // 4096 -> 13 whole lines
+        let n = RING_BYTES / 301;         // 6144 -> 20 whole lines
         let lines: Vec<&str> = core::iter::repeat_n(filler.as_str(), n).collect();
         let staged_bytes: usize = lines.iter().map(|l| l.len() + 1).sum();
         assert!(staged_bytes <= LOG_READ_BUF, "fixture must fit one upload");

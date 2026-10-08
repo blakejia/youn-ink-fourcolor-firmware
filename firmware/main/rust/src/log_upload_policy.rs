@@ -15,19 +15,20 @@
 /// `one_upload_drains_a_full_ring_without_leaving_a_residue` pins the pairing;
 /// `shim_log.cpp` owns the other half of it.
 ///
-/// Raised 2048 -> 4096 on 2026-10-09. At 2048 the ring still dropped 36-83
-/// lines per wake because it holds exactly ONE wake's first ~5.5 s, while the
-/// canvas paint decision lands at 10-15 s: those lines were written, survived
-/// to the next wake, and were then evicted by that wake's boot burst before
-/// the upload that would have shipped them. The result was that every
-/// `show page` / `skipping repaint` line was unrecoverable, which is precisely
-/// the evidence the page-repaint investigation needs. 4096 holds the boot
-/// burst plus the decision tail. The RTC slow segment has room: `.rtc_noinit`
-/// used 2068 B of 8192 B.
+/// Settled at 6144 from the device's own numbers rather than a round figure.
+/// A wake writes ~4000 B of boot log before its upload and ~900 B of canvas
+/// decision after it, then sleeps with nothing further logged, so the ring has
+/// to hold ~900 + ~4000 = ~4900 B or the NEXT wake's burst evicts the very
+/// line that says whether the panel was repainted. That is why every
+/// `show page` / `skipping repaint` was unrecoverable at 2048 -- and it would
+/// still be at 4096, which is why 4096 was never flashed.
 ///
-/// The server's decoded-body limit MUST stay above this (`app.py`: 4096 ->
-/// 8192), or every batch is a 400.
-pub const MAX_UPLOAD_BYTES: u32 = 4096;
+/// The RTC slow segment caps it: 0x2000 (8192 B) with 244 B taken by the other
+/// `.rtc_noinit` occupants, and 8192 does not fit (244 + 8192 > 8192).
+///
+/// The server's decoded-body limit MUST stay above this (`app.py`: 8192), or
+/// every batch is a 400.
+pub const MAX_UPLOAD_BYTES: u32 = 6144;
 
 /// Both switches are three-state. "No opinion" is not "off": it is precisely
 /// what lets the other side decide.

@@ -21,12 +21,24 @@
 namespace {
 
 constexpr uint32_t kMagic = 0x4c4f4731u;  // "LOG1"
-// Raised 2048 -> 4096 on 2026-10-09; see `MAX_UPLOAD_BYTES` in
-// `log_upload_policy.rs` for why (the canvas paint decision lands after the
-// upload and was then evicted by the next wake's boot burst). kDataBytes and
-// MAX_UPLOAD_BYTES MUST move together, or the ring cannot be drained in one
-// wake -- `one_upload_drains_a_full_ring_without_leaving_a_residue` pins that.
-constexpr int kDataBytes = 4096;
+// Sized from what a wake actually has to carry, measured on the device:
+//   * the pre-upload boot burst is ~4000 B (28 kept + 36 dropped lines at
+//     ~66 B each), and
+//   * the canvas decision is written ~900 B before the sleep, with nothing
+//     logged after it until the next wake.
+// The decision therefore needs the ring to hold ~900 + ~4000 = ~4900 B, or the
+// next wake's burst evicts exactly the line that says whether the panel was
+// repainted. 4096 was short of that and 8192 does not fit (below); 6144 does.
+//
+// Budget: `rtc_slow_seg` is 0x2000 (8192 B) per the linker's memory.ld, the
+// other `.rtc_noinit` occupants take 244 B, so 6144 leaves ~1800 B spare. The
+// ASSERT in sections.ld.in ("RTC_SLOW segment data does not fit") is the
+// backstop if that stops being true.
+//
+// kDataBytes and `MAX_UPLOAD_BYTES` (log_upload_policy.rs) MUST move together,
+// or one wake cannot drain the ring --
+// `one_upload_drains_a_full_ring_without_leaving_a_residue` pins that.
+constexpr int kDataBytes = 6144;
 constexpr int kMaxLine = 256;             // one line's cap incl. NUL
 
 // One byte is reserved (kCapBytes = kDataBytes - 1) so that head == tail

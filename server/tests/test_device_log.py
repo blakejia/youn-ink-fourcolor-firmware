@@ -251,7 +251,7 @@ def test_device_log_accepts_a_batch_at_the_device_cap(client, trusted_device):
     invariant is stated here explicitly rather than derived: raise the device
     cap past the server's bound and every batch becomes a 400.
     """
-    DEVICE_UPLOAD_CAP = 4096      # firmware/main/rust/src/log_upload_policy.rs
+    DEVICE_UPLOAD_CAP = 6144      # firmware/main/rust/src/log_upload_policy.rs
     SERVER_DECODED_LIMIT = 8192   # app.py's device_log bound
     assert DEVICE_UPLOAD_CAP < SERVER_DECODED_LIMIT, (
         f"the server limit ({SERVER_DECODED_LIMIT}) must exceed the device cap "
