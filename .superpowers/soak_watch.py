@@ -75,7 +75,21 @@ def main():
             t = datetime.fromisoformat(r["ts"])
             gap = int((t - last).total_seconds()) if last else 0
             last = t
+
             flags = []
+            # A wake far sooner than the budget is either a page-boundary hit or
+            # a sync-failure backoff, and the two look identical on interval
+            # alone: 02:29:59 -> 02:31:07 was 68 s and was CORRECT, having
+            # landed one second before a page boundary and slept just enough to
+            # catch it. Separate them by where the wake sits in the rotation --
+            # a legitimate short sleep opens a page (pos ~ 0), a backoff can
+            # start anywhere.
+            page_pos = int(t.timestamp()) % 1800
+            if 0 < gap < 300:
+                if page_pos < 120:
+                    flags.append(f"boundary-hit(pos={page_pos}s,ok)")
+                else:
+                    flags.append(f"SHORT-SLEEP?(pos={page_pos}s,check-backoff)")
             if w == 1 and a == 0 and r == 0 and gap < 300:
                 flags.append("RESET-LOOP?")
             if c in ("2", "3") and a == 0:
