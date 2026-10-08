@@ -20,7 +20,6 @@
 
 namespace {
 
-constexpr uint32_t kMagic = 0x4c4f4731u;  // "LOG1"
 // Sized from what a wake actually has to carry, measured on the device:
 //   * the pre-upload boot burst is ~4000 B (28 kept + 36 dropped lines at
 //     ~66 B each), and
@@ -39,6 +38,16 @@ constexpr uint32_t kMagic = 0x4c4f4731u;  // "LOG1"
 // or one wake cannot drain the ring --
 // `one_upload_drains_a_full_ring_without_leaving_a_residue` pins that.
 constexpr int kDataBytes = 6144;
+
+// The magic carries the capacity, because `head`/`tail` are stored as offsets
+// into `data[]`: two firmwares with different kDataBytes cannot read each
+// other's cursors. Without this a new build inherits an old ring's cursors,
+// interprets a 2048-modulus offset under a 6144 modulus, derives a nonsense
+// occupancy, finds no complete frame in it -- `lines == 0`, so it never acks --
+// and the log upload is dead until a power cycle clears RTC. That is exactly
+// what happened on the first flash from the 2048 B build; `ensure_init_locked`
+// resets the ring now that the magic differs.
+constexpr uint32_t kMagic = 0x4c4f4731u ^ static_cast<uint32_t>(kDataBytes);
 constexpr int kMaxLine = 256;             // one line's cap incl. NUL
 
 // One byte is reserved (kCapBytes = kDataBytes - 1) so that head == tail
