@@ -174,6 +174,11 @@ cd server && ./start.sh status|logs|journal|restart|stop
 - 日志分两路：应用自己 `RotatingFileHandler` 写 `data/server.log`（10 MB × 5）；
   stdout/stderr 走 journal。**不要合并**，否则轮转失效。
 - **重建前端后必须重启服务端**：`frontend/dist` 在 app 启动时挂载。
+- **改 `server/` 下任何 `.py` 后也必须 `./start.sh restart`。** `ExecStart` 是裸
+  `python llmserve.py`，**没有 `--reload`**，所以运行中的进程一直用旧代码——改完文件、
+  测试也绿、进程却按旧逻辑答复。2026-10-09 踩过：把 `/api/device-log` 的解码上限
+  4096→8192 改完并提交后没重启，设备上传被旧上限拒成 400，一度误判成固件环的问题。
+  代价：任何"改了 `.py` 但行为没变"的现象，先核对 `ActiveEnterTimestamp` 与文件 mtime。
 
 ### 硬编码值
 
