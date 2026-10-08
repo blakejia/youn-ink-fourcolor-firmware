@@ -213,3 +213,50 @@ INFO（`sdkconfig: CONFIG_LOG_DEFAULT_LEVEL_INFO=y`），本该必留记录。
 - 该窗口是否真的会把外壳刷上玻璃：**仍未观测到**——本机是插着 USB 的交互启动，画板 11 s 内就
   接管并画了页；唯一一次观测到的「skip 之后仍有刷新」是旧固件那次。故 §3.8 那个守卫
   **实际是否触发，未知**。
+
+## 11. 真机刷写后的启动复核（2026-10-08 22:49）——§10 的判定被独立坐实，且守卫未触发
+
+**设备身份**：把 `/dev/ttyACM0` 应用分区（`ota_0`）读回，`esp_app_desc.app_elf_sha256 =
+5ebe8fa3…50c1ea`，与本地 `build/xiaozhi.elf` 逐字节一致 ⇒ 设备跑的是 HEAD（`65e675a`）产物。
+刷写前同一字段为 `05defdd7…3ba42`（旧镜像）；`otadata` 两条记录的 `ota_seq`/`state` 均为擦除
+值（`0xFFFFFFFF`），bootloader 回落 `ota_0`，与本地 `partitions/v2/16m.csv` 相符。
+
+**注意**：`app_desc` 的 `time`/`date` 字段（`08:57:44 Sep 29 2026`）在本项目**陈旧**——
+10/8 16:36 构建的 bin 也写着同一时刻（`.o` 复用了旧对象），所以时间戳**不能**用来判版本，
+只有 `elf_sha256` 可信。
+
+**抓包手法变更**：§9/§10 用浏览器 WebSerial 抓包，会丢 `CustomLcdDisplay`/`Application` 的
+INFO 行。本次改用 UART0（GPIO43/44，115200，`CONFIG_ESP_CONSOLE_UART_DEFAULT=y`）——
+与 USB 口独立，全程不必开 `/dev/ttyACM0`。抓到 **187 行**，从 ROM 引导（`ESP-ROM` /
+`load:0x3fce2820`）到 `Display refresh idle`，覆盖完整启动。
+
+**坐实 §10 的机制判定**：整段抓包里 `[REFRESH]` / `request (urgent` / `Performing FULL` /
+`Performing PART` **全部 0 命中**，而 `show page 3/3 md5="b805c9a5"`（15659 ms）明确出现——
+它必然经由 `blit_and_refresh` → `rf_request_full_refresh()` → `RequestUrgentFullRefresh("canvas")`
+→ `custom_lcd_display.cc` 的 `#undef ESP_LOGI` 重定义 ⇒ **该文件的 INFO 行被编译掉**。
+同文件里 `EPD busy wait` 是 `ESP_LOGW`，在本次抓包中正常出现（21249 / 26249 / 31249 ms）。
+**结论：§10 的「串口有/无某行不可作证据」由此独立复核成立；`CustomLcdDisplay` 的 INFO 判据
+在本构建下永久缺失，除非把这几条改成 `ESP_LOGW` 或撤掉该 `#undef`。**
+
+**本启动窗口的时点（uptime ms）**：
+
+| 事件 | uptime |
+|---|---|
+| ROM 引导 → `main: Boot reset reason=11` | 0 → 209 |
+| `RawDrawUiManager initialized`（UI 已构建，`DISPLAYING` 仍 false） | 519 |
+| WiFi 拿到 IP | 6089 |
+| `Application: PageSync: started`（`DISPLAYING` 转真） | **6149** |
+| `schedule updated` | 9439 |
+| `log upload ok: 25 lines, 1823 B` | 12459 |
+| `show page 3/3 md5="b805c9a5"` | **15659** |
+| 首个刷新事务起点（busy 5000 的前 5 s） | 21249 |
+| `Display refresh idle` | 56419 |
+
+**窗口 = 519 → 6149 ms ≈ 5.6 s**，与 §10 在另一构建上测得的 4.3 s 同量级（两次独立构建、
+两次独立抓包）。§10 的结论在本构建上复现：**窗口真实存在，但画板在 15659 ms 就赢了竞速并
+完成 `show page`（一次全刷）**；刷新回调里那个守卫**未被触发**（惰性防御），**没有**多刷一次。
+故本缺陷的最终状态与 §10 相同：记录收紧与四处交权点写来源独立成立；守卫是否触发仍是
+未知，且本次证据表明它是惰性的。
+
+**本次未做**：§3.8 守卫的正向触发（需在画板赢竞速之前制造一次 UI 帧上玻璃），以及 `rr=4`
+的 panic 归因（本次两份抓包均无 `Guru Meditation` / backtrace）。
