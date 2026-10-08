@@ -1058,14 +1058,26 @@ pub fn log_upload_server_set(v: u8) {
     unsafe { shim::rf_log_upload_server_set(v) }
 }
 
-/// The read is capped at the policy's own per-upload ceiling, so
-/// `take == read_len` always holds and the ack range can never run past what
-/// was actually sent. (Reading more and then truncating is the bug this
-/// comment replaces: `seq_hi` came from the untruncated line count, so a
-/// backlog over 1024 B acked lines that never left the device.)
+/// One upload attempt. Returns true when the server accepted the batch.
+///
+/// Caller must already hold no lock: HTTP can block for seconds.
+///
+/// The three working buffers live in PSRAM, not on the stack: this runs on the
+/// esp_timer task (8 KB) and the base64 + JSON + read buffers would add ~7.2 KB
+/// of frame on top of the mbedtls chain — and a stack overflow there would
+/// corrupt the very RTC ring this feature exists to protect. Same reason
+/// `sync_once` keeps the schedule buffer in PSRAM.
+//
+// The read is capped at the policy's own per-upload ceiling, so
+// `take == read_len` always holds and the ack range can never run past what
+// was actually sent. (Reading more and then truncating is the bug this
+// comment replaces: `seq_hi` came from the untruncated line count, so a
+// backlog over the cap acked lines that never left the device.)
 const LOG_READ_BUF: usize = log_upload_policy::MAX_UPLOAD_BYTES as usize;
-const LOG_B64_BUF: usize = 2048;   // base64(1024 B) = 1368 chars, rounded up
-const LOG_BODY_BUF: usize = 2048;  // envelope + base64 + NUL
+// base64(2048 B) = 2732 chars. Rounded up to the next multiple of 1024 so the
+// two buffers keep a fixed relationship to the cap when it moves again.
+const LOG_B64_BUF: usize = 3072;
+const LOG_BODY_BUF: usize = 3072;  // envelope + base64 + NUL
 const LOG_URL_BUF: usize = 320;
 const LOG_HTTP_TIMEOUT_MS: i32 = 10_000;
 
@@ -2036,10 +2048,73 @@ mod tests {
         let posted = shim::host::calls_matching("http_post");
         assert_eq!(posted.len(), 1);
         assert!(posted[0].contains("/api/device-log"));
+        // Derive the admitted frame count from the cap instead of hardcoding
+        // it: each 300-char line costs 301 B of read buffer (300 + '\n'), and
+        // the stub's admission rule is `written + len + 1 >= cap` breaks. A
+        // hardcoded count silently rots the next time the cap moves — it did,
+        // once, asserting `Some(9)` where the raised cap admits `Some(12)`.
+        let cap = LOG_READ_BUF;
+        let admitted = (cap / 301) as u32;   // 2048 -> 6, 1024 -> 3
+        assert!(admitted >= 2, "the fixture must straddle the cap");
         // Whatever the frame count, the ack must equal what was sent; the
         // stub hands out seq_lo = 7, so seq_hi = 7 + lines - 1.
-        assert_eq!(shim::host::log_acked(), Some(7 + 3 - 1),
-                   "1024 B cap admits 3 x 300-char frames; ack must match exactly");
+        assert_eq!(shim::host::log_acked(), Some(7 + admitted - 1),
+                   "cap admits {admitted} x 300-char frames; ack must match exactly");
+    }
+
+    #[test]
+    fn one_upload_drains_a_full_ring_without_leaving_a_residue() {
+        // The point of the cap == ring capacity: `log_upload_try_once` runs
+        // exactly ONCE per wake, so anything the read cannot hand back in that
+        // single pass is overwritten before the next wake. This stages a
+        // backlog filling the ring (2000 B) and asserts the ONE attempt both
+        // sends it and empties the ring — i.e. the next wake has nothing left.
+        //
+        // At the old 1024 B cap this staged text needed two uploads, so the
+        // second half sat in the ring until it was overwritten: silent log
+        // loss with no `dropped` marker to explain it.
+        let _g = shim::host::lock();
+        reset_for_test();
+        shim::host::set_log_opinion(log_upload_policy::OPINION_ON, log_upload_policy::OPINION_NONE);
+
+        // A FULL ring's worth of text, anchored to the ring's own capacity
+        // rather than to the cap. Deriving the fixture from the cap is what
+        // made this test vacuous: with the cap at 1024 the ring's 2048 B needed
+        // two uploads and the residue assertion caught it, but scaling the
+        // fixture with the cap made it pass at BOTH values, so a sentinel that
+        // reverted the cap stayed green.
+        const RING_BYTES: usize = 2048;   // shim_log.cpp's kDataBytes
+        assert_eq!(RING_BYTES, LOG_READ_BUF,
+                   "the cap must equal the ring, or one wake cannot drain it");
+        let filler = "a".repeat(300);
+        let n = RING_BYTES / 301;         // 2048 -> 6 whole lines
+        let lines: Vec<&str> = core::iter::repeat_n(filler.as_str(), n).collect();
+        let staged_bytes: usize = lines.iter().map(|l| l.len() + 1).sum();
+        assert!(staged_bytes <= LOG_READ_BUF, "fixture must fit one upload");
+        shim::host::stage_log_lines(&lines);
+
+        let before = shim::host::log_used_bytes();
+        assert!(before > 0);
+        shim::host::script_get("/api/device-log", 201, b"{}");
+        assert!(log_upload_try_once(), "201 -> accepted");
+
+        // Everything staged went out in this one attempt...
+        let posted = shim::host::calls_matching("http_post");
+        assert_eq!(posted.len(), 1, "exactly one POST: no residue left for a second");
+        let body = posted[0].splitn(3, ' ').nth(2).expect("http_post carries the body");
+        let payload = crate::json::member(body.as_bytes(), 0, "lines")
+            .and_then(|at| crate::json::str_value(body.as_bytes(), at))
+            .expect("lines is a string");
+        // `base64` is built without `alloc`, so `decode` is unavailable; the
+        // decoded text is bounded by the read cap, so a stack buffer suffices.
+        let mut plain = [0u8; LOG_READ_BUF];
+        let n_dec = B64.decode_slice(payload, &mut plain).expect("lines is valid base64");
+        assert_eq!(n_dec, staged_bytes,
+                   "one POST carried the whole staged backlog, not a fraction");
+
+        // ...and the ring is now empty, so the next wake uploads nothing rather
+        // than double-sending.
+        assert_eq!(shim::host::log_used_bytes(), 0, "ring fully drained by one upload");
     }
 
     /// Run one schedule sync and return the single URL it fetched.

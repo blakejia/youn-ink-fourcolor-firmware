@@ -13,7 +13,10 @@ fn base() -> Inputs {
         wifi_ready: 1,
         // Above MAX_UPLOAD_BYTES so the happy path actually exercises the cap;
         // `max_bytes_is_capped_by_pending_bytes` pins the other bound.
-        pending_bytes: 1500,
+        // Derived from the cap, not hardcoded: at the old 1024 cap a literal
+        // 1500 sat above it, and raising the cap to 2048 silently turned this
+        // into a "pending below the cap" case.
+        pending_bytes: MAX_UPLOAD_BYTES + 500,
         pending_lines: 2,
         fail_streak: 0,
         _pad: [0; 4],

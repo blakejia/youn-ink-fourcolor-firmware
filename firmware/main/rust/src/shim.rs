@@ -1054,8 +1054,9 @@ pub(crate) mod host {
     }
 
     // ── device log upload (device: shim_log.cpp / shim.cpp) ──
-    /// Staged ring: the lines a read hands out, as framed text.
-    static LOG_RING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    /// Staged ring: `(seq, line)` frames, oldest first, mirroring the device's
+    /// ring so an ack can retire the acked prefix (see `rf_logbuf_ack`).
+    static LOG_RING: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
     /// `(server_set, local_set)`.
     static LOG_OPINION: Mutex<(u8, u8)> = Mutex::new((0, 0));
     /// `(last_fail_s, streak)`.
@@ -1072,9 +1073,14 @@ pub(crate) mod host {
     static LOG_DROP_DURING_POST: Mutex<u32> = Mutex::new(0);
 
     /// Stage the lines the next `rf_logbuf_read` will return.
+    ///
+    /// Staged frames carry the seq the stub will report as `seq_lo`, and every
+    /// later frame follows from there, so `rf_logbuf_ack` can retire exactly
+    /// the acked prefix the way the device's tail walk does.
     pub fn stage_log_lines(lines: &[&str]) {
-        *LOG_RING.lock().unwrap_or_else(|e| e.into_inner()) =
-            lines.iter().map(|s| s.to_string()).collect();
+        let mut g = LOG_RING.lock().unwrap_or_else(|e| e.into_inner());
+        let seq0 = g.last().map(|(s, _)| s + 1).unwrap_or(7);
+        g.extend(lines.iter().enumerate().map(|(i, s)| (seq0 + i as u32, s.to_string())));
     }
 
     pub fn set_log_opinion(server: u8, local: u8) {
@@ -1107,6 +1113,14 @@ pub(crate) mod host {
         *LOG_ACKED.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Bytes the staged ring currently holds, mirroring `rf_logbuf_stats`'s
+    /// `used`. Lets a test assert a ring is DRAINED, not merely acked: the
+    /// device uploads once per wake, so a residue is silent log loss.
+    pub fn log_used_bytes() -> u32 {
+        let g = LOG_RING.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter().map(|(_, l)| l.len() + 1).sum::<usize>() as u32
+    }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_logbuf_install_hook() {
         note("logbuf_install");
@@ -1123,7 +1137,8 @@ pub(crate) mod host {
         let cap = cap.max(0) as usize;
         let mut written = 0usize;
         let mut lines = 0u32;
-        for l in &g {
+        let mut first_seq = 0u32;
+        for (seq, l) in &g {
             if written + l.len() + 1 >= cap {
                 break;
             }
@@ -1133,13 +1148,18 @@ pub(crate) mod host {
                 *out.add(written) = b'\n';
             }
             written += 1;
+            if lines == 0 {
+                first_seq = *seq;
+            }
             lines += 1;
         }
         if !out.is_null() && cap > 0 {
             unsafe { *out.add(written.min(cap - 1)) = 0 };
         }
+        // seq_lo is meaningful only when lines > 0: a caller that acked with
+        // lines == 0 would compute seq_lo - 1 and ack the whole ring.
         if !out_seq_lo.is_null() {
-            unsafe { *out_seq_lo = 7 };
+            unsafe { *out_seq_lo = first_seq };
         }
         if !out_lines.is_null() {
             unsafe { *out_lines = lines };
@@ -1153,12 +1173,20 @@ pub(crate) mod host {
         // drop that lands during the upload is still reported next batch.
         let mut d = LOG_DROPPED.lock().unwrap_or_else(|e| e.into_inner());
         *d = d.saturating_sub(reported_dropped);
+        // Retire the frames the server accepted. Without this the stub never
+        // drained: a second upload re-sent the same backlog, which the device
+        // can never do (its tail advances past the acked span) and which hid
+        // "one wake ships half the ring" from every test. The staged list is
+        // ordered by seq, and `read` reported `seq_lo` for the first frame it
+        // handed back, so dropping everything up to `seq_hi` mirrors the
+        // device's tail walk exactly.
+        LOG_RING.lock().unwrap_or_else(|e| e.into_inner()).retain(|(seq, _)| *seq > seq_hi);
     }
 
     #[unsafe(no_mangle)]
     pub extern "C" fn rf_logbuf_stats(dropped: *mut u32, used: *mut u32) {
         let g = LOG_RING.lock().unwrap_or_else(|e| e.into_inner());
-        let used_bytes: usize = g.iter().map(|l| l.len() + 1).sum();
+        let used_bytes: usize = g.iter().map(|(_, l)| l.len() + 1).sum();
         if !dropped.is_null() {
             unsafe { *dropped = *LOG_DROPPED.lock().unwrap_or_else(|e| e.into_inner()) };
         }

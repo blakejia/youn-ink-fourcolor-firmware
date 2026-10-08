@@ -7,7 +7,14 @@
 
 /// Single-upload cap. Bounded by the deep-sleep cycle's HTTP budget and by the
 /// fixed request buffer on the C++ side.
-pub const MAX_UPLOAD_BYTES: u32 = 1024;
+///
+/// Equal to the log ring's capacity (`shim_log.cpp`'s `kDataBytes`). The upload
+/// runs exactly once per wake, so a smaller cap would leave the backlog
+/// permanently half-drained: each wake ships half and the rest is overwritten
+/// before the next one. `page_sync.rs`'s
+/// `one_upload_drains_a_full_ring_without_leaving_a_residue` pins the pairing;
+/// `shim_log.cpp` owns the other half of it.
+pub const MAX_UPLOAD_BYTES: u32 = 2048;
 
 /// Both switches are three-state. "No opinion" is not "off": it is precisely
 /// what lets the other side decide.
