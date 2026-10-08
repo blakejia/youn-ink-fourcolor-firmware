@@ -122,17 +122,31 @@ mount，代价待测。**收益不确定，必须实测再决定** —— 这正
 先读 RTC 面板记录，`COMPARE_SKIP_SAME` / `COMPARE_USE_CACHE` 时**根本不调
 `ensure_bitmap`**。下载前的比对已经在正确的位置，无需再做。
 
-**新发现（这才是那 60% 的真因）**：`prepare_decision()` 的 `glass_matches` 要求
-**index 也匹配**——`record_index(rec) == idx as i32 && rec.md5() == &md5[..]`
-（`page_sync.rs:750-761`）。而 `prepare_paint` 是 **index-scoped**，
-`paint_if_changed` 才是 md5-scoped。服务端每轮下发 `current_index`，轮换推进时
-index 与记录不一致 ⇒ 即使玻璃上是同一张图，也会走 `COMPARE_FETCH` 重新下载。
+**曾疑为真因（已被否证）**：`prepare_decision()` 的 `glass_matches` 要求 **index 也匹配**
+（`record_index(rec) == idx && rec.md5() == &md5[..]`，`page_sync.rs:750-761`），
+而 `prepare_paint` 是 index-scoped、`paint_if_changed` 是 md5-scoped——看着像"下载了却不画"。
+**否证**：统计设备日志全部 53 条 `show page N/M md5=...`，**43 个 md5 各只对应唯一一个
+index，零例外**；且下述新数据表明冗余的真正来源是唤醒节奏，与此判据无关。
 
-**真正可做的是 C'**：index 不匹配但 md5 匹配且记录可信时，是否也该跳过下载。
-**这需要证据而非推理**——index 与 md5 在什么情况下会不一致而玻璃上仍是同一页？
-设备日志里 `PageSync: show page N/M md5=...` 已带 index，可直接统计。见 §6。
+**真因已定，且不是记录机制——是唤醒节奏，方案 A 已顺带治好（2026-10-09 05:30 数据）**：
 
-**判据（不变）**：改完后 `schedule` 200 之后不应再出现 `bitmap/*.bin` GET（当记录命中时）。
+改用正确指标（**每个页槽的下载次数**，"同一 md5 多次"是错的——每 90 分钟轮换回到该页时
+本来就必须重画）：
+
+| 窗口 | 每页槽下载 | 同槽重复 |
+|---|---|---|
+| 旧固件 10-08 13:43–16:21 | **2.00 次**（3 个槽各下 3 次） | 3 个 |
+| 新固件 10-09 00:37–05:30（方案 A） | **1.00 次** | **0 个** |
+
+新窗口 11 次下载有 **10 次精确落在页槽起点**（`pos_in_slot` 6–73 s），第 1 次是启动中途。
+机制：旧节奏 600 s 唤醒对 1800 s 页槽，**每槽醒 3 次**，后 2 次都下载同一张图；
+方案 A 让唤醒对齐槽边界后，**每槽恰好 1 次**。
+
+⇒ **C' 不需要做，且原先怀疑的 `prepare_paint`/`paint_if_changed` index/md5 判据不一致
+并未造成实际损失**。这条假设连同 C' 一并作废。
+
+**判据（保持）**：`schedule` 200 之后不应出现多余的 `bitmap/*.bin` GET——现已在
+「每槽 1.00 次」上达标。
 
 ### 方案 D：服务端页时长调长（**零固件改动**）
 
