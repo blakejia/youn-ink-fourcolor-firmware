@@ -95,8 +95,13 @@ RTC 计数器（`w/a/r/g/f/er/eb/rr/c`），以及 UART0 抓的三次冷启动
    DFS-only 下 CPU 空闲仍跑 80 MHz。开 tickless 需要先解决 USB-Serial-JTAG 控制台
    被 light sleep 拆 pad 的问题（`main.cc:88-96` 的红线）——**风险高，收益仅限清醒窗口
    的 CPU 功耗**，而清醒窗口里 EPD 波形占 40 s/40.8 s，CPU 占空极低。**不推荐。**
-5. **音频轨在刷屏前断电**（`rf_rails_audio(0)`，T2 引入）——SDD 自己登记为 deferred：
-   "可能在继续活着的会话里关掉音频，须真机确认音频路径能否自恢复"。**这是已知未验风险。**
+5. **音频轨在刷屏前断电**（`rf_rails_audio(0)`，T2 引入）——**已核实为不可达，撤回**。
+   静态部分成立：`rf_rails_audio` 全仓只有一处调用（关），`PowerAudioOn()` 只在开机
+   `InitializePower()` 跑一次，`CheckAndUpdateAudioPowerState` 只管 codec 的 input/output。
+   **可达性部分否证**：`Application::PlaySound` 无调用者，`TtsStreamer`/`AudioService::`
+   在 `xiaozhi.elf` 里 **0 符号**（链接器已丢弃整条音频路径），且静默唤醒根本不初始化音频
+   （`application.cc:494`）。⇒ 这版固件没有任何路径发声，**既不是 bug 也不耗电**。
+   登记为「结构隐患」：等音频消费者接回来时，`rf_rails_audio(0)` 的单向性才会变成缺陷。
 
 ## 6. 建议的验收顺序（全部拔 USB，主机可完成）
 
