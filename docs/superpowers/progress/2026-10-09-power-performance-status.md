@@ -190,3 +190,73 @@ RTC 计数器（`w/a/r/g/f/er/eb/rr/c`），以及 UART0 抓的三次冷启动
 
 **仍未做**：T5 长跑（2h）、F1/F2（需 push 通知，会打断占空比，等你在场）、
 T6/T7（需肉眼/耳朵）、`rr=4` 归因（仍阻塞）。
+
+---
+
+## §9 能耗测量：BQ27220 之类的板载方案能不能用
+
+问题：除了 USB 功率计，有没有板载的能耗测量办法。结论如下（数据来自 TI 手册，芯片本身的
+寄存器语义已逐条核对，不是印象）。
+
+### 先确认板上现状（已核实）
+
+- 本板**没有任何电量计/电流计**：全仓无 `INA2xx`/`BQ27`/`MAX17`/coulomb/fuel-gauge 引用，
+  板级 `config.h` 无 `CURRENT`/`SHUNT`/`ISENSE`/`IBAT` 引脚。
+- ESP32-S3 **片上无电量计**，IDF 也无任何功率/库仑测量 API。
+- 唯一的电池测量是 `ReadBatterySampleForTelemetry()`，**只给 mV**（10 次 ADC 平均），
+  充电方向靠 `CHARGE_DETECT_GPIO`/`CHARGE_FULL_GPIO` 两个 GPIO。与 `AGENTS.md` §7
+  「无电流传感器、无燃料计」一致。
+- **板载 I²C 已有三站**：RTC PCF8563 `0x51`、NFC `0x55`、ES8311（`I2C_NUM_0`）。
+
+### BQ27220 能测什么（核到寄存器）
+
+能。它是 CEDV 单节电量计，挂在电池与系统地之间测 10 mΩ 采样电阻压差，I²C 标准命令：
+
+| 寄存器 | 地址 | 语义 |
+|---|---|---|
+| `AveragePower()` | 0x24/0x25 | **signed，单位 mW**；放电为负、充电为正 |
+| `Current()` | 0x0C/0x0D | signed，mA |
+| `RawCoulombCount()` | 0x22/0x23 | 库仑计数（放电累加、充电递减，充满清 0） |
+| `RemainingCapacity()` / `FullChargeCapacity()` | 0x10 / 0x3C | mAh |
+| `StateOfCharge()` | 0x2C | % |
+| `TimeToEmpty()` | 0x16 | min |
+| `StandbyCurrent()` | 0x1A | mA（芯片自身的静态电流口径） |
+
+数据手册给的自身功耗：**NORMAL 50 µA / SLEEP 9 µA / SHUTDOWN 0.6 µA**。
+
+### 三条否决理由（按严重度）
+
+**① 采样电阻串在电池回路，芯片有规范盲区 —— 对本项目是致命的**
+`Deadband` 出厂默认 **5 mA**，`CC Deadband` 默认 17×294 nV（≈5.6 mA）。手册定义：
+**落在 ±Deadband 内的电流被报成 0 mA，且不计入库仑累加**（`Any current within ±Deadband ...
+will be reported as 0 mA by the AverageCurrent() and is excluded from capacity accumulation`）。
+
+本设备深睡电流落在 mA 级（1–10 mA），而唤醒峰值有几百 mA。后果：
+
+- 库仑计在深睡期间**要么看不见、要么低计**，`RemainingCapacity()` 反而**不如现有的裸 mV 可信**；
+- 而这个**深睡电流恰恰是本次省电优化要测的量**——刚改的唤醒节奏改的就是深睡占空比。
+
+要测它就得把采样电阻换到 1 Ω 级（并重新校准/OTP 量产编程），那是改硬件设计，不是接线。
+
+**② I²C 地址硬撞**：BQ27220 从地址**固定为 7-bit `1010101` = `0x55`**（可用仓库
+`Xinyuan-LilyGO/T-Embed-CC1101/bq27xxx_test/bq27220_def.h` 复核：`BQ27220_I2C_ADDRESS 0x55`），
+与本板 **NFC `0x55` 直接冲突**——接上去就是双设备抢地址。
+
+**③ 工程量与不可逆性**：除芯片外还要串 10 mΩ 采样电阻、改电池走线、按实际电芯做 CEDV
+参数标定（TI 的 GAUGEPARCal，或 OTP 量产编程）。这是**重做电池板**，不是加个测量点。
+
+### 对照表
+
+| 方案 | 能给出 | 代价 | 适用 |
+|---|---|---|---|
+| **USB 功率计** | 直接 mA/mW、mAh | 几块钱，串在 USB 与设备间 | **一次性回答"省了多少"** |
+| **外部 INA219/INA226**（散件，串电池正极） | 板上长期 mA·h，可写进遥测 | ~¥10–20 + 焊接；本身就是电流表，无死区 | 想在设备端长期记录 |
+| **BQ27220** | mW / mAh / SOC / TTE | 重做电池板 + 参数标定 + 解决 `0x55` 冲突 | **不适用**（见上三条） |
+| **现有 `awake_ms`/`epd_busy_ms`** | 时长（负载代理） | 已到位 | 只能比"省了多少唤醒/刷屏"，**不能换成能量** |
+
+### 结论
+
+**要给"续航延长多久"的数字，仍然只有 USB 功率计一条最短路径。** BQ27220 解决不了本项目的
+主要问题（深睡 mA 级电流恰在它的死区里），地址还与板上 NFC 冲突，且要重做电池板。
+若确实想长期在设备端记录，**INA219/INA226 散件**比 BQ27220 更合适：无死区、无需化学参数
+标定、I²C 地址可配（避开 `0x51`/`0x55`）。
