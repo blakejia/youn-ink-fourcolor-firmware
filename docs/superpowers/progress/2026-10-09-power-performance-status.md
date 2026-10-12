@@ -260,3 +260,46 @@ will be reported as 0 mA by the AverageCurrent() and is excluded from capacity a
 主要问题（深睡 mA 级电流恰在它的死区里），地址还与板上 NFC 冲突，且要重做电池板。
 若确实想长期在设备端记录，**INA219/INA226 散件**比 BQ27220 更合适：无死区、无需化学参数
 标定、I²C 地址可配（避开 `0x51`/`0x55`）。
+
+---
+
+## §10 ESP-Mosaico 能不能当能耗测量手段（2026-10-09 核实）
+
+问题：Mosaico 上有 BQ27220，买它做能耗测试是否更方便。**结论：不能，它只能测它自己。**
+
+来源：`esp-dev-kits` ESP-Mosaico V1.2 user guide（`docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp-mosaico/user_guide.html`）、
+CoreBoard V1.2 原理图、`espressif/bq27220` 组件。
+
+### Mosaico 实测得到的事实
+
+| 项 | 值 |
+|---|---|
+| SoC | ESP32-S31（RISC-V 双核 320 MHz，16 MB 封装内 PSRAM） |
+| 显示 | 2.16″ 480×480 QSPI AMOLED（CO5300 + CST9220 触摸）——**无 EPD** |
+| 电池 | 3.7 V / 65 mAh，TP4057 充电（原理图 RPROG 15 kΩ ⇒ 66 mA） |
+| 电量计 | **BQ27220 @ I²C0 `0x55`**，与触摸(0x5A)、ES8311(0x19)、BMI270(0x69)、BMM150×2(0x11/0x12) 同总线 |
+| 官方驱动 | `espressif/bq27220`（esp-iot-solution `components/sensors/battery_fuel_gauge/bq27220`），有 `bq27220_get_voltage()` / `bq27220_get_current()`(mA) / SOC |
+| BSP | user guide 明确 BSP 会初始化 "…sensors, **battery**, NAND flash…" |
+
+### 否决理由
+
+1. **测不到本设备。** 电量计的采样电阻串在 Mosaico CoreBoard 自己的电池回路（BAT1/SRP/SRN）上，不是暴露的测量端口。它能给的只有 Mosaico 自己的 65 mAh。
+2. **剖面不可迁移。** Mosaico 无 EPD，主成本是 AMOLED+Wi-Fi6；NOTE4C 的主成本是 EPD 全刷 40.8 s（§4）。在 Mosaico 上的省电结论不适用于本设备。
+3. **连它自己的深睡也读不出。** BQ27220 的 5 mA 死区（TRM SLUUBD4A §4.9.10/§4.9.11）仍在，深睡 µA 级一律报 0 mA。所以它在 Mosaico 上只是电量%/续航趋势表。
+
+### 顺带记下的一条方法论陷阱
+
+`firmware/main/rust/src/power.rs:68` —— `if i.mains { StayAwake }`。**USB 插着就永不深睡**，
+所以任何依赖 USB 口/串口在场的测量（USB 功率计、从别的板子读、串口监视器）只能看到清醒剖面，
+测不到占空比平均。要测的是**电池侧**的量，这与 §6「全部拔 USB」同源。
+
+### 可用的替代（未购买，仅登记）
+
+| 方案 | 能给出 | 代价/坑 |
+|---|---|---|
+| Nordic PPK2 | 电池侧 mA·h，200 nA–1 A，100 nA 分辨率，带波形 | 需串进电池回路 |
+| Joulescope JS220 | nA–A 动态范围 + energy | 更贵 |
+| INA226 / INA219 + 0.1 Ω 串电池正极 | 板上长期 mA·h，可并入现有遥测 | INA226 shunt LSB 2.5 µV(16 bit)，INA219 10 µV(12 bit, ±320 mV FS)；需第二 MCU / USB-I²C / 占空闲 I²C |
+| USB 功率计 | ① 清醒剖面（单次 EPD 刷新电荷量）② 充电窗口 mAh 代理 | 插电常醒，设备自身电流也进表头 ⇒ 高估；测不到深睡 |
+
+**一句话**：为了测 NOTE4C 能耗买 Mosaico 是买错；要一个数字就用 PPK2/Joulescope（或散件 INA226）串进电池回路。

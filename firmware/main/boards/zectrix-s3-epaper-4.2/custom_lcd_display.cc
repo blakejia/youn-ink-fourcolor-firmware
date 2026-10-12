@@ -48,6 +48,19 @@ static constexpr int kFourColorSampleIntervalMs = 12000;
 #undef ESP_LOGI
 #define ESP_LOGI(tag, fmt, ...) ((void)0)
 
+// The blanket `#undef ESP_LOGI` above silences this file's INFO lines, which
+// is why a full BWRY refresh showed up in the device log as a bare `show page`
+// with no way to tell one waveform from two. The refresh *decisions* still
+// need to be visible, so they log through a macro that does not depend on
+// ESP_LOGI: `ESP_LOGW` is never silenced anywhere in the firmware.
+//
+// Scope is deliberately narrow — only the lines that decide WHAT gets sent to
+// the panel. The per-row SPI loops keep the blanket suppression, because a
+// per-row log would flood the 6144 B ring and evict the very evidence this
+// exists to preserve.
+#define EPD_LOG_DECISION(fmt, ...) \
+    ESP_LOGW(TAG, "[REFRESH] " fmt, ##__VA_ARGS__)
+
 // --------------------
 // Rect helpers
 // --------------------
@@ -409,7 +422,7 @@ void CustomLcdDisplay::RequestUrgentRefresh(const char* reason) {
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
     }
     last_refresh_reason_ = reason ? reason : "unspecified";
-    ESP_LOGI(TAG, "[REFRESH] request (urgent): reason=%s", last_refresh_reason_);
+    EPD_LOG_DECISION("request (urgent): reason=%s", last_refresh_reason_);
     urgent_refresh = true;
     refresh_in_progress = true;
     const uint32_t default_kick_ms = IsFourColorPanel() ? (uint32_t)sample_interval_ms : kDisplayKickMs;
@@ -430,7 +443,7 @@ void CustomLcdDisplay::RequestUrgentFullRefresh(const char* reason) {
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
     }
     last_refresh_reason_ = reason ? reason : "unspecified";
-    ESP_LOGI(TAG, "[REFRESH] request (urgent+full): reason=%s", last_refresh_reason_);
+    EPD_LOG_DECISION("request (urgent+full): reason=%s", last_refresh_reason_);
     urgent_refresh = true;
     force_full_refresh_ = true;
     refresh_in_progress = true;
@@ -559,8 +572,8 @@ void CustomLcdDisplay::refresh_task_loop() {
             r = dirty;
             dirty = {0, 0, 0, 0};
             pending = false;
-            ESP_LOGI(TAG, "[REFRESH] Got dirty rect: x=%d, y=%d, w=%d, h=%d, area=%d",
-                     r.x, r.y, r.w, r.h, rect_area(r));
+            EPD_LOG_DECISION("Got dirty rect: x=%d, y=%d, w=%d, h=%d, area=%d",
+                       r.x, r.y, r.w, r.h, rect_area(r));
         }
         if (urgent || rect_area(r) > 0) {
             refresh_in_progress = true;
@@ -593,8 +606,8 @@ void CustomLcdDisplay::refresh_task_loop() {
                 r = rect_union(r, dirty);
                 dirty = {0, 0, 0, 0};
                 pending = false;
-                ESP_LOGI(TAG, "[REFRESH] Debounce merged dirty: x=%d, y=%d, w=%d, h=%d, area=%d",
-                         r.x, r.y, r.w, r.h, rect_area(r));
+                EPD_LOG_DECISION("Debounce merged dirty: x=%d, y=%d, w=%d, h=%d, area=%d",
+                           r.x, r.y, r.w, r.h, rect_area(r));
             }
             xSemaphoreGive(dirty_mutex);
         }
@@ -623,7 +636,7 @@ void CustomLcdDisplay::refresh_task_loop() {
             prev_buffer_synced = true;
             stat_skip_nodiff++;
             maybe_log_stats(last_sample_tick);
-            ESP_LOGI(TAG, "[REFRESH] wake baseline synced; skipping identical ui refresh");
+            EPD_LOG_DECISION("wake baseline synced; skipping identical ui refresh");
             bool fire_idle_cb_wake = false;
             xSemaphoreTake(dirty_mutex, portMAX_DELAY);
             urgent_refresh = false;
@@ -694,8 +707,10 @@ void CustomLcdDisplay::refresh_task_loop() {
 
         const size_t total_bytes = lcd_spi_data.buffer_len;
         const size_t total_bits = total_bytes * 8;
-        ESP_LOGI(TAG, "[STRATEGY] Diff analysis: bits=%u/%u (%.2f%%)",
-                 (unsigned)result.diff_bits, (unsigned)total_bits, result.diff_ratio * 100.0f);
+        EPD_LOG_DECISION("Diff analysis: bits=%u/%u (%.2f%%) tiny_streak=%d accum=%ub",
+                       (unsigned)result.diff_bits, (unsigned)total_bits,
+                       result.diff_ratio * 100.0f, tiny_diff_streak,
+                       (unsigned)tiny_diff_accum_bits);
 
         // Decide FULL vs PARTIAL
         bool should_full = !prev_buffer_synced || !prev_buffer;
@@ -707,7 +722,7 @@ void CustomLcdDisplay::refresh_task_loop() {
         }
         if (!should_full && result.diff_ratio >= kForceFullDiffRatio) {
             should_full = true;
-            ESP_LOGI(TAG, "[STRATEGY] diff_ratio>=30%% -> FULL");
+            EPD_LOG_DECISION("diff_ratio>=30%% -> FULL");
         }
         if (!should_full && partial_since_full >= 10) {
             should_full = true;
@@ -720,8 +735,8 @@ void CustomLcdDisplay::refresh_task_loop() {
 
         if (should_full) {
             stat_full++;
-            ESP_LOGI(TAG, "[REFRESH] Performing FULL refresh: reason=%s urgent=%d force_full=%d",
-                     last_refresh_reason_, urgent ? 1 : 0, force_full ? 1 : 0);
+            EPD_LOG_DECISION("Performing FULL refresh: reason=%s urgent=%d force_full=%d",
+                           last_refresh_reason_, urgent ? 1 : 0, force_full ? 1 : 0);
             EPD_Init();
             EPD_Display();
 
@@ -731,7 +746,7 @@ void CustomLcdDisplay::refresh_task_loop() {
         } else
         {
             stat_partial++;
-            ESP_LOGI(TAG, "[REFRESH] Performing PARTIAL refresh");
+            EPD_LOG_DECISION("Performing PARTIAL refresh");
             EPD_Init();
             EPD_DisplayPart();
             memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);

@@ -1231,7 +1231,14 @@ void Application::OnPowerTimer() {
         return;
     }
     const int64_t now_ms = esp_timer_get_time() / 1000;
-    const uint32_t poll_s = page_sync_poll_s();
+    // The cycle cadence is the one place the server's sleep window can bite:
+    // `poll_s` is the day cadence, `sleep_poll_s` the night one. Gating on
+    // `poll_s` alone made `screen_active=false` a no-op — the device still ran
+    // a 600 s cycle all night, which is exactly the cost the window exists to
+    // avoid. `poll_cap` in power.rs consumes both already; this is the
+    // cadence the cycle itself runs on.
+    const uint32_t poll_s = page_sync_screen_active() ? page_sync_poll_s()
+                                                      : page_sync_sleep_poll_s();
     const bool never_ran = (last_cycle_ms_ < 0);
     const bool interval_elapsed =
         !never_ran && poll_s > 0 &&
